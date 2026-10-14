@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!-- The developer benchmark (scripts/bench.sh) as a mod of its own, "kometbench": never in the release, so the player's Komet.dll
+         carries none of it. It reaches Komet's internals through Komet's InternalsVisibleTo and is loaded beside the build under
+         test; inert unless KOMET_BENCH names a bench.json. -->
+    <PropertyGroup>
+        <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+        <OutputPath>bin\$(Configuration)\Mods\kometbench</OutputPath>
+        <GenerateDependencyFile>false</GenerateDependencyFile>   <!-- the game loads the mod assembly itself -->
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Using Include="Vintagestory.API.Client.GuiElement" Static="true"/>
+        <Using Include="Komet.Contracts" Static="true"/>
+        <InternalsVisibleTo Include="Komet.Test"/>
+    </ItemGroup>
+
+    <!-- Komet is the other mod in the same game, never copied into this one's folder -->
+    <ItemGroup>
+        <ProjectReference Include="$(KometRepo)Komet/Komet.csproj" Private="false"/>
+        <Reference Include="VintagestoryAPI" HintPath="$(VsInstall)/VintagestoryAPI.dll" Private="false"/>
+        <Reference Include="0Harmony" HintPath="$(VsInstall)/Lib/0Harmony.dll" Private="false"/>
+        <Reference Include="VintagestoryLib" HintPath="$(VsInstall)/VintagestoryLib.dll" Private="false"/>
+        <Reference Include="OpenTK.Windowing.Desktop" HintPath="$(VsInstall)/Lib/OpenTK.Windowing.Desktop.dll" Private="false"/>
+        <Reference Include="OpenTK.Windowing.Common" HintPath="$(VsInstall)/Lib/OpenTK.Windowing.Common.dll" Private="false"/>
+        <Reference Include="OpenTK.Mathematics" HintPath="$(VsInstall)/Lib/OpenTK.Mathematics.dll" Private="false"/>
+        <Reference Include="cairo-sharp" HintPath="$(VsInstall)/Lib/cairo-sharp.dll" Private="false"/>
+        <Reference Include="Newtonsoft.Json" HintPath="$(VsInstall)/Lib/Newtonsoft.Json.dll" Private="false"/>
+    </ItemGroup>
+
+    <!-- The same Power-of-Ten rules as the mod -->
+    <ItemGroup>
+        <ProjectReference Include="$(KometRepo)tools/Komet.Rules/Komet.Rules.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <Content Include="modinfo.json" CopyToOutputDirectory="PreserveNewest"/>
+    </ItemGroup>
+
+    <!-- `dotnet build Komet.Bench -c Release -t:Package` (scripts/bench.sh with its build option): the folder mod ../Releases/kometbench, beside
+         Releases/komet from build.sh. No zip: it is never released. -->
+    <Target Name="Package" DependsOnTargets="Build">
+        <Error Condition="'$(Configuration)' != 'Release'" Text="Package takes a Release build: dotnet build -c Release -t:Package"/>
+        <PropertyGroup>
+            <BenchDir>$(MSBuildProjectDirectory)/../Releases/kometbench</BenchDir>
+        </PropertyGroup>
+        <RemoveDir Directories="$(BenchDir)"/>
+        <Copy SourceFiles="$(TargetPath);$(TargetDir)$(TargetName).pdb;@(Content)" DestinationFolder="$(BenchDir)"/>
+    </Target>
+
+</Project>

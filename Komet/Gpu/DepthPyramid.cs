@@ -1,7 +1,6 @@
 namespace Komet.Gpu;
 
-// The units lie far above the ones the engine's programs sample, as a build may run in the middle of the terrain's pass
-// with its program's textures bound.
+// Units lie far above the engine's: a build may run mid terrain pass with its program's textures bound.
 internal sealed class DepthPyramid
 {
     public const int Unit = 31, DepthUnit = 30;
@@ -10,7 +9,7 @@ internal sealed class DepthPyramid
     private int _program, _params, _texture;
     private IGpuBackend? _gpu;
 
-    // The backend in use when the pyramid was made: its programs and images belong to that backend, also after a switch
+    // Backend the pyramid was made with; its programs and images belong to it, also after a switch
     private IGpuBackend gpu => _gpu ?? GpuBackends.Current;
 
     public int Texture => _texture;

@@ -25,7 +25,7 @@ public sealed class GpuTimesTests
             for (var f = 0; f < VulkanFrame.Slots + 2; f++)
             {
                 frame!.Next();
-                Assert.That(frame.Begin(SegmentSync.Deferred, out why), Is.True, why);
+                Assert.That(frame.Begin(out why), Is.True, why);
                 frame.Section(copy);
                 Assert.That(frame.CopyBuffer((from!.Buffer, 0), (to!.Buffer, 0), Bytes), Is.True);
                 frame.Section(idle);
@@ -72,7 +72,7 @@ public sealed class GpuTimesTests
             for (var f = 0; f < VulkanFrame.Slots + 2; f++)
             {
                 frame.Next();
-                Assert.That(frame.Begin(SegmentSync.Deferred, out why), Is.True, why);
+                Assert.That(frame.Begin(out why), Is.True, why);
                 frame.Section(opaque);
                 Assert.That(frame.CopyBuffer((from!.Buffer, 0), (to!.Buffer, 0), Bytes), Is.True);
                 frame.Section(sky);

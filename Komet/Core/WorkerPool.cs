@@ -5,21 +5,10 @@ using Vintagestory.Client.NoObf;
 
 namespace Komet.Core;
 
-// Komet's worker threads, one pool for everything that runs beside the game's threads: frame jobs (FrustumSweep's cull of one
-// MeshDataPoolManager.Render call) and background jobs (tessellation passes, TessWorkers). Frame jobs win: a worker helps a published
-// batch first and runs one background job only when no batch waits - and only while fewer than BackgroundLimit workers are in one, so
-// the background work cannot crowd out the main thread.
-//
-// The shared cursor holds the batch's count in its high half and the next index in its low half: one Interlocked increment claims an
-// index and says of which batch, so a worker that saw the previous batch can never claim an item of the next one under the old count.
-// The caller never waits for a worker that is inside a background job: a worker only claims between jobs and finishes what it claimed
-// before it takes anything else, so the caller waits at most for the items workers claimed, one each. Nothing is allocated per batch.
-// A resting worker marks itself Idle through a full fence before it looks at the cursor a last time, and the caller publishes through
-// a full fence before it looks for Idle workers: either the caller wakes it or it sees the batch.
-//
-// Threads belong to a world: they join its list of client threads (DestroyGameSession waits for them like for its own) and end when it
-// exits, when the pool moves to another world, or at Stop. Fewer wanted than running parks the rest; they are reused, so a thread keeps
-// whatever it pinned to itself (its ChunkTesselator). Threads run at normal priority: an item a worker claimed holds up the frame.
+// Workers for frame jobs (FrustumSweep culls) and background jobs (TessWorkers, below BackgroundLimit); frame jobs win.
+// The cursor packs count (high) and next index (low): one Interlocked increment claims an index of a known batch, and
+// the caller waits only for claimed items. Full fences on Idle and publish: a worker is woken or sees the batch.
+// Threads belong to a world (DestroyGameSession joins them); surplus ones park, keeping their ChunkTesselator.
 internal static class WorkerPool
 {
     public enum FrameResult
@@ -34,28 +23,27 @@ internal static class WorkerPool
     private const int IdleMs = 50, Spins = 32, SignalSpins = 8, JoinMs = 2000, FrameCounter = 0, BackgroundCounter = 1,
         MaxRetired = 64, MaxWaits = 1 << 24;
 
-    private const long MaxRounds = long.MaxValue; // a worker runs until its world or generation ends
+    private const long MaxRounds = long.MaxValue; // runs until its world or generation ends
     private const long Low = 0xFFFFFFFFL;
     private static readonly int DefaultThreads = Math.Clamp(Environment.ProcessorCount - 2, 1, MaxThreads);
 
     private static readonly bool Accessible = Seams();
     private static readonly Lock Gate = new();
     private static readonly ManualResetEventSlim Finished = new(false);
-    private static int _relay; // resting workers still to be woken by the ones woken already
+    private static int _relay; // resting workers still to be woken by those already woken
 
-    // Worker ticks on frame and background jobs, while Counting.On
     private static readonly Tally Busy = new(BackgroundCounter + 1);
 
     private static readonly List<Worker> Retired = []; // workers of an earlier world or generation, until they ended
     private static Worker[] _workers = [];
-    private static object? _world; // the ClientMain the threads belong to; null for a pool without a world (tests)
+    private static object? _world; // ClientMain the threads belong to; null without a world (tests)
     private static int _generation, _done, _frameFailures, _backgroundLimit, _inBackground;
     private static long _cursor; // count << 32 | next index; count 0 while no batch is open
     private static Action<int>? _job;
     private static Exception? _error;
     [ThreadStatic] private static int _number; // this thread's worker number + 1; 0 on every other thread
 
-    // 0: no pool, culling and tessellation stay on the game's threads
+    // 0: culling and tessellation stay on the game's threads
     public static int Wanted { get; set; } = DefaultThreads;
 
     public static Func<bool>? Background { get; set; } // one background job, true when it ran one; must not throw
@@ -69,15 +57,14 @@ internal static class WorkerPool
     public static long BackgroundTicks => Busy.Total(BackgroundCounter);
     public static int InBackground => Volatile.Read(ref _inBackground);
 
-    // How many workers may be inside a background job at once; set by the job's owner (TessWorkers)
+    // Set by the job's owner (TessWorkers)
     public static int BackgroundLimit
     {
         get => Volatile.Read(ref _backgroundLimit);
         set => Volatile.Write(ref _backgroundLimit, Assert(value is >= 0 and <= MaxThreads) ? value : 0);
     }
 
-    // Whether a frame batch could run now: workers running, frame batches not switched off, none open (FrustumSweep's stage batch
-    // stays open across a render stage's calls)
+    // FrustumSweep's stage batch stays open across a stage's calls
     public static bool Free => _job is null && !FrameOff && _number == 0 && Running > 0;
 
     public static int Running
@@ -92,7 +79,7 @@ internal static class WorkerPool
         }
     }
 
-    // On the main thread, every few hundred milliseconds: the wanted number of threads for the world being played
+    // Main thread, every few hundred ms
     public static void Steer(ClientMain? game)
     {
         if (game is null || game.threadsShouldExit ||
@@ -100,7 +87,7 @@ internal static class WorkerPool
         Resize(game, Math.Clamp(Wanted, 0, MaxThreads));
     }
 
-    // Threads for `world` (a ClientMain, or null without one): another world retires every thread first
+    // Another world retires every thread first
     internal static void Resize(object? world, int wanted)
     {
         if (!Assert(wanted is >= 0 and <= MaxThreads) || (world is not null && !Assert(Accessible))) return;
@@ -132,7 +119,7 @@ internal static class WorkerPool
         }
     }
 
-    // Leaving the world or the mod: every thread ends; true when all did within JoinMs
+    // True when all threads ended within JoinMs
     public static bool Stop()
     {
         Worker[] ending;
@@ -143,7 +130,9 @@ internal static class WorkerPool
             ending = [.. Retired];
             Retired.Clear();
             _ = Assert(_workers.Length == 0);
-            (_frameFailures, BackgroundOff, LastError) = (0, false, null);
+            // a batch left open by a stage that threw past CloseFrame would block the next world's pool forever
+            _ = Interlocked.Exchange(ref _cursor, 0);
+            (_job, _frameFailures, BackgroundOff, LastError) = (null, 0, false, null);
         }
 
         var (joined, deadline) = (true, Environment.TickCount64 + JoinMs);
@@ -157,7 +146,6 @@ internal static class WorkerPool
         return joined;
     }
 
-    // Under Gate: the running threads end after their current job, the resting ones at once
     private static void Retire()
     {
         _ = Interlocked.Increment(ref _generation);
@@ -177,8 +165,7 @@ internal static class WorkerPool
         _ = Assert(Retired.Count <= MaxRetired);
     }
 
-    // Runs job(0..count-1) on the calling thread and every free worker, waking up to `helpers` resting ones; Declined when there is no
-    // pool (the caller does the work its own way), Failed when an item threw (every item has ended; LastError holds the first exception)
+    // Declined without a pool, Failed when an item threw (LastError)
     public static FrameResult RunFrame(Action<int> job, int count, int helpers)
     {
         if (!NotNull(job) || count < 2 || !OpenFrame(job, count, Math.Min(helpers, count - 1)))
@@ -194,9 +181,7 @@ internal static class WorkerPool
         return Ended();
     }
 
-    // A batch the caller does not wait for (RunFrame opens its batch here, then waits): the call returns at once and the workers claim
-    // its items while the caller goes on. The caller takes items itself with ClaimBelow, waits for whatever it needs through the job's own
-    // bookkeeping, and ends the batch with CloseFrame before anything else opens one. False when there is no pool to run it.
+    // No waiting: the caller claims via ClaimBelow and must CloseFrame before anything else opens a batch.
     public static bool OpenFrame(Action<int> job, int count, int helpers)
     {
         if (!NotNull(job) || !Assert(count <= MaxItems) || count < 1 || Running == 0 || FrameOff ||
@@ -209,8 +194,7 @@ internal static class WorkerPool
         return true;
     }
 
-    // The open batch's items the caller runs itself: the next one, as long as its index lies below `below`; how many it ran. A compare
-    // and swap takes it, so the caller never claims one past the bound, while the workers' increments go on claiming beside it.
+    // CAS-claimed while the index is below `below`; returns how many.
     public static int ClaimBelow(int below)
     {
         var ran = 0;
@@ -227,8 +211,7 @@ internal static class WorkerPool
         return Assert(ran <= MaxItems) ? ran : 0;
     }
 
-    // Ends the batch OpenFrame opened: no item is handed out any more, and once every item a thread claimed has ended it returns.
-    // Unclaimed items never run. Declined when none was open.
+    // Waits for every claimed item; unclaimed ones never run.
     public static FrameResult CloseFrame()
     {
         if (_job is null || !Assert(_number == 0)) return FrameResult.Declined;
@@ -249,10 +232,7 @@ internal static class WorkerPool
         return FrameResult.Failed;
     }
 
-    // Up to n resting workers woken: one by the caller, the rest by the relay - each woken worker wakes the next before it
-    // claims, so the caller (the main thread, for a frame batch) pays for one wake-up instead of n. Waking only hurries the
-    // workers: a batch never waits for a worker it did not claim an item for, and a resting worker looks again after IdleMs.
-    // How many the caller woke itself.
+    // Caller wakes one, the rest relay, so the caller pays one wake-up. Returns the caller's count.
     private static int Wake(int n)
     {
         _ = Assert(n <= MaxItems);
@@ -263,7 +243,6 @@ internal static class WorkerPool
         return woken;
     }
 
-    // One resting worker, taken from its rest (Idle 1 -> 0) so no other waker picks it too; false when none rests
     private static bool WakeOne()
     {
         _ = Assert(_workers.Length <= MaxThreads);
@@ -277,7 +256,6 @@ internal static class WorkerPool
         return false;
     }
 
-    // Resting workers woken for background work, as many as BackgroundLimit leaves room for; for the job's owner when work arrived
     public static void WakeBackground()
     {
         var room = BackgroundLimit - InBackground;
@@ -314,7 +292,7 @@ internal static class WorkerPool
         _ = Assert(at < count);
     }
 
-    // The engine fields the accessors reach, with their types: a missing one would throw on a game thread
+    // A missing one would throw on a game thread
     private static bool Seams()
     {
         var main = typeof(ClientMain);
@@ -343,7 +321,6 @@ internal static class WorkerPool
 
         public Thread Thread { get; }
 
-        // Once the thread ended and no one wakes it any more
         public void Dispose()
         {
             _ = Assert(!Thread.IsAlive);
@@ -376,7 +353,7 @@ internal static class WorkerPool
             _ = Interlocked.Exchange(ref Idle, 1);
             var woken = (Parked || !Open()) && Signal.Wait(IdleMs);
             _ = Interlocked.Exchange(ref Idle, 0);
-            Signal.Reset(); // a wake that came late is not lost: the loop looks at the cursor before it rests again
+            Signal.Reset(); // a late wake is not lost: the loop checks the cursor before resting again
             if (woken && !Parked) Relay();
             _ = Assert(Volatile.Read(ref Idle) == 0);
         }
@@ -404,7 +381,6 @@ internal static class WorkerPool
             _number = number;
         }
 
-        // A worker's turn at the open batch, if one is open: the stale read only decides whether to claim
         private static bool Help()
         {
             if (!Assert(_number > 0) || !Open()) return false;

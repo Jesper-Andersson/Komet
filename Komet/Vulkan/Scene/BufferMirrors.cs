@@ -2,19 +2,15 @@ using OpenTK.Graphics.OpenGL;
 
 namespace Komet.Vulkan;
 
-// Writes are replayed in the order OpenGL got them. A buffer mapped for good (persistent: the engine writes through the
-// pointer, unseen) has no mirror. A write goes into the open segment's setup, which runs before its draws, while none of
-// them read the mirror; once one did, the mirror is renamed: a new range takes the old contents and the write, later draws
-// read that, earlier ones keep the old range until their frame is done. A buffer a draw reads without a mirror is imported on
-// the GPU: OpenGL copies it into GlStaging, the open segment's setup copies that into the mirror after OpenGL's signal (a late
-// one when the segment had it already), so neither the engine's thread nor the draw waits for OpenGL's queue.
+// Writes replay in OpenGL's order; persistent mappings (written unseen) get no mirror. A write goes into the open
+// segment's setup while none of its draws read the mirror; after one did, the mirror is renamed (new range = old +
+// write, earlier draws keep the old one until their frame is done). An unmirrored buffer is read back from OpenGL once.
 internal sealed unsafe class BufferMirrors : IDisposable
 {
     public const long EagerLimit = 16L << 20;
 
-    // A new buffer of at most this many bytes is mirrored from its first contents on, before any draw read it: a draw reading a
-    // buffer without a mirror reads it back from OpenGL, which waits for everything queued before (it was most of the scene's
-    // stutter, a new entity or block entity mesh at a time); a larger one only once a draw wanted it
+    // Up to this size, new buffers are mirrored from their first contents (a draw reading an unmirrored buffer waited
+    // for OpenGL's whole queue: most scene stutter, per new entity mesh); larger only once a draw wants them.
     public const long FirstLimit = 1L << 20;
     private const int MaxMirrors = 1 << 17, MaxPending = 1 << 14, MaxWritten = 256, MaxPersistent = 1 << 12,
         MaxReasons = 8, Recent = 128;
@@ -30,10 +26,9 @@ internal sealed unsafe class BufferMirrors : IDisposable
     private readonly List<(ulong Buffer, ulong Offset, ulong Size)> _written = [];
     private readonly FrameStaging _staging;
     private readonly Dictionary<string, long> _reasons = new(StringComparer.Ordinal);
-    private readonly GlStaging? _imports;
     private readonly Dictionary<uint, long> _sizes = []; // each buffer's size as glBufferData or glBufferStorage gave it
 
-    // In front of _mirrors, by the buffer's low bits: a frame's draws read the same few buffers again and again
+    // Cache in front of _mirrors by the buffer's low bits: a frame reads the same few buffers again and again
     private readonly (uint Buffer, Mirror? Mirror)[] _recent = new (uint, Mirror?)[Recent];
 
     private sealed class Mirror(DeviceHeap.Range range, long size)
@@ -44,10 +39,10 @@ internal sealed unsafe class BufferMirrors : IDisposable
         public bool Stale { get; private set; }
         public string Why { get; private set; } = ""; // what made it stale, for the report
 
-        // Its buffer is in _wanted: only Gone and Forget take it out, and they drop the mirror too
+        // In _wanted: only Gone and Forget remove it, dropping the mirror too
         public bool Wanted { get; set; }
 
-        // No longer the buffer's mirror (dropped or replaced): a stale entry of _recent
+        // Dropped or replaced: a stale _recent entry
         public bool Gone { get; set; }
 
         public void Spoil(string why)
@@ -59,18 +54,33 @@ internal sealed unsafe class BufferMirrors : IDisposable
 
     private readonly record struct Copy(ulong From, ulong FromOffset, ulong To, ulong ToOffset, ulong Size);
 
-    // imports: OpenGL's staging for buffers read back (none: no import, the draw is left to OpenGL)
-    public BufferMirrors(VulkanDevice device, VulkanFrame frame, GlStaging? imports)
+    public BufferMirrors(VulkanDevice device, VulkanFrame frame)
     {
         _ = NotNull(device) && NotNull(frame);
         (_device, _frame, _heap, _staging) = (device, frame, new DeviceHeap(device), new FrameStaging(device, frame));
-        _imports = imports;
     }
 
     public int Count => _mirrors.Count;
 
-    // About what the mirrors keep on the managed heap, for the report (the contents are in device memory): a mirror and its entry, a
-    // size and the set entries of each buffer known
+    // Persistent buffers from Vulkan memory (PersistentMaps.Read)
+    public System.Func<uint, (ulong Buffer, ulong Offset, ulong Size)?>? Mapped { get; init; }
+
+    // Pool buffers (TerrainPools.BufferOf) are used in place (TerrainRenderer.PoolWritten): no mirror,
+    // which lean (GlTap.LeanBuffer) would keep in full
+    public System.Func<uint, (ulong Buffer, ulong Offset, ulong Size)?>? Pooled { get; init; }
+
+    // The pools took the buffer over (TerrainPools.Held)
+    public void Taken(uint buffer)
+    {
+        if (!Assert(buffer > 0) || !Assert(Pooled is not null)) return;
+        Drop(buffer);
+        _ = _wanted.Remove(buffer);
+    }
+
+    // Before the first frame, writes and copies go with the texture uploads, in order
+    public TextureImages? Early { get; init; }
+
+    // Approximate managed bytes for the report (contents live in device memory)
     public long ManagedBytes => Assert(_mirrors.Count <= MaxMirrors) && Assert(_sizes.Count <= MaxMirrors)
         ? (96L * _mirrors.Count) + (24L * _sizes.Count) + (16L * (_wanted.Count + _specified.Count + _persistent.Count))
         : 0;
@@ -82,6 +92,8 @@ internal sealed unsafe class BufferMirrors : IDisposable
     public string Reasons =>
         string.Join(", ", _reasons.OrderByDescending(r => r.Value).Take(MaxReasons).Select(r => $"{r.Key} {r.Value}"));
     public long Renames { get; private set; }
+
+    public long PersistentReads { get; private set; }
     public long Writes { get; private set; }
 
     public bool Persistent(uint buffer) => Assert(_persistent.Count <= MaxPersistent) && _persistent.Contains(buffer);
@@ -89,10 +101,16 @@ internal sealed unsafe class BufferMirrors : IDisposable
     public (ulong Buffer, ulong Offset, ulong Size)? Read(uint buffer)
     {
         if (buffer == 0 || !Assert(_frame.Open)) return null;
-        // read for every draw: a buffer with a mirror is never persistent (Data drops it, Imported is not asked for one)
+        if (Pooled?.Invoke(buffer) is { } pooled) return pooled;
+        // per draw: a mirrored buffer is never persistent (Data drops it, Imported is not asked)
         var mirror = Find(buffer);
-        if ((mirror is null || mirror.Stale) && _persistent.Contains(buffer)) return null;
-        if (mirror is null || mirror.Stale) mirror = Imported(buffer, mirror);
+        if ((mirror is null || mirror.Stale) && _persistent.Contains(buffer))
+        {
+            PersistentReads++; // read where the engine writes, ordered by no fence of OpenGL's
+            return Mapped?.Invoke(buffer);
+        }
+
+        if (mirror is null || mirror.Stale) mirror = ReadBack(buffer, mirror);
         if (mirror is null) return null;
         if (!mirror.Wanted && _wanted.Count < MaxMirrors)
         {
@@ -105,6 +123,18 @@ internal sealed unsafe class BufferMirrors : IDisposable
         return (mirror.Range.Buffer, mirror.Range.Offset, (ulong)mirror.Size);
     }
 
+    // A Vulkan range copy (draw indices into uploads), ordered with mirror writes before the segment's
+    // draws
+    public bool CopyAhead((ulong Buffer, ulong Offset) from, (ulong Buffer, ulong Offset) to, ulong size) =>
+        Assert(size > 0) && Assert(from.Buffer != 0 && to.Buffer != 0) &&
+        Enqueue(new Copy(from.Buffer, from.Offset, to.Buffer, to.Offset, size));
+
+    // Mirror as it stands (stale or not), for a copy back to OpenGL outside any frame
+    public (ulong Buffer, ulong Offset, long Size)? Held(uint buffer) =>
+        Assert(buffer > 0) && _mirrors.TryGetValue(buffer, out var mirror) && Assert(!mirror.Gone)
+            ? (mirror.Range.Buffer, mirror.Range.Offset, mirror.Size)
+            : null;
+
     private Mirror? Find(uint buffer)
     {
         ref var slot = ref _recent[buffer % Recent];
@@ -115,7 +145,6 @@ internal sealed unsafe class BufferMirrors : IDisposable
         return found;
     }
 
-    // glBufferData and glBufferStorage
     public void Data(uint buffer, long size, IntPtr data, bool persistent)
     {
         if (buffer == 0 || !Assert(size >= 0)) return;
@@ -124,8 +153,10 @@ internal sealed unsafe class BufferMirrors : IDisposable
         if (_sizes.Count < MaxMirrors || _sizes.ContainsKey(buffer)) _sizes[buffer] = size;
         if (persistent && _persistent.Count < MaxPersistent) _ = _persistent.Add(buffer);
         else _ = _persistent.Remove(buffer);
-        if (persistent || size is 0 or > EagerLimit || _mirrors.Count >= MaxMirrors ||
-            (!_wanted.Contains(buffer) && size > FirstLimit)) return;
+        // lean (GlTap.LeanBuffer): OpenGL keeps nothing, so the mirror is what OpenGL gets back, whatever the size
+        var lean = GlTap.LeanBuffer(buffer) && size <= int.MaxValue;
+        if (persistent || size == 0 || (size > EagerLimit && !lean) || _mirrors.Count >= MaxMirrors ||
+            (!_wanted.Contains(buffer) && size > FirstLimit && !lean)) return;
         if (_heap.Take((ulong)size) is not { } range) return;
         var mirror = new Mirror(range, size);
         _mirrors[buffer] = mirror;
@@ -226,31 +257,38 @@ internal sealed unsafe class BufferMirrors : IDisposable
         _ = Assert(range.Size >= (ulong)mirror.Size);
     }
 
-    private Mirror? Imported(uint buffer, Mirror? old)
+    // OpenGL's contents via host memory (waits for OpenGL's queue, once per pre-mirror or unseen buffer)
+    private Mirror? ReadBack(uint buffer, Mirror? old)
     {
-        if (!Assert(buffer > 0) || !Assert(_mirrors.Count <= MaxMirrors) || _imports is null) return null;
+        if (!Assert(buffer > 0) || !Assert(_mirrors.Count <= MaxMirrors) || _mirrors.Count >= MaxMirrors) return null;
+        if (GlTap.LeanBuffer(buffer)) return old; // lean: OpenGL holds none of it, what Vulkan last heard stays
         var size = SizeOf(buffer);
-        VulkanWatch.Mark($"mirror: importing buffer {buffer} of {size >> 10} KB");
         if (size <= 0 || size > int.MaxValue || _heap.Take((ulong)size) is not { } range) return null;
-        if (!_frame.Late() || _imports.Take((ulong)size, _frame.Number, out _) is not { } staged)
+        if (_staging.Take((int)size, out var at) is not { } staging)
         {
             _heap.Retire(range, _frame.Number);
             return null;
         }
 
+        var start = Hitches.Now;
+        using (GlTap.Quietly()) GL.GetNamedBufferSubData((int)buffer, IntPtr.Zero, (int)size, (IntPtr)staging.Pointer(at));
+        Hitches.Since(Hitches.Kind.BufferRead, start);
+        return Placed(buffer, old, (range, size), (staging.Buffer, (ulong)at));
+    }
+
+    // New mirror copied from staging in order with the frame's writes; the old range retires
+    private Mirror Placed(uint buffer, Mirror? old, (DeviceHeap.Range Range, long Size) to, (ulong Buffer, ulong At) from)
+    {
+        _ = Assert(buffer > 0) && Assert(to.Size > 0);
         if (old is not null)
         {
             _heap.Retire(old.Range, _frame.Number);
-            old.Gone = true; // removed or replaced below
+            old.Gone = true; // replaced
         }
 
-        var start = Hitches.Now;
-        using (GlTap.Quietly())
-            GL.CopyNamedBufferSubData((int)buffer, staged.Gl, IntPtr.Zero, new IntPtr((long)staged.At), (int)size);
-        Hitches.Since(Hitches.Kind.BufferRead, start); // no wait: what it costs the engine's thread
+        var (range, size) = to;
         var mirror = new Mirror(range, size);
-        if (!Enqueue(new Copy(staged.Buffer, staged.At, range.Buffer, range.Offset, (ulong)size)))
-            mirror.Spoil("copies queued full");
+        if (!Enqueue(new Copy(from.Buffer, from.At, range.Buffer, range.Offset, (ulong)size))) mirror.Spoil("copies queued full");
         _mirrors[buffer] = mirror;
         (Imports, ImportedBytes) = (Imports + 1, ImportedBytes + size);
         var why = old?.Why ?? FirstWhy(buffer, size);
@@ -258,10 +296,11 @@ internal sealed unsafe class BufferMirrors : IDisposable
         return mirror;
     }
 
-    // As OpenGL was told it; asked of OpenGL (a wait for Mesa's glthread, not for the GPU) for a buffer made before the mirrors
+    // As OpenGL was told; for pre-mirror buffers asked of OpenGL (waits for Mesa's glthread, not the GPU)
     private long SizeOf(uint buffer)
     {
         if (_sizes.TryGetValue(buffer, out var size) || !Assert(buffer > 0)) return size;
+        if (GlTap.BufferSizeOf(buffer) is { } recorded) return recorded;
         GL.GetNamedBufferParameter((int)buffer, BufferParameterName.BufferSize, out int asked);
         Asked++;
         if (_sizes.Count < MaxMirrors) _sizes[buffer] = asked;
@@ -280,6 +319,7 @@ internal sealed unsafe class BufferMirrors : IDisposable
     private bool Stage(ReadOnlySpan<byte> data, DeviceHeap.Range range, ulong offset)
     {
         if (!Assert(offset + (ulong)data.Length <= range.Size) || data.IsEmpty) return true;
+        if (Early is { Before: true } early) return early.Write((range.Buffer, range.Offset + offset), data);
         var staging = _staging.Take(data.Length, out var at);
         if (staging is null) return false;
         _ = Assert(at >= 0);
@@ -290,6 +330,8 @@ internal sealed unsafe class BufferMirrors : IDisposable
     private bool Enqueue(Copy copy)
     {
         if (!Assert(copy.Size > 0) || !Assert(_pending.Count <= MaxPending)) return false;
+        if (Early is { Before: true } early)
+            return early.Copy((copy.From, copy.FromOffset), (copy.To, copy.ToOffset), copy.Size);
         if (_frame.Open)
         {
             Record(_frame.Setup, copy);
@@ -301,7 +343,7 @@ internal sealed unsafe class BufferMirrors : IDisposable
         return true;
     }
 
-    // Copies overlapping what an earlier copy of the same transfers wrote wait for it
+    // Waits for earlier copies in the same transfers whose target it overlaps
     private void Record(IntPtr commands, Copy copy)
     {
         if (!Assert(commands != IntPtr.Zero) || !Assert(_written.Count <= MaxWritten)) return;

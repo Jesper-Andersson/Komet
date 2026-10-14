@@ -1,3 +1,5 @@
+using Komet.Rendering;
+
 namespace Komet.Test.Rendering;
 
 // A render call the loops leave out is one the engine's OnRenderFrame would have returned from without doing anything: golden against

@@ -14,6 +14,10 @@
 // Written for OpenGL and Vulkan alike: explicit bindings no two resources share, no loose uniforms. Needs doubles.
 layout(local_size_x = 64) in;
 
+const int Slabs = 4;                // per direction (FaceSorting.Slabs; 6 * Slabs bits fit a verdict below Whole)
+const int Segments = 6 * Slabs + 1; // the slabs, then the rest
+const uint Whole = 0x80000000u;     // a row's verdict: pass 0 hid it whole; else bit s, pass 0 hid slab s
+
 struct Row
 {
     vec3 centre; // FrustumCullSphere.x, y, z
@@ -22,14 +26,11 @@ struct Row
     uint first;  // first index
     uint flags;  // bit 0: Hide; bits 1-3: LodLevel 0 to 3, 4 for a level above, 5 for one below 0; bit 4: sorted
     uint chunk;  // the location's chunk in Chunks
-    uint splitsA; // each direction's faces before its split (0: none), as counts: -X | +X << 16, then -Y | +Y << 16
-    uint splitsB;
-    uvec4 counts; // sorted (FaceSorting): faces facing -X | +X << 16, -Y | +Y << 16, -Z | +Z << 16; the rest after them; w: the
-                  // splits of -Z | +Z << 16. Within a direction the faces go by their plane, least first.
-    vec4 planesA; // each direction's plane nearest the side it faces away from, relative to centre: -X, +X, -Y, +Y
-    vec2 planesB; // -Z, +Z
-    uvec2 steps;  // each split's plane relative to centre in quarter blocks, a signed byte: +a the least after it, -a the
-                  // greatest before it; x: -X, +X, -Y, +Y from the low byte up, y: -Z, +Z
+    uvec2 unused;
+    uint slabs[3 * Slabs];  // sorted (FaceSorting): faces per slab, two to a uint (slab s in the low half of s / 2 when even); slab
+                     // d * Slabs + j is direction d's (-X, +X, -Y, +Y, -Z, +Z) j-th, by plane least first; the rest after them
+    uint planes[3 * Slabs]; // each slab's least plane (low byte) and greatest (high byte) relative to centre in quarter blocks, signed,
+                     // rounded away from its faces; two slabs to a uint like slabs
 };
 
 struct Command // DrawElementsIndirectCommand, VkDrawIndexedIndirectCommand
@@ -54,18 +55,20 @@ layout(std140, binding = 15) uniform Frustum
 {
     dvec4 planes[6];     // the culler's frustum: normal xyz, D
     dvec4 camera;        // xyz: the camera the boxes are relative to
-    dvec4 player;        // x, y: the culler's playerPos X and Z
+    dvec4 player;        // x, y: the culler's playerPos X and Z; z: the far cache's radius squared, w: 1 when it is on
     dvec4 lods;          // x: (double)(lod0BiasSq + 1024f), y: (double)ViewDistanceSq, z: lod2BiasSq, w: 1 when lod0BiasSq > 0
     dvec4 shadow;        // x, y: shadowRangeX, shadowRangeZ
-    ivec4 misc;          // x: ModelDataPoolLocation.VisibleBufIndex; y: 0 CullNormal, 1 the near shadow pass, 2 the far one;
+    ivec4 misc;          // x: ModelDataPoolLocation.VisibleBufIndex; y: 0 CullNormal, 1 the near shadow pass, 2 the far one,
+                         // 3 the far cache's pass (CullNormal's rows past its radius, no verdicts, no counts);
                          // z: 1 when back faces are culled (a sorted row's directions facing away are left out), 2 so and
-                         // each direction's part past its split too (FaceSorting.Splitting); w: 1 when the
+                         // each direction's part past its split too (what Komet sends); w: 1 when the
                          // shadow passes leave out what casts nothing into the view (Casts)
-    dvec4 casters[5];    // the camera's near, left, right, top and bottom planes this frame, each moved out by a margin
+    dvec4 casters[5];    // the camera's near, left, right, top and bottom planes this frame, each moved out by a margin;
+                         // CullNormal with the far cache: the planes of the view it holds, each moved in
     dvec4 eye;           // xyz: where the view matrix puts the eye; camera is the player's position (CameraPos, the feet)
 };
 
-const double Beyond = 1.0 / 32.0; // the eye this far behind a direction's nearest plane sees none of its faces
+const double Beyond = 1.0 / 32.0; // the eye this far behind a slab's nearest plane sees none of its faces
 const uint Runs = 4u;              // commands a row may take (OcclusionCulling.Runs)
 
 layout(binding = 31) uniform sampler2D pyramid;
@@ -79,7 +82,7 @@ layout(std430, binding = 5) buffer Counters
 
 layout(std430, binding = 6) buffer Verdicts
 {
-    uint verdicts[]; // per row, 1: pass 0 hid it
+    uint verdicts[]; // per row
 };
 
 layout(std430, binding = 7) writeonly buffer Commands
@@ -171,16 +174,41 @@ bool Casts(Row row)
     return true;
 }
 
+// The row's box wholly inside the far cache's view: its corner nearest to each plane's inside on it
+bool Inside(Row row)
+{
+    for (int p = 0; p < 5; p++)
+    {
+        dvec4 plane = casters[p];
+        precise double x = double(row.centre.x) + double(plane.x > 0.0 ? -row.extent.x : row.extent.x);
+        precise double y = double(row.centre.y) + double(plane.y > 0.0 ? -row.extent.y : row.extent.y);
+        precise double z = double(row.centre.z) + double(plane.z > 0.0 ? -row.extent.z : row.extent.z);
+        if (x * plane.x + y * plane.y + z * plane.z + plane.w < 0.0) return false;
+    }
+
+    return true;
+}
+
+// The far cache's split (player.w on): its own pass takes the rows past its radius; the camera's leaves it those its view holds
+bool Split(Row row)
+{
+    if (player.w == 0.0) return misc.y == 0;
+    precise double dx = double(row.centre.x) - player.x;
+    precise double dz = double(row.centre.z) - player.y;
+    bool far = dx * dx + dz * dz >= player.z;
+    return misc.y == 3 ? far : !far || !Inside(row);
+}
+
 // ModelDataPoolLocation.IsVisible(mode, culler)
 bool Visible(Row row)
 {
     if ((row.flags & 1u) != 0u || ((chunks[row.chunk] >> uint(misc.x)) & 1u) == 0u) return false;
     uint lod = (row.flags >> 1) & 7u;
-    if (misc.y == 0)
+    if (misc.y == 0 || misc.y == 3)
     {
         for (int p = 0; p < 5; p++)
             if (Outside(planes[p], row)) return false;
-        return InRange(row, lod);
+        return InRange(row, lod) && Split(row);
     }
 
     // InFrustumShadowPass: (float)playerPos.X - sphere.x in floats, widened for the comparison, then all six planes
@@ -200,11 +228,11 @@ uint Bucket(Row row)
     return min(uint(sqrt(distance) * 2.8), Buckets - 1u);
 }
 
-// cull.comp's occlusion test of the location's box relative to this frame's camera, made as Occlusion.Box makes it
-bool Hidden(Row row)
+// cull.comp's occlusion test of a box (relative to this frame's camera) as Occlusion.Box makes it: the location's, or a slab's
+bool Hidden(vec3 low, vec3 high)
 {
-    vec3 centre = vec3(dvec3(row.centre) - camera.xyz);
-    vec3 low = centre - row.extent + shift.xyz, high = centre + row.extent + shift.xyz;
+    low += shift.xyz;
+    high += shift.xyz;
     vec2 lo = vec2(1.0), hi = vec2(-1.0);
     float nearest = 1.0;
     for (int corner = 0; corner < 8; corner++)
@@ -236,6 +264,16 @@ bool Hidden(Row row)
     return false;
 }
 
+// A slab's box: the location's (centre relative to the camera), cut on its axis to its planes (which never reach past the box's
+// faces by more than rounding)
+bool Hidden(vec3 centre, vec3 extent, int axis, float least, float greatest)
+{
+    vec3 low = centre - extent, high = centre + extent;
+    low[axis] = max(low[axis], centre[axis] + least);
+    high[axis] = min(high[axis], centre[axis] + greatest);
+    return high[axis] >= low[axis] && Hidden(low, high);
+}
+
 void main()
 {
     uint draw = uint(span.y) + gl_WorkGroupID.y;
@@ -244,7 +282,8 @@ void main()
     uint index = pool.x + gl_GlobalInvocationID.x;
     int pass = flags.y;
     bool again = pass == 1 || pass == 3;
-    if (again && verdicts[index] == 0u) return; // drawn in pass 0 already, or left out by the frustum
+    uint verdict = again ? verdicts[index] : 0u;
+    if (again && verdict == 0u) return; // drawn in pass 0 already, or left out by the frustum
     Row row = rows[index];
     bool viewed = misc.y == 0; // the shadow passes keep no verdicts and count nothing: the camera's passes read those
     if (!again && !Visible(row))
@@ -253,15 +292,17 @@ void main()
         return;
     }
 
-    bool hidden = (pass == 0 || pass == 1) && Hidden(row);
-    if (!again && viewed) verdicts[index] = hidden ? 1u : 0u;
+    bool testing = pass == 0 || pass == 1, whole = !again || (verdict & Whole) != 0u;
+    vec3 centre = vec3(dvec3(row.centre) - camera.xyz);
+    bool hidden = testing && whole && Hidden(centre - row.extent, centre + row.extent);
     uint stats = again ? 4u : 0u, triangles = row.count / 3u;
-    if (viewed)
+    if (viewed && whole)
     {
         atomicAdd(counters[stats], 1u);
         atomicAdd(counters[stats + 2u], triangles);
     }
 
+    if (!again && viewed && (hidden || misc.z == 0 || (row.flags & 16u) == 0u)) verdicts[index] = hidden ? Whole : 0u;
     if (hidden)
     {
         atomicAdd(counters[stats + 1u], 1u);
@@ -269,71 +310,97 @@ void main()
         return;
     }
 
-    // The runs of faces to draw: the whole range, or for a sorted row the parts of each direction facing the camera, neighbours
-    // joined. A direction's faces go by their plane, least first: -a seen from below a plane, its part before the split (planes
-    // up to the split's) is left out first; +a seen from above, its part after the split. So the parts seen of an axis's two
-    // directions touch, and a row takes at most Runs runs; past that a run would end, the last one reaches over the gap.
-    uint firsts[Runs], counts[Runs];
-    uint runs = 0u;
+    // The runs of faces to draw: the whole range, or for a sorted row the slabs facing the camera (each slab of a +a direction is
+    // seen from above its least plane, of a -a one from below its greatest) that the depth pyramid does not hide, with misc.z 2;
+    // with 1 a direction is one slab, its least plane to its greatest. Again for the slabs pass 0 hid (verdict bits) only those.
+    // Neighbours are joined; past Runs the smallest gaps are drawn over.
+    uint firsts[Segments], ends[Segments];
+    uint runs = 0u, drawn = 0u;
     if (misc.z == 0 || (row.flags & 16u) == 0u)
     {
-        firsts[0] = row.first;
-        counts[0] = row.count;
-        runs = 1u;
+        if (whole)
+        {
+            firsts[0] = row.first;
+            ends[0] = row.first + row.count;
+            runs = 1u;
+        }
     }
     else
     {
         dvec3 seen = eye.xyz - dvec3(row.centre);
-        float planes[6] = float[6](row.planesA.x, row.planesA.y, row.planesA.z, row.planesA.w, row.planesB.x, row.planesB.y);
-        uint splits[3] = uint[3](row.splitsA, row.splitsB, row.counts.w);
-        uint faces = 0u, open = 0xFFFFFFFFu;
-        for (int s = 0; s < 13; s++)
+        bool slabbed = misc.z == 2, occluding = slabbed && testing && viewed;
+        uint hid = 0u, faces = 0u;
+        bool open = false;
+        for (int s = 0; s < Segments; s++)
         {
             uint n;
-            bool shown = true;
-            if (s < 12)
+            bool shown = whole || s < Segments - 1 && (verdict >> uint(s) & 1u) != 0u;
+            if (s < Segments - 1)
             {
-                int g = s / 2;
-                bool after = (s & 1) == 1, rising = g % 2 == 1;
-                uint all = (row.counts[g / 2] >> (16u * uint(g % 2))) & 0xFFFFu;
-                uint split = misc.z == 2 ? (splits[g / 2] >> (16u * uint(g % 2))) & 0xFFFFu : 0u;
-                n = after ? all - split : split;
-                double plane = double(planes[g]);
-                if (split > 0u && after == rising)
-                    plane = double(bitfieldExtract(int(row.steps[g / 4]), 8 * (g % 4), 8)) * 0.25;
-                double at = seen[g / 2];
-                shown = rising ? at >= plane - Beyond : at <= plane + Beyond; // -a seen from below its greatest plane
+                int d = s / Slabs, axis = d / 2;
+                if (!slabbed && s % Slabs != 0) continue; // counted with the direction's first
+                n = 0u;
+                float least = 0.0, greatest = 0.0;
+                for (int j = 0; j < (slabbed ? 1 : Slabs); j++) // the direction whole: its first slab's least plane to its last's greatest
+                {
+                    uint k = (row.slabs[(s + j) / 2] >> (16u * uint((s + j) % 2))) & 0xFFFFu;
+                    if (k == 0u) continue;
+                    uint b = row.planes[(s + j) / 2] >> (16u * uint((s + j) % 2));
+                    if (n == 0u) least = float(bitfieldExtract(int(b), 0, 8)) * 0.25;
+                    greatest = float(bitfieldExtract(int(b), 8, 8)) * 0.25;
+                    n += k;
+                }
+
+                if (n == 0u) continue;
+                double at = seen[axis];
+                shown = shown && (d % 2 == 1 ? at >= double(least) - Beyond : at <= double(greatest) + Beyond);
+                if (shown && occluding && Hidden(centre, row.extent, axis, least, greatest))
+                {
+                    shown = false;
+                    hid |= 1u << uint(s);
+                }
             }
             else n = row.count / 6u - faces;
             if (shown && n > 0u)
             {
-                if (open == 0xFFFFFFFFu && runs < Runs)
+                uint first = row.first + 6u * faces;
+                if (!open) firsts[runs++] = first;
+                ends[runs - 1u] = first + 6u * n;
+                open = true;
+            }
+            else if (n > 0u) open = false;
+            faces += n;
+        }
+
+        if (!again && viewed) verdicts[index] = hid;
+        while (runs > Runs) // draw over the smallest gap
+        {
+            uint at = 0u, gap = 0xFFFFFFFFu;
+            for (uint r = 0u; r + 1u < runs; r++)
+                if (firsts[r + 1u] - ends[r] < gap)
                 {
-                    open = runs++;
-                    firsts[open] = row.first + 6u * faces;
-                    counts[open] = 0u;
-                }
-                else if (open == 0xFFFFFFFFu)
-                {
-                    open = runs - 1u;
-                    counts[open] = row.first + 6u * faces - firsts[open];
+                    gap = firsts[r + 1u] - ends[r];
+                    at = r;
                 }
 
-                counts[open] += 6u * n;
+            ends[at] = ends[at + 1u];
+            for (uint r = at + 1u; r + 1u < runs; r++)
+            {
+                firsts[r] = firsts[r + 1u];
+                ends[r] = ends[r + 1u];
             }
-            else if (n > 0u) open = 0xFFFFFFFFu;
-            faces += n;
+
+            runs--;
         }
     }
 
-    uint drawn = 0u;
-    for (uint r = 0u; r < runs; r++) drawn += counts[r];
-    if (viewed && drawn < row.count) atomicAdd(counters[stats + 3u], (row.count - drawn) / 3u); // facing away: as if hidden
+    for (uint r = 0u; r < runs; r++) drawn += ends[r] - firsts[r];
+    if (viewed && whole && drawn < row.count) atomicAdd(counters[stats + 3u], (row.count - drawn) / 3u); // facing away or hidden
     if (runs == 0u) return;
     uint slot = atomicAdd(counters[uint(flags.z) + draw], runs), bucket = Bucket(row);
     for (uint r = 0u; r < runs; r++)
     {
-        commands[uint(flags.w) + starts[draw] + slot + r] = Command(counts[r], 1u, firsts[r], 0, 0u);
+        commands[uint(flags.w) + starts[draw] + slot + r] = Command(ends[r] - firsts[r], 1u, firsts[r], 0, 0u);
         if (flags.w == 0) keys[starts[draw] + slot + r] = bucket;
     }
 }

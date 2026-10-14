@@ -1,5 +1,11 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Komet.Bench;
+using Komet.Chunks;
+using Komet.Core;
+using Komet.Diagnostics;
+using Komet.Rendering;
+using Komet.Tessellation;
 using Vintagestory.Server.Systems;
 using Komet.Test.Diagnostics;
 using static Komet.Testing.Profiles;
@@ -111,7 +117,7 @@ public sealed class BenchConfigTests
     [TestCase("\"laps\": 3, \"arms\": [ { \"name\": \"A\" }, { \"name\": \"B\" } ]", "a multiple of the 2 arms")]
     [TestCase("\"env\": { \"DOTNET_gcServer\": 1 }", "env.DOTNET_gcServer must be a string")]
     [TestCase("\"arms\": [ { \"name\": \"A\", \"set\": { \"Nonexistent\": true } } ]",
-        "arms[0].set.Nonexistent must be one of the knob names in Komet/Core/Features.cs")]
+        "arms[0].set.Nonexistent must be one of the knob names in Komet/Core/Features/Features.cs")]
     [TestCase("\"arms\": [ { \"name\": \"A\", \"set\": { \"My Mod:water\": true } } ]", "set.My Mod:water must be")]
     [TestCase("\"arms\": [ { \"name\": \"A\", \"set\": { \"mymod:\": true } } ]", "modid:name")]
     [TestCase("\"arms\": [ { \"name\": \"A\", \"set\": { \"mymod:water\": 1.5 } } ]", "true, false or a whole number")]

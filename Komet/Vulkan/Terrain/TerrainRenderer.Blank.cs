@@ -1,10 +1,8 @@
 namespace Komet.Vulkan;
 
-// A float 2D sampler whose unit holds no texture samples texture 0, which no one specified: incomplete, so it reads (0, 0, 0, 1)
-// (GL 4.6 core, 11.1.3.5). Mesa samples that as a 1x1 texture with the unit's sampling, its border included: with texture 0's
-// own (repeat, never set) every fetch is (0, 0, 0, 1), through a sampler object one clamping to a border mixes the border in.
-// So with no sampler object on the unit a 1x1 private image holding (0, 0, 0, 1), at rest for sampling for good, gives the same,
-// and the GUI's untextured draws stay Vulkan's; with one, OpenGL draws.
+// An empty unit samples incomplete texture 0: (0, 0, 0, 1) (GL 4.6 core 11.1.3.5). Mesa samples it as 1x1 with the
+// unit's sampling, border included, so a clamp-to-border sampler mixes the border in. Without a sampler object a 1x1
+// (0, 0, 0, 1) image matches and untextured GUI draws stay Vulkan's; with one, OpenGL draws.
 internal sealed unsafe partial class TerrainRenderer
 {
     private static readonly Samplers.State BlankSampling = new(false, false, 0, true, false);

@@ -9,12 +9,14 @@ internal sealed unsafe partial class TerrainPipeline
 
     public int[] Locations { get; private set; } = [];
 
+    private Vk.BindingDivisor[] Divisors { get; set; } = [];
+
     private (Vk.VertexBinding[] Bindings, Vk.VertexAttribute[] Attributes) Inputs(GlslPort.Ported ported,
         TerrainPools.Attribute[] attributes, out string missing)
     {
         missing = "";
         if (!NotNull(ported) || !NotNull(attributes)) return ([], []);
-        var inputs = ported.Attributes.OrderBy(a => a.Location).ToArray();
+        var inputs = GlslPort.Columns(ported.Attributes).OrderBy(a => a.Location).ToArray();
         var (bindings, formats) = (new Vk.VertexBinding[inputs.Length], new Vk.VertexAttribute[inputs.Length]);
         for (var i = 0; i < Math.Min(inputs.Length, MaxAttributes); i++)
         {
@@ -28,6 +30,8 @@ internal sealed unsafe partial class TerrainPipeline
                 Binding = (uint)location, Stride = (uint)stride,
                 InputRate = pool.Length == 1 && pool[0].Divisor > 0 ? 1u : 0
             };
+            if (pool.Length == 1 && pool[0].Divisor > 1) // Vulkan-only, with VK_EXT_vertex_attribute_divisor
+                Divisors = [.. Divisors, new Vk.BindingDivisor { Binding = (uint)location, Divisor = (uint)pool[0].Divisor }];
             formats[i] = new Vk.VertexAttribute
             {
                 Location = (uint)location, Binding = (uint)location, Format = format
@@ -84,10 +88,16 @@ internal sealed unsafe partial class TerrainPipeline
             };
             fixed (Vk.VertexBinding* bindings = input.Bindings)
             fixed (Vk.VertexAttribute* attributes = input.Attributes)
+            fixed (Vk.BindingDivisor* divisors = Divisors)
             {
+                var divided = new Vk.DivisorState
+                {
+                    SType = Vk.DivisorStateInfo, Count = (uint)Divisors.Length, Divisors = divisors
+                };
                 var vertexInput = new Vk.VertexInputState
                 {
-                    SType = Vk.VertexInputStateInfo, BindingCount = (uint)input.Bindings.Length, Bindings = bindings,
+                    SType = Vk.VertexInputStateInfo, Next = Divisors.Length > 0 ? &divided : null,
+                    BindingCount = (uint)input.Bindings.Length, Bindings = bindings,
                     AttributeCount = (uint)input.Attributes.Length, Attributes = attributes
                 };
                 return Graphics(stages, &vertexInput, pass);
@@ -132,12 +142,7 @@ internal sealed unsafe partial class TerrainPipeline
         var line = new Vk.LineState { SType = Vk.LineStateInfo, Mode = smooth ? LineSmooth : Vk.LineBresenham };
         if (lines && (_bresenham || smooth)) raster.Next = &line; // OpenGL's lines, not Vulkan's parallelograms
         var multisample = new Vk.MultisampleState { SType = Vk.MultisampleStateInfo, Samples = 1 };
-        var test = (state.Caps & (uint)GlTap.Caps.DepthTest) != 0;
-        var depth = new Vk.DepthStencilState
-        {
-            SType = Vk.DepthStencilStateInfo, DepthTest = test ? 1u : 0,
-            DepthWrite = test && state.DepthWrite ? 1u : 0, DepthCompare = state.DepthCompare, MaxDepthBounds = 1
-        };
+        var depth = Tested(state, target.Depth);
         var blends = stackalloc Vk.BlendAttachment[MaxColors];
         for (var i = 0; i < Math.Min(target.Colors.Length, MaxColors); i++) blends[i] = Blending(state.Blend[i]);
         var logic = (state.Caps & (uint)GlTap.Caps.LogicOp) != 0;
@@ -146,14 +151,22 @@ internal sealed unsafe partial class TerrainPipeline
             SType = Vk.ColorBlendStateInfo, AttachmentCount = (uint)target.Colors.Length, Attachments = blends,
             LogicOpEnable = logic ? 1u : 0, LogicOp = logic ? (state.Caps & GlTap.LogicOperationBits) >> 12 : 0
         };
-        var dynamics = stackalloc uint[] { Vk.DynamicViewport, Vk.DynamicScissor, Vk.DynamicLineWidth };
-        var dynamic = new Vk.DynamicState { SType = Vk.DynamicStateInfo, Count = lines ? 3u : 2, States = dynamics };
+        var stencil = depth.Stencil != 0; // its reference and masks are dynamic: the draw sets them (Stenciling)
+        var dynamics = stackalloc uint[]
+        {
+            Vk.DynamicViewport, Vk.DynamicScissor, stencil ? Vk.DynamicStencilCompare : Vk.DynamicLineWidth,
+            Vk.DynamicStencilWrite, Vk.DynamicStencilReference, Vk.DynamicLineWidth
+        };
+        var dynamic = new Vk.DynamicState
+        {
+            SType = Vk.DynamicStateInfo, Count = (stencil ? 5u : 2) + (lines ? 1u : 0), States = dynamics
+        };
         fixed (uint* colors = target.Colors)
         {
             var rendering = new Vk.PipelineRendering
             {
                 SType = Vk.RenderingCreateInfo, ColorCount = (uint)target.Colors.Length, ColorFormats = colors,
-                DepthFormat = target.Depth
+                DepthFormat = target.Depth, StencilFormat = Stenciled(target.Depth) ? target.Depth : 0
             };
             var info = new Vk.GraphicsInfo
             {
@@ -169,6 +182,33 @@ internal sealed unsafe partial class TerrainPipeline
             return null;
         }
     }
+
+    // The rendering attaches the depth as stencil too
+    public static bool Stenciled(uint format) => Assert(format != uint.MaxValue) && format is Vk.FormatD24S8 or Vk.FormatD32S8;
+
+    // Stencil only where the target has one (GlTap.StencilWord ops; reference and masks dynamic)
+    private static Vk.DepthStencilState Tested(GlTap.Fixed state, uint format)
+    {
+        var test = (state.Caps & (uint)GlTap.Caps.DepthTest) != 0;
+        var stencil = (state.Caps & (uint)GlTap.Caps.Stencil) != 0 && Stenciled(format);
+        _ = Assert(state.Stencil < 1u << 24) && Assert(format != uint.MaxValue);
+        return new Vk.DepthStencilState
+        {
+            SType = Vk.DepthStencilStateInfo, DepthTest = test ? 1u : 0,
+            DepthWrite = test && state.DepthWrite ? 1u : 0, DepthCompare = state.DepthCompare, MaxDepthBounds = 1,
+            Stencil = stencil ? 1u : 0, Front = stencil ? Face(state.Stencil) : default,
+            Back = stencil ? Face(state.Stencil >> 12) : default
+        };
+    }
+
+    private static Vk.StencilState Face(uint word) =>
+        Assert(word < 1u << 24) && Assert(word != uint.MaxValue)
+            ? new Vk.StencilState
+            {
+                Compare = word & 7, Fail = (word >> 3) & 7, DepthFail = (word >> 6) & 7, Pass = (word >> 9) & 7,
+                CompareMask = 0xFF, WriteMask = 0xFF
+            }
+            : default;
 
     private static uint Polygon(uint caps)
     {

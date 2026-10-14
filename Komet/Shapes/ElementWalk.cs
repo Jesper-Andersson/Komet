@@ -2,9 +2,7 @@ using System.Runtime.CompilerServices;
 
 namespace Komet.Shapes;
 
-// Pre-order over a ShapeElement tree without recursion: an element before its children, children in array order, which is the
-// order of the engine's recursive walks (Animation.GenerateFrame, Shape.CollectElements, CacheInverseTransformMatrixRecursive).
-// The stack lives in the struct, so a walk allocates nothing and shares nothing between threads.
+// Non-recursive pre-order over a ShapeElement tree, the order of the engine's recursive walks; allocation-free.
 internal ref struct ElementWalk
 {
     public const int MaxDepth = 64, MaxElements = 1 << 14;
@@ -24,8 +22,7 @@ internal ref struct ElementWalk
     public readonly int Parent => _owners[Depth]; // visit index of its parent, -1 for a root
     public bool Failed { get; private set; } // deeper than MaxDepth or more than MaxElements: the walk stopped short
 
-    // The next element, a null one included; false at the end of the tree or once Failed. Its children are pushed right away, which
-    // Skip undoes.
+    // The next element, null included; false at the end or once Failed. Children are pushed at once; Skip undoes that.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool Next(out ShapeElement? element)
     {

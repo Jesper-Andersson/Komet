@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Reflection;
 using HarmonyLib;
+using Komet.Core;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client;
 using Vintagestory.Client.NoObf;
@@ -8,21 +9,19 @@ using static Komet.Rendering.Fields;
 
 namespace Komet.Vulkan;
 
-// MeshDataPoolManager.AddModel makes a chunk pool when no pool has room (AllocateNewPool) and writes the chunk into it at once.
-// Preparing then adopted it by copying what was written and waiting for the GPU to finish the copy (and all before it, a frame in
-// flight) before handing the engine the moved pointers: a stall in the Before stage each time a pass grows by a pool while chunks
-// stream in. Adopted in AllocateNewPool's postfix, before the first write, the pool holds nothing: no copy, no wait (TerrainPools.Adopt
-// fresh). A pool made while a segment is open, or one the fresh adoption refused, is left to Preparing as before. The bodies that
-// make a pool are pinned (EngineShape): one that wrote into the new pool would lose that write to a fresh adoption.
+// MeshDataPoolManager.AddModel makes a chunk pool when none has room (AllocateNewPool) and writes into it at once.
+// Adopting it later (Preparing) means copying the written data and waiting for the GPU (a frame in flight), a
+// Before-stage stall per new pool while chunks stream. Adopted in AllocateNewPool's postfix the pool is still empty: no
+// copy, no wait (TerrainPools.Adopt fresh). Pools refused still go to Preparing. Always on: an exact saving.
+// Pool-making bodies are pinned (EngineShape): a write into the new pool there would be lost to fresh adoption.
 internal static partial class VulkanRenderer
 {
     // EngineShape of BirthSeams() in Vintage Story 1.22.7
     internal const ulong BirthFingerprint = 0x545C1A54CE3C990BUL;
 
     private static MeshDataPoolManager? _adding; // the manager whose AddModel runs, main thread
-    private static bool _births; // the patches are in
+    private static bool _births;
 
-    public static bool Births { get; set; } = true;
     public static long Born { get; private set; } // pools adopted as they were made, and the time it took
     public static long BirthTicks { get; private set; }
 
@@ -45,9 +44,9 @@ internal static partial class VulkanRenderer
         var add = AccessTools.DeclaredMethod(typeof(MeshDataPoolManager), nameof(MeshDataPoolManager.AddModel),
             [typeof(MeshData), typeof(Vec3i), typeof(int), typeof(Sphere)]);
         if (!NotNull(harmony) || !NotNull(add) || !Assert(seams.Length == 3) || !Assert(!Array.Exists(seams, s => s is null)) ||
-            !EngineShape.Matches(seams, fingerprint, "VulkanPoolBirths", _logger)) return;
+            !EngineShape.Matches(seams, fingerprint, "Vulkan pool births", _logger)) return;
         _ = NotNull(harmony.Patch(add, Of(nameof(Adding)), finalizer: Of(nameof(Added))));
-        _ = NotNull(harmony.Patch(seams[0], postfix: Of(nameof(Birth))));
+        _ = NotNull(harmony.Patch(seams[0], Of(nameof(Birthing)), Of(nameof(Birth)), finalizer: Of(nameof(Birthed))));
         _births = true;
     }
 
@@ -56,9 +55,16 @@ internal static partial class VulkanRenderer
 
     private static void Added() => _adding = null;
 
+    // A chunk pass's pool is being made: its buffers lean from a smaller size (GlTap.PoolBirth)
+    private static void Birthing() => GlTap.PoolBirth = _births && _adding is not null && Assert(_births);
+
+    private static void Birthed() => GlTap.PoolBirth = false;
+
     private static void Birth(MeshDataPool __result)
     {
-        if (!Births || !_births || _adding is not { } manager || State != Phase.Running || _renderer is not { } renderer ||
+        GlTap.PoolBirth = false;
+        if (!_births || _adding is not { } manager || (State != Phase.Running && !(OnlyOn && GlTap.Recording)) ||
+            _renderer is not { } renderer ||
             __result is null || ModelRef(__result) is not VAO vao || _api?.World is not ClientMain game ||
             TerrainOf(game) is not { } chunks) return;
         var pass = PassOf(PassPools(chunks), manager);

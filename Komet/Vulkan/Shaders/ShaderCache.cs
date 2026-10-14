@@ -5,15 +5,14 @@ using System.Text.Json.Serialization;
 
 namespace Komet.Vulkan;
 
-// So a program the engine built before costs a file read instead of shaderc and the driver's compiler on the render thread. Ports
-// go in a folder of this Komet build, as another build ports anew. The hot uniforms the scene settled on are kept per program, so
-// its first port already pushes them and neither a second port nor a second set of pipelines follows. Ports and hot uniforms are
-// written off the render thread, one after the other. Ports are made on the builders' threads (Builds), so the state they share
-// (the settled hot uniforms, the counts, the chain of writes) is guarded by State.
+// Built programs cost a file read instead of shaderc plus driver compile. A folder per Komet build. Settled hot
+// uniforms are kept per program, so the first port already pushes them. Writes run off the render thread, one at a
+// time; ports build on builder threads, so shared state is guarded by State.
 internal static class ShaderCache
 {
     private const int MaxPorts = 1024, MaxSettled = 1024, MaxFile = 64 << 20, KeyBytes = 16, MaxParts = 4;
-    private const string Format = "1", HotFile = "hot.json", PortsFolder = "ports";
+    private const string Format = "1", HotFile = "hot.json", PortsFolder = "ports", RecipesFile = "pipelines.json";
+    private const int MaxRecipes = 256, MaxRecipePrograms = 1024;
 
     private static readonly JsonSerializerOptions Json = new()
     {
@@ -25,28 +24,51 @@ internal static class ShaderCache
         typeof(ShaderCache).Assembly.ManifestModule.ModuleVersionId.ToString("N")[..12];
 
     private static Dictionary<string, string[]>? _settled;
+    private static Dictionary<string, List<Recipe>>? _recipes;
+    private static bool _recipesQueued;
     private static Task _writes = Task.CompletedTask;
     private static int _kept;
 
     public static bool Enabled { get; set; } = true;
 
-    // Where the files go; "" until Install, so tests never touch the game's folders
+    // "" until Install, so tests never touch the game's folders
     public static string Folder { get; private set; } = "";
     public static bool Active => Enabled && Folder.Length > 0;
 
     public static int Loaded { get; private set; }
     public static long PipelineBytes { get; set; }
 
-    public static void Install(ILogger logger)
+    public static void Install(ILogger logger, ICoreClientAPI? api = null)
     {
         if (!NotNull(logger)) return;
         Open(Path.Join(Vintagestory.API.Config.GamePaths.Cache, "komet-vulkan"));
+        Seeded(api);
         var folder = Folder;
         lock (State) _writes = _writes.ContinueWith(_ => Dropped(folder, logger), TaskScheduler.Default);
         _ = Assert(Active || !Enabled);
     }
 
-    // The other builds' ports: never read again
+    // Pipeline recipes the mod ships (assets/komet/config/pipelines.json, recorded on a 1.22.7 session): a first start
+    // warms those pipelines off the engine's thread instead of making each as a draw first needs it
+    private static Dictionary<string, List<Recipe>>? _seed;
+
+    private static void Seeded(ICoreClientAPI? api)
+    {
+        _seed = null;
+        if (api?.Assets is not { } assets || !Assert(Folder.Length > 0 || !Enabled)) return;
+        try
+        {
+            var text = assets.TryGet(new AssetLocation("komet", "config/pipelines.json"))?.ToText();
+            if (text is null || text.Length > MaxFile) return;
+            if (JsonSerializer.Deserialize<Dictionary<string, List<Recipe>>>(text, Json) is { } read)
+                lock (State) _seed = read;
+        }
+        catch (Exception e) when (e is JsonException or IOException or NotSupportedException)
+        {
+            // no seed: recipes come as they are made
+        }
+    }
+
     private static void Dropped(string folder, ILogger logger)
     {
         var ports = Path.Join(folder, PortsFolder);
@@ -66,7 +88,7 @@ internal static class ShaderCache
     public static void Open(string folder)
     {
         if (!NotNull(folder)) return;
-        lock (State) (Folder, _settled, Loaded, _kept, PipelineBytes) = (folder, null, 0, 0, 0);
+        lock (State) (Folder, _settled, _recipes, Loaded, _kept, PipelineBytes) = (folder, null, null, 0, 0, 0);
         _ = Assert(Folder == folder);
     }
 
@@ -143,7 +165,88 @@ internal static class ShaderCache
         }
     }
 
-    // The device checks the header against itself before it hands it to the driver
+    // A pipeline a port drew with, keyed by the program's sources, so a later start builds it before the first draw.
+    // Fixed: see PipelineRecipes.
+    public sealed record Recipe(string Inputs, string Target, uint Topology, uint[] Colors, uint Depth, uint[] Fixed,
+        long[] Attributes);
+
+    public static Recipe[] Recipes(string sources)
+    {
+        if (!Active || !NotNull(sources) || sources.Length == 0) return [];
+        lock (State)
+        {
+            var recipes = _recipes ??= ReadRecipes();
+            _ = Assert(recipes.Count <= MaxRecipePrograms);
+            return recipes.TryGetValue(sources, out var known) ? [.. known] : [];
+        }
+    }
+
+    // Written off-thread, one at a time: a burst of new pipelines writes the file once or twice
+    public static void Remember(string sources, Recipe recipe)
+    {
+        if (!Active || !Assert(sources.Length > 0) || !NotNull(recipe)) return;
+        lock (State)
+        {
+            var recipes = _recipes ??= ReadRecipes();
+            if (!recipes.TryGetValue(sources, out var known))
+            {
+                if (recipes.Count >= MaxRecipePrograms) return;
+                recipes[sources] = known = [];
+            }
+
+            if (known.Count >= MaxRecipes || known.Exists(r => Same(r, recipe))) return;
+            known.Add(recipe);
+            if (_recipesQueued) return;
+            _recipesQueued = true;
+            var path = Path.Join(Folder, RecipesFile);
+            _writes = _writes.ContinueWith(_ => Write(path, RecipeBytes()), TaskScheduler.Default);
+        }
+    }
+
+    private static bool Same(Recipe a, Recipe b) =>
+        NotNull(a) && NotNull(b) && a.Inputs == b.Inputs && a.Target == b.Target && a.Fixed.AsSpan().SequenceEqual(b.Fixed);
+
+    private static byte[] RecipeBytes()
+    {
+        lock (State)
+        {
+            _recipesQueued = false;
+            _ = Assert(_recipes is null || _recipes.Count <= MaxRecipePrograms);
+            return JsonSerializer.SerializeToUtf8Bytes(_recipes ?? [], Json);
+        }
+    }
+
+    private static Dictionary<string, List<Recipe>> ReadRecipes()
+    {
+        var path = Path.Join(Folder, RecipesFile);
+        var read = new Dictionary<string, List<Recipe>>(StringComparer.Ordinal);
+        try
+        {
+            if (Assert(Folder.Length > 0) && File.Exists(path) && new FileInfo(path).Length <= MaxFile &&
+                JsonSerializer.Deserialize<Dictionary<string, List<Recipe>>>(File.ReadAllBytes(path), Json) is { } file)
+                foreach (var (key, recipes) in file.Take(MaxRecipePrograms).ToArray().Bounded(MaxRecipePrograms))
+                    if (recipes is not null)
+                        read[key] = [.. recipes.Where(Whole).Take(MaxRecipes)];
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or
+                                      NotSupportedException)
+        {
+            // started anew
+        }
+
+        if (_seed is { } seed) // what the file lacks, the mod's seed gives
+            foreach (var (key, recipes) in seed.Take(MaxRecipePrograms).ToArray().Bounded(MaxRecipePrograms))
+                if (recipes is not null && !read.ContainsKey(key) && read.Count < MaxRecipePrograms)
+                    read[key] = [.. recipes.Where(Whole).Take(MaxRecipes)];
+        _ = Assert(read.Count <= MaxRecipePrograms);
+        return read;
+    }
+
+    private static bool Whole(Recipe r) =>
+        r is { Inputs: not null, Target: not null, Colors: not null, Fixed.Length: 12 or 13, Attributes: not null } &&
+        r.Attributes.Length % 9 == 0 && Assert(r.Colors.Length < 1 << 16);
+
+    // The device checks the header before handing it to the driver
     public static byte[]? Pipelines(uint vendor, uint model)
     {
         if (!Active) return null;
@@ -161,10 +264,10 @@ internal static class ShaderCache
         }
     }
 
-    // The device's pipeline cache as it goes; written at once, as the process may end right after
+    // Written at once: the process may end right after
     public static void KeepPipelines(uint vendor, uint model, byte[] data)
     {
-        if (!Active || !NotNull(data) || data.Length == 0 || !Assert(data.Length <= MaxFile)) return;
+        if (!Active || !NotNull(data) || data.Length is 0 or > MaxFile) return; // a driver may keep more: not kept then, not wrong
         Write(PipelinePath(vendor, model), data);
     }
 
@@ -198,7 +301,7 @@ internal static class ShaderCache
         return read;
     }
 
-    // Written to a file beside it and moved over it: a reader never sees half a file
+    // Via a side file moved over it: a reader never sees half a file
     private static void Write(string path, byte[] bytes)
     {
         if (!Assert(path.Length > 0) || !NotNull(bytes)) return;
@@ -222,7 +325,8 @@ internal static class ShaderCache
     {
         _ = Assert(Folder.Length > 0) && Assert(sources.Length == 2 * KeyBytes);
         var hotNames = hot is null ? "" : string.Join(";", hot.Order(StringComparer.Ordinal));
-        return Path.Join(Folder, PortsFolder, Build, Hash(Format, sources, hotNames) + ".json");
+        var format = GlslPort.PointSized ? Format + "p" : Format; // Vulkan-only's ports write gl_PointSize
+        return Path.Join(Folder, PortsFolder, Build, Hash(format, sources, hotNames) + ".json");
     }
 
     private static string PipelinePath(uint vendor, uint model)

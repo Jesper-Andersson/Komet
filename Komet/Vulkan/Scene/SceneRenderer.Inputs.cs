@@ -5,7 +5,7 @@ internal sealed partial class SceneRenderer
     private const uint Texture2D = 0x0DE1;
     private const int MaxSeen = 256;
 
-    // What the units of a program's samplers hold: the texture of each sampler's kind and the sampler object, up to four
+    // Per sampler unit: texture of the sampler's kind and sampler object, up to four
     private readonly record struct Units(uint T0, uint S0, uint T1, uint S1, uint T2, uint S2, uint T3, uint S3)
     {
         public const int Max = 4;
@@ -56,7 +56,6 @@ internal sealed partial class SceneRenderer
         return seen.Recorded;
     }
 
-    // The units of at most four samplers: what each holds, the texture of the sampler's kind and the sampler object
     private static Units? UnitsOf(Drawn program)
     {
         var count = program.Kinds.Length;
@@ -73,21 +72,20 @@ internal sealed partial class SceneRenderer
         return new Units(held[0], held[1], held[2], held[3], held[4], held[5], held[6], held[7]);
     }
 
-    // Resolved before with the units holding the same, and no texture deleted, sampler uniform set, copy or target changed since
     private Seen? Known(Drawn program, VulkanFrame.Target target, Units units)
     {
         if (!NotNull(program) || !Assert(program.Seen.Count <= MaxSeen)) return null;
         var held = SeenOf(program, target);
-        if (program.SeenHeld == held) return _terrain.Copies.AnyDirty ? null : program.Seen.GetValueOrDefault(units);
+        if (program.SeenHeld == held) return program.Seen.GetValueOrDefault(units);
         program.Seen.Clear();
         program.SeenHeld = held;
         return null;
     }
 
-    // A dirty copy is refreshed by the next resolve that reads it (Copy), so the cache answers only while none is
+    // Dirty copies refresh on the next resolve reading them (Copy), so the cache answers only while none is dirty
     private (long, int, long, long, VulkanFrame.Target?) SeenOf(Drawn program, VulkanFrame.Target target) =>
         Assert(target is not null) && NotNull(program)
-            ? (GlTap.DeleteVersion, program.Program.Mirror.Samplers, _terrain.Copies.Shape, _terrain.Targets.Version, target)
+            ? (GlTap.DeleteVersion, program.Program.Mirror.Samplers, _terrain.TextureVersion, _terrain.Targets.Version, target)
             : default;
 
     private void Keep(Drawn program, (Units Units, VulkanFrame.Target Target) at, TerrainDraw.Program recorded)
@@ -105,11 +103,10 @@ internal sealed partial class SceneRenderer
 
     private (long, int, long, long, VulkanFrame.Target?) HeldOf(Drawn program, VulkanFrame.Target target) =>
         Assert(target is not null) && NotNull(program)
-            ? (GlTap.DeleteVersion, program.Program.Mirror.Samplers, _terrain.Copies.Version, _terrain.Targets.Version,
+            ? (GlTap.DeleteVersion, program.Program.Mirror.Samplers, _terrain.TextureVersion, _terrain.Targets.Version,
                 target)
             : default;
 
-    // Other binds came between, but every unit the program's samplers read holds what it held when they were resolved
     private bool Unchanged(Drawn program, VulkanFrame.Target target)
     {
         if (!NotNull(program) || program.Held != HeldOf(program, target)) return false;
@@ -121,7 +118,7 @@ internal sealed partial class SceneRenderer
 
     private (long, int, long, long, VulkanFrame.Target?) KeyOf(Drawn program, VulkanFrame.Target target) =>
         Assert(target is not null) && NotNull(program)
-            ? (GlTap.TextureVersion, program.Program.Mirror.Samplers, _terrain.Copies.Version, _terrain.Targets.Version,
+            ? (GlTap.TextureVersion, program.Program.Mirror.Samplers, _terrain.TextureVersion, _terrain.Targets.Version,
                 target)
             : default;
 
@@ -151,17 +148,15 @@ internal sealed partial class SceneRenderer
         var kind = program.Kinds[port.At];
         var texture = (int)GlTap.UnitTexture(unit, kind);
         if (texture == 0) return Blank(program, (sampler, unit, kind), out why);
-        var image = _terrain.Targets.Find(texture);
-        if (image is null && kind is not (Texture2D or GlTap.TextureCube))
-            return Unsampled(out why, program, sampler.Name, "not a 2D texture or a cube map");
-        image ??= _terrain.Copy(texture, out why);
+        var image = _terrain.SampledFind(texture);
+        image ??= _terrain.Copy(texture, out why); // any kind
         if (image is null) return Unsampled(out why, program, sampler.Name, why);
         if (image.Cube != (kind == GlTap.TextureCube)) return Unsampled(out why, program, sampler.Name, "no cube copy");
         var samplerObject = GlTap.Unit(unit).Sampler;
         _bound.Add((unit, kind, (uint)texture, samplerObject));
         var state = samplerObject > 0
             ? SamplerObject(samplerObject)
-            : _terrain.Targets.Sampling(texture) ?? _terrain.Copies.SamplingOf(texture);
+            : _terrain.Targets.Sampling(texture) ?? _terrain.SamplingOf(texture);
         if (state is null) return Unsampled(out why, program, sampler.Name, $"texture {texture} has no sampling");
         if (!_sampled.Contains(image)) _sampled.Add(image);
         var layout = image == target.Depth ? LayoutDepthReadOnly : Vk.LayoutShaderRead;
@@ -177,7 +172,7 @@ internal sealed partial class SceneRenderer
         _ => Assert(sampler > 0) ? "the engine bound no texture to it, read through a sampler object" : ""
     };
 
-    // A unit holding no texture: what OpenGL reads from texture 0, nothing the frame hands over
+    // Empty unit: what OpenGL reads from texture 0
     private TerrainDraw.Texture? Blank(Drawn program, (GlslPort.Sampler Sampler, int Unit, uint Kind) at, out string why)
     {
         why = "";
@@ -190,7 +185,7 @@ internal sealed partial class SceneRenderer
 
     private static TerrainDraw.Texture? Unsampled(out string why, Drawn program, string sampler, string reason)
     {
-        why = $"{program.Name} reads {sampler}: {reason}";
+        why = TerrainRenderer.Reason("{0} reads {1}: {2}", program.Name, sampler, reason);
         _ = Assert(why.Length > 0) && NotNull(program);
         return null;
     }
@@ -202,7 +197,7 @@ internal sealed partial class SceneRenderer
         return type.Contains("Array", StringComparison.Ordinal) ? GlTap.Texture2DArray : Texture2D;
     }
 
-    // The program's last vertex array again, unchanged: no lookup
+    // Same vertex array as last time: no lookup
     private Layout? LayoutFor(GlTap.VertexArray array, Drawn program)
     {
         if (program.Laid is var (last, changes, known) && ReferenceEquals(last, array) && changes == array.Changes)
@@ -213,7 +208,7 @@ internal sealed partial class SceneRenderer
         return layout;
     }
 
-    // A disabled attribute reads the constant (0, 0, 0, 1), as OpenGL gives it
+    // Disabled attributes read the constant (0, 0, 0, 1), as in OpenGL
     private Layout? LayoutOf(GlTap.VertexArray array, Drawn program)
     {
         if (!NotNull(array) || !NotNull(program)) return null;
@@ -221,11 +216,12 @@ internal sealed partial class SceneRenderer
         if (_layouts.TryGetValue(key, out var known)) return known;
         var attributes = new List<TerrainPools.Attribute>();
         var sources = new List<(int, uint, long)>();
-        foreach (var input in program.Program.Ported.Attributes.Bounded(MaxInputs))
+        foreach (var input in GlslPort.Columns(program.Program.Ported.Attributes).Bounded(MaxInputs))
         {
             var a = input.Location < GlTap.MaxAttributes ? array.Attributes[input.Location] : default;
             var integer = input.Type.StartsWith('i') || input.Type.StartsWith('u');
-            if (a.Divisor > 1 || (a.Enabled && Mirrors.Persistent(a.Buffer))) return Remember(key, null);
+            // persistent buffers from their mapping (PersistentMaps); divisors past 1 need VK_EXT_vertex_attribute_divisor
+            if (a.Divisor > 1 && !_terrain.Device.Divisors) return Remember(key, null);
             var constantType = (int)(integer ? GlInt : GlFloat);
             var made = a.Enabled
                 ? new TerrainPools.Attribute(input.Location, sources.Count, a.Size, (int)a.Type, a.Normalized, a.Integer)
@@ -236,8 +232,8 @@ internal sealed partial class SceneRenderer
             if (TerrainPipeline.Format(made) == 0) return Remember(key, null);
             attributes.Add(made);
             var constant = integer ? 16L : 0L; // where the constant of the input's kind lies
-            // The pointer's offset goes into the binding: the pipeline's attributes start at 0 (interleaved instance data, the
-            // particles' position and scale, sits at 0 and 12 in one buffer)
+            // Pointer offset goes into the binding, attributes start at 0 (interleaved instance data, e.g. particles at
+            // 0 and 12)
             sources.Add((input.Location, a.Enabled ? a.Buffer : 0, a.Enabled ? a.Offset : constant));
         }
 
@@ -260,7 +256,7 @@ internal sealed partial class SceneRenderer
         return layout;
     }
 
-    // waiting: the pipeline is being made, the draw stays OpenGL's (nothing remembered, so a later draw finds it made)
+    // waiting: pipeline building, the draw waits for it (nothing remembered, so a later draw finds it)
     private TerrainPipeline? Pipeline(Drawn program, Layout layout,
         (uint Topology, VulkanFrame.Target Target, GlTap.Fixed State) pass, out bool waiting)
     {
@@ -295,11 +291,15 @@ internal sealed partial class SceneRenderer
         var into = _terrain.Formats(target, ref state);
         var key = new PipelineKey(program.Program.Id, program.Port, $"{formats.Key}|{topology}", into.Key, state);
         var (device, attributes) = (_terrain.Device, formats.Attributes);
-        return _pipelines.Get(key, (program.Name, program.Program.Ported),
-            ported => TerrainPipeline.Started(device, ported, attributes, (state, into.Target, topology)), false, out waiting);
+        var known = _pipelines.Knows(key);
+        var made = _pipelines.Get(key, (program.Name, program.Program.Ported),
+            ported => TerrainPipeline.Started(device, ported, attributes, (state, into.Target, topology)), true,
+            out waiting); // waits for it: the draw would be missing
+        if (!known) Learned(program, formats, (key, topology, into.Target));
+        return made;
     }
 
-    // The old ports' pipelines go once no frame in flight uses them: no handoff, no wait for the GPU. keep: a port's to keep
+    // Old ports' pipelines go once no frame in flight uses them (no GPU wait). keep: a port's to keep
     private void ForgetPipelines(int program, int keep)
     {
         if (!Assert(program >= 0) || !Assert(_pipelines.Count <= MaxPipelines)) return;
@@ -317,13 +317,18 @@ internal sealed partial class SceneRenderer
         {
             var mirror = buffer == 0 ? (Constants.Buffer, 0UL, Constants.Size) : Mirrors.Read(buffer);
             if (mirror is not { } m) return Refuse(out why, $"buffer {buffer} has no mirror");
+            if (offset < 0 || (buffer != 0 && (ulong)offset >= m.Item3)) // read past the buffer's end
+                return Refuse(out why, $"a vertex input past the end of buffer {buffer}");
             _vertices.Add(((uint)location, m.Buffer, m.Offset + (ulong)offset));
         }
 
         if (call.IndexType != 0)
         {
             if (Mirrors.Read(input.Array.Elements) is not { } e) return Refuse(out why, "the indices have no mirror");
-            var type = call.IndexType == UnsignedInt ? Vk.IndexUint32 : Vk.IndexUint16;
+            var type = call.IndexType switch
+            {
+                UnsignedInt => Vk.IndexUint32, UnsignedByte => Vk.IndexUint8, _ => Vk.IndexUint16 // 8-bit: Vulkan-only's
+            };
             indices = (e.Buffer, e.Offset + (ulong)call.Indices, type);
         }
 
@@ -346,6 +351,8 @@ internal sealed partial class SceneRenderer
             {
                 if (Mirrors.Read(bound.Buffer) is not { } m)
                     return Refuse(out why, $"{program.Name}'s block {blocks[i].Name} reads a buffer with no mirror");
+                if (bound.Offset < 0 || (ulong)bound.Offset + (ulong)Math.Max(bound.Size, 0) > m.Size)
+                    return Refuse(out why, $"{program.Name}'s block {blocks[i].Name} reads past its buffer");
                 var size = bound.Size > 0 ? (ulong)bound.Size : m.Size - (ulong)bound.Offset;
                 descriptor = new Vk.BufferDescriptor
                 {

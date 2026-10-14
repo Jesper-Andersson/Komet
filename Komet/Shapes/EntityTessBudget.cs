@@ -2,21 +2,17 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Reflection.Emit;
 using HarmonyLib;
+using Komet.Core;
+using Komet.Diagnostics;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.Client;
 using Vintagestory.Client.NoObf;
 
 namespace Komet.Shapes;
 
-// EntityShapeRenderer.BeforeRender tesselates every visible entity whose shape is not fresh in one frame, its main-thread half
-// (shape composition, animation init, animator, textures) included. Entities come due in bursts: shapeFresh starts false and is
-// cleared on load and spawn, so a chunk full of animals coming online or the camera turning toward a herd tesselates all of them at
-// once, and so do gear and skin changes.
-//
-// shapeFresh itself stays false, so a deferred entity asks again next frame. It is in a state vanilla already produces for any entity
-// outside the frustum or whose chunk is not drawn yet: not tesselated, no mesh, Animator null, which BeforeRender, the render passes
-// and AnimationManager.OnClientFrame all handle; one that re-tesselates keeps its old mesh and animator together until its turn.
-// Entities are known by id and code only, so no static keeps a world alive after it is left, not even one whose TesselateShape threw.
+// BeforeRender tesselates every stale visible entity in one frame, and they come in bursts (chunk loads, herds, gear).
+// A deferred one keeps shapeFresh false and asks again, in the state vanilla gives culled entities (no mesh, Animator
+// null). Known by id and code only, so no world is kept alive.
 internal static class EntityTessBudget
 {
     public const int Engine = 0, MaxMillis = 50, DefaultMillis = 4, MaxWaitFrames = 30;
@@ -75,7 +71,7 @@ internal static class EntityTessBudget
                 "every entity tessellates at once, as in the engine");
     }
 
-    // EntityShapeRenderer lives in VSEssentials, which Komet does not reference; declared there, not inherited
+    // EntityShapeRenderer is in VSEssentials (unreferenced); declared there, not inherited
     internal static MethodInfo? Before() => AccessTools.TypeByName(Renderer) is { } type
         ? AccessTools.DeclaredMethod(type, nameof(EntityRenderer.BeforeRender), [typeof(float)]) : null;
 
@@ -95,8 +91,7 @@ internal static class EntityTessBudget
         if (_budget == 0 && Waiting.Count > 0) Waiting.Clear();
     }
 
-    // Stands in for entity.ShapeFresh in BeforeRender: true skips the tesselation this frame. A null entity throws as the engine's
-    // callvirt did.
+    // Replaces entity.ShapeFresh in BeforeRender: true skips this frame's tesselation; null throws as the engine's
     internal static bool Fresh(Entity entity)
     {
         if (entity.ShapeFresh) return true;
@@ -110,7 +105,7 @@ internal static class EntityTessBudget
             return false;
         }
 
-        // Counted in frames it asked and was put off, not frames since: one that left the view while waiting has not waited
+        // Counted in frames asked and put off, not frames since: one that left the view has not waited
         if (waited == 0 && Waiting.Count >= MaxWaiting) Waiting.Clear(); // despawned waiters: start over, don't grow
         Waiting[id] = waited + 1;
         _code = null; // nothing of it to time
@@ -118,7 +113,7 @@ internal static class EntityTessBudget
         return Assert(_frame > 0) && Assert(Waiting.Count <= MaxWaiting);
     }
 
-    // Around the TesselateShape() call in BeforeRender. One that throws leaves _began set; the next Begin overwrites it.
+    // Around TesselateShape() in BeforeRender. One that throws leaves _began set; the next Begin overwrites it.
     internal static void Begin()
     {
         _began = Stopwatch.GetTimestamp();
@@ -140,9 +135,7 @@ internal static class EntityTessBudget
         if (ms > SlowestMs) (SlowestMs, SlowestCode) = (ms, code?.ToShortString() ?? "");
     }
 
-    // The one ldstr "esr-tesseleateshape", the one read of ShapeFresh and the one TesselateShape() call, read before call before
-    // mark: the read becomes Fresh (the same Entity in, the same bool out) in place, so labels and blocks stay where they were, and
-    // the call is bracketed by Begin and End. Any other count or order: the engine's IL, untouched.
+    // ldstr "esr-tesseleateshape", ShapeFresh read, TesselateShape() once each in order: read → Fresh, call → Begin/End
     internal static List<CodeInstruction> Substitute(IEnumerable<CodeInstruction> instructions)
     {
         Substituted = false;

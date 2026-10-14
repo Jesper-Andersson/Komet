@@ -1,3 +1,4 @@
+using Komet.Rendering;
 using Komet.Vulkan;
 
 namespace Komet.Test.Rendering;
@@ -28,7 +29,7 @@ public sealed class PoolUpdatesTests
     [Test]
     public void AnUpdateIntoThePoolGoesThroughWithItsBytes()
     {
-        using var window = Gpu.OcclusionGpuTests.Context(); // a taken upload makes the engine's GL binds
+        using var window = Gpu.GlContext.Context(); // a taken upload makes the engine's GL binds
         if (window is null) Assert.Ignore("no OpenGL 4.6 context here");
         using var harmony = new TestHarmony("komet-test-poolupdates");
         PoolUpdates.Install(harmony, new QuietLogger());

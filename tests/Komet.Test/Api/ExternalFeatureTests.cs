@@ -1,3 +1,8 @@
+using Komet.Api;
+using Komet.Bench;
+using Komet.Core;
+using Komet.Hud;
+using Komet.Options;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -265,7 +270,7 @@ public sealed class ExternalFeatureTests
         });
     }
 
-    // komet-hud.json saves Komet's knobs alone: the mod saves its own
+    // komet.json saves Komet's knobs alone: the mod saves its own
     [Test]
     public void TheSettingsFileKeepsKometsKnobsAlone()
     {

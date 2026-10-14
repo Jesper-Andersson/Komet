@@ -3,17 +3,16 @@ using System.Text;
 
 namespace Komet.Vulkan;
 
-// The device whose UUID OpenGL reports (GL_EXT_memory_object), which is what lets the two share memory and semaphores. Linux
-// shares through file descriptors (VK_KHR_external_memory_fd, VK_KHR_external_semaphore_fd); Windows' handles come later.
+// The device whose UUID GL reports (GL_DEVICE_UUID_EXT where offered), else picked by GL's vendor and renderer names
+// (Pick). Nothing is shared with OpenGL.
 internal sealed unsafe partial class VulkanDevice : IDisposable
 {
     public const int UuidBytes = 16;
     private const int MaxDevices = 16, MaxFamilies = 32;
     private const string ClipControl = "VK_EXT_depth_clip_control", LineRasterization = "VK_KHR_line_rasterization";
-    private const int MaxExtensions = 1024, MaxWanted = 8;
+    private const int MaxExtensions = 1024, MaxWanted = 12;
 
-    private static readonly string[] Extensions =
-        ["VK_KHR_external_memory_fd", "VK_KHR_external_semaphore_fd", "VK_KHR_push_descriptor"];
+    private static readonly string[] Extensions = ["VK_KHR_push_descriptor"];
 
     private IntPtr _instance, _physical, _device, _queue, _commands;
     private ulong _pool, _fence;
@@ -25,8 +24,7 @@ internal sealed unsafe partial class VulkanDevice : IDisposable
     // VK_EXT_depth_clip_control is on: a pipeline can take OpenGL's clip space depth, -1 to 1, as it is
     public bool DepthClipControl { get; private set; }
 
-    // Lines wider than a pixel (the engine outlines the selected block 1.6 wide), rasterized as OpenGL does (Bresenham's, not
-    // Vulkan's parallelograms) where the device offers it
+    // Lines wider than a pixel (block outline is 1.6), rasterized like GL (Bresenham, not parallelograms) where offered
     public bool WideLines { get; private set; }
     public bool BresenhamLines { get; private set; }
 
@@ -58,13 +56,13 @@ internal sealed unsafe partial class VulkanDevice : IDisposable
     public bool WaylandSurfaces { get; private set; }
     public bool Swapchains { get; private set; }
 
-    public SharedArena Arena => _arena ??= new SharedArena(this);
-    private SharedArena? _arena;
+    public static VulkanDevice? Create(ReadOnlySpan<byte> uuid, out string why) => Create(uuid, default, out why);
 
-    public static VulkanDevice? Create(ReadOnlySpan<byte> uuid, out string why)
+    // No UUID: picked by GL_VENDOR/GL_RENDERER (Pick)
+    public static VulkanDevice? Create(ReadOnlySpan<byte> uuid, (string? Vendor, string? Renderer) gl, out string why)
     {
         why = "";
-        if (!Assert(uuid.Length == UuidBytes)) return null;
+        if (!Assert(uuid.Length is UuidBytes or 0)) return null;
         if (!VkApi.Load())
         {
             why = "no Vulkan loader";
@@ -72,7 +70,7 @@ internal sealed unsafe partial class VulkanDevice : IDisposable
         }
 
         var device = new VulkanDevice();
-        why = device.Instance() ?? device.Pick(uuid) ?? device.Logical() ?? device.Pool() ?? "";
+        why = device.Instance() ?? device.Pick(uuid, gl) ?? device.Logical() ?? device.Pool() ?? "";
         if (why.Length == 0)
         {
             device.OpenCache();
@@ -116,44 +114,6 @@ internal sealed unsafe partial class VulkanDevice : IDisposable
         }
     }
 
-    private string? Pick(ReadOnlySpan<byte> uuid)
-    {
-        if (!Assert(_instance != IntPtr.Zero) || !Assert(uuid.Length == UuidBytes)) return "no instance";
-        var count = (uint)MaxDevices;
-        var devices = stackalloc IntPtr[MaxDevices];
-        if (VkApi.EnumeratePhysicalDevices(_instance, &count, devices) < 0) return "no Vulkan devices";
-        var properties = stackalloc byte[Vk.PropertiesBytes];
-        for (var i = 0; i < Math.Min((int)count, MaxDevices); i++)
-        {
-            var id = new Vk.IdProperties { SType = Vk.PhysicalDeviceIdProperties };
-            new Span<byte>(properties, Vk.PropertiesBytes).Clear();
-            *(int*)properties = Vk.PhysicalDeviceProperties2;
-            *(Vk.IdProperties**)(properties + 8) = &id;
-            VkApi.GetPhysicalDeviceProperties2(devices[i], properties);
-            if (!new ReadOnlySpan<byte>(id.DeviceUuid, UuidBytes).SequenceEqual(uuid)) continue;
-            (_physical, Name) = (devices[i], Marshal.PtrToStringUTF8((IntPtr)(properties + Vk.DeviceNameOffset)) ?? "");
-            Identify(properties);
-            break;
-        }
-
-        if (_physical == IntPtr.Zero) return "no Vulkan device is the OpenGL one";
-        var families = stackalloc Vk.QueueFamily[MaxFamilies];
-        count = MaxFamilies;
-        VkApi.GetQueueFamilies(_physical, &count, families);
-        for (var i = 0u; i < Math.Min(count, MaxFamilies); i++)
-            if ((families[i].Flags & (Vk.QueueGraphics | Vk.QueueCompute)) == (Vk.QueueGraphics | Vk.QueueCompute))
-            {
-                _family = i;
-                if (families[i].TimestampBits == 0) TimestampPeriod = 0;
-                Vk.MemoryProperties memory;
-                VkApi.GetMemoryProperties(_physical, &memory);
-                _memory = memory;
-                return null;
-            }
-
-        return Assert(count <= MaxFamilies) ? "no queue family does graphics and compute" : "too many queue families";
-    }
-
     private bool Offers(string extension)
     {
         if (!Assert(_physical != IntPtr.Zero) || !Assert(extension.Length < Vk.ExtensionNameBytes)) return false;
@@ -165,13 +125,17 @@ internal sealed unsafe partial class VulkanDevice : IDisposable
         return VkApi.Lists(properties, count, extension);
     }
 
-    // Every feature the terrain uses only where the device offers it, so the device is made and a pipeline that needs a missing
-    // one refuses instead
+    // Each terrain feature enabled only where offered: the device is made, a pipeline needing a missing one refuses
     private void Wanted(Vk.Features2* features, Vk.Features12* v12, Vk.LineFeaturesInfo* lines)
     {
         if (!Assert(features != null && v12 != null) || !Assert(_physical != IntPtr.Zero)) return;
         var offeredLines = new Vk.LineFeaturesInfo { SType = Vk.LineFeatures };
-        var offered12 = new Vk.Features12 { SType = Vk.Vulkan12Features, Next = BresenhamLines ? &offeredLines : null };
+        void* only = BresenhamLines ? &offeredLines : null;
+        var offeredUint8 = new Vk.OneFeature { SType = Vk.IndexTypeUint8Features, Next = only };
+        if (IndexUint8) only = &offeredUint8;
+        var offeredDivisor = new Vk.TwoFeatures { SType = Vk.DivisorFeatures, Next = only };
+        if (Divisors) only = &offeredDivisor;
+        var offered12 = new Vk.Features12 { SType = Vk.Vulkan12Features, Next = only };
         var offered = new Vk.Features2 { SType = Vk.PhysicalDeviceFeatures2, Next = &offered12 };
         VkApi.GetPhysicalDeviceFeatures2(_physical, &offered);
         foreach (var feature in (ReadOnlySpan<int>)[Vk.IndependentBlend, Vk.MultiDrawIndirect, Vk.SamplerAnisotropy,
@@ -179,6 +143,8 @@ internal sealed unsafe partial class VulkanDevice : IDisposable
                      Vk.FillModeNonSolid, Vk.FeatureLogicOp, Vk.ShaderFloat64, Vk.PipelineStatisticsQuery])
             features->Features[feature] = offered.Features[feature];
         PreciseQueries = offered.Features[Vk.OcclusionQueryPrecise] != 0;
+        MultiDraws = offered.Features[Vk.MultiDrawIndirect] != 0;
+        (IndexUint8, Divisors) = (IndexUint8 && offeredUint8.Enabled != 0, Divisors && offeredDivisor.First != 0);
         Float64 = offered.Features[Vk.ShaderFloat64] != 0;
         PipelineStatistics = offered.Features[Vk.PipelineStatisticsQuery] != 0;
         WideLines = offered.Features[Vk.WideLines] != 0;
@@ -198,10 +164,9 @@ internal sealed unsafe partial class VulkanDevice : IDisposable
         if (!Assert(_physical != IntPtr.Zero) || !Assert(_device == IntPtr.Zero)) return "no device";
         DepthClipControl = Offers(ClipControl);
         BresenhamLines = Offers(LineRasterization);
+        (IndexUint8, Divisors) = (Offers(Vk.IndexUint8Extension), Offers(Vk.DivisorExtension)); // what mods' raw OpenGL needs
         Swapchains = Surfaces && Offers(Vk.SwapchainExtension);
-        string[] wanted = DepthClipControl ? [.. Extensions, ClipControl] : Extensions;
-        if (BresenhamLines) wanted = [.. wanted, LineRasterization];
-        if (Swapchains) wanted = [.. wanted, Vk.SwapchainExtension];
+        var wanted = Extras(Extensions);
         var names = Array.ConvertAll(wanted, Marshal.StringToCoTaskMemUTF8);
         try
         {
@@ -214,11 +179,16 @@ internal sealed unsafe partial class VulkanDevice : IDisposable
             };
             void* chain = BresenhamLines ? &lines : null;
             if (DepthClipControl) chain = &clip;
+            var uint8 = new Vk.OneFeature { SType = Vk.IndexTypeUint8Features, Enabled = 1, Next = chain };
+            if (IndexUint8) chain = &uint8;
+            var divisor = new Vk.TwoFeatures { SType = Vk.DivisorFeatures, First = 1, Next = chain };
+            if (Divisors) chain = &divisor;
             var v13 = new Vk.Features13 { SType = Vk.Vulkan13Features, Next = chain };
             v13.Features[Vk.DynamicRendering] = 1;
             var v12 = new Vk.Features12 { SType = Vk.Vulkan12Features, Next = &v13 };
             var features = new Vk.Features2 { SType = Vk.PhysicalDeviceFeatures2, Next = &v12 };
             Wanted(&features, &v12, &lines);
+            (uint8.Enabled, divisor.First) = (IndexUint8 ? 1u : 0, Divisors ? 1u : 0); // as offered
             var priority = 1f;
             var queue = new Vk.QueueInfo
             {
@@ -232,7 +202,9 @@ internal sealed unsafe partial class VulkanDevice : IDisposable
             IntPtr device;
             if (VkApi.CreateDevice(_physical, &info, null, &device) != Vk.Success) return "vkCreateDevice failed";
             _device = device;
-            return VkApi.LoadDevice(device) ? null : "Vulkan device functions missing";
+            Formats();
+            var loaded = VkApi.LoadDevice(device);
+            return loaded ? null : "Vulkan device functions missing";
         }
         finally
         {
@@ -270,11 +242,10 @@ internal sealed unsafe partial class VulkanDevice : IDisposable
         return -1;
     }
 
-    // Records into the command buffer, submits it signalling the given semaphores, and waits for it to finish
+    // Run and Submit wait for the GPU to finish, unlike the frames' Submit
     public bool Run(Action<IntPtr> record, ReadOnlySpan<ulong> signal) =>
         Assert(signal.Length <= 4) && Run(record, [], signal);
 
-    // The same, the commands waiting for the wait semaphores first (OpenGL's signal)
     public bool Run(Action<IntPtr> record, ReadOnlySpan<ulong> wait, ReadOnlySpan<ulong> signal)
     {
         if (!NotNull(record) || !Assert(signal.Length <= 4)) return false;
@@ -287,10 +258,9 @@ internal sealed unsafe partial class VulkanDevice : IDisposable
     public IntPtr Begin() =>
         Assert(_commands != IntPtr.Zero) && Assert(_device != IntPtr.Zero) && Begin(_commands) ? _commands : IntPtr.Zero;
 
-    // Ends and submits what Begin's buffer holds, signalling the semaphores, and waits for the GPU to finish it
     public bool Submit(ReadOnlySpan<ulong> signal) => Assert(signal.Length <= 4) && Submit([], signal);
 
-    // The same after the wait semaphores, which every stage waits for
+    // Every stage waits for the wait semaphores
     public bool Submit(ReadOnlySpan<ulong> wait, ReadOnlySpan<ulong> signal)
     {
         var fence = _fence;
@@ -305,8 +275,6 @@ internal sealed unsafe partial class VulkanDevice : IDisposable
         {
             _ = VkApi.DeviceWaitIdle(_device);
             CloseCache();
-            _arena?.Dispose();
-            _arena = null;
             if (_fence != 0) VkApi.DestroyFence(_device, _fence, null);
             if (_pool != 0) VkApi.DestroyCommandPool(_device, _pool, null);
             VkApi.DestroyDevice(_device, null);

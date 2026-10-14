@@ -1,7 +1,6 @@
 namespace Komet.Vulkan;
 
-// A range given back waits for the frame that last used it to finish on the GPU (Retire). Plain allocations, not
-// exportable: they cost a submission nothing.
+// Returned ranges wait for their last frame (Retire). Plain, non-exportable allocations: free to submit.
 internal sealed unsafe class DeviceHeap(VulkanDevice device) : IDisposable
 {
     public const ulong BlockBytes = 64UL << 20;
@@ -10,7 +9,8 @@ internal sealed unsafe class DeviceHeap(VulkanDevice device) : IDisposable
                                Vk.TransferSrc | Vk.TransferDst;
 
     private readonly List<Block> _blocks = [];
-    private readonly List<(Range Range, long Frame)> _retired = [];
+    private Retired<Range>? _retiredList;
+    private Retired<Range> Retiring => _retiredList ??= new Retired<Range>(MaxRetired, Give);
 
     public sealed class Block(ulong buffer, ulong memory, ulong size)
     {
@@ -44,22 +44,45 @@ internal sealed unsafe class DeviceHeap(VulkanDevice device) : IDisposable
     public void Retire(Range range, long frame)
     {
         if (!NotNull(range.Block) || !Assert(frame >= 0)) return;
-        if (_retired.Count < MaxRetired) _retired.Add((range, frame));
-        else Give(range); // should not happen: nothing collects
+        if (!Retiring.Add(range, frame)) Give(range); // should not happen: nothing collects
     }
 
     public void Collect(long done)
     {
-        if (!Assert(_retired.Count <= MaxRetired) || !Assert(done >= -VulkanFrame.Slots) || _retired.Count == 0) return;
-        var kept = 0;
-        for (var i = 0; i < Math.Min(_retired.Count, MaxRetired); i++)
+        if (!Assert(Retiring.Count <= MaxRetired) || !Assert(done >= -VulkanFrame.Slots) || Retiring.Count == 0) return;
+        Retiring.Collect(done);
+        Release();
+    }
+
+    // Empty blocks (Taken 0) go back to the driver but one (so the next mirror need not allocate): a burst of large
+    // mirrors leaves no lasting high-water mark.
+    private void Release()
+    {
+        var spare = false;
+        _ = Assert(_blocks.Count <= MaxBlocks) && NotNull(device);
+        for (var n = 0; n < MaxBlocks; n++)
         {
-            if (_retired[i].Frame <= done) Give(_retired[i].Range);
-            else _retired[kept++] = _retired[i];
+            var i = _blocks.Count - 1 - n;
+            if (i < 0) break;
+            var block = _blocks[i];
+            if (block.Taken != 0) continue;
+            if (!spare)
+            {
+                spare = true;
+                continue;
+            }
+
+            _ = Assert(block.Free.Count == 1) && Assert(block.Size > 0);
+            VkApi.DestroyBuffer(device.Handle, block.Buffer, null);
+            VkApi.FreeMemory(device.Handle, block.Memory, null);
+            _blocks.RemoveAt(i);
+            Released++;
         }
 
-        _retired.RemoveRange(kept, _retired.Count - kept);
+        _ = Assert(_blocks.Count <= MaxBlocks);
     }
+
+    public long Released { get; private set; }
 
     private static ulong? Carve(Block block, ulong size)
     {
@@ -108,7 +131,7 @@ internal sealed unsafe class DeviceHeap(VulkanDevice device) : IDisposable
 
     public void Dispose()
     {
-        _ = Assert(_blocks.Count <= MaxBlocks) && Assert(_retired.Count <= MaxRetired) && device.WaitIdle();
+        _ = Assert(_blocks.Count <= MaxBlocks) && Assert(Retiring.Count <= MaxRetired) && device.WaitIdle();
         foreach (var block in _blocks.Bounded(MaxBlocks))
         {
             VkApi.DestroyBuffer(device.Handle, block.Buffer, null);
@@ -116,6 +139,6 @@ internal sealed unsafe class DeviceHeap(VulkanDevice device) : IDisposable
         }
 
         _blocks.Clear();
-        _retired.Clear();
+        Retiring.Clear(freed: false); // the blocks went whole
     }
 }

@@ -3,32 +3,24 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet.Core;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.Client.NoObf;
 
 namespace Komet.Chunks;
 
-// Every packet the client receives becomes a main-thread task, queued by the network thread in arrival order: a chunk as a
-// "loadchunk" task that inserts it and initialises its block entities, everything else as a ProcessPacketTask. ExecuteMainThreadTasks
-// runs the whole queue every frame, so a burst of chunks (a server tick's worth, or a backlog after a stall) initialises every one of
-// their block entities in one frame, with whatever garbage collection that allocation sets off landing in the same frame.
-//
-// Once the tasks of a frame have taken Millis, the queue stops in front of the next task that may wait: the load of a chunk more than
-// NearChunks columns from the player, or a chunk unload. What is left stays in the engine's own queue, in order, ahead of whatever
-// arrives meanwhile, and runs first next frame; so no packet ever overtakes another, and a later block update or unload of the chunk
-// still finds it loaded. The first task of a frame always runs. A near chunk load further back is never held: the queue runs through
-// it. A backlog past BoostAbove tasks (a world join, a teleport) raises the budget to BoostMillis. Before the player has spawned the
-// engine's loop is left alone.
-//
-// A far chunk whose block entities did not all fit into the budget (BlockEntityBudget) goes on first at the frame's first look at the
-// queue, on the same clock, and while it is still not done nothing behind it runs.
+// Each packet is a main-thread task in arrival order ("loadchunk" inserts a chunk and inits its block entities), and
+// ExecuteMainThreadTasks runs them all each frame: a chunk burst (and its GC) lands in one frame. After Millis the
+// queue stops before the next task that may wait (far chunk load past NearChunks, or unload); the rest stays queued in
+// order, so no packet overtakes another. The first task always runs; a near load further back is run through to.
+// Backlog past BoostAbove (join, teleport) boosts to BoostMillis. Off until the player spawned.
 internal static class ChunkLoadBudget
 {
     // EngineShape of Seams() in Vintage Story 1.22.7
     internal const ulong Fingerprint = 0x222221D9946996AEUL;
     public const int Engine = 0, MaxMillis = 20, DefaultMillis = 3;
     private const int BoostMillis = 8, BoostAbove = 256, NearChunks = 3, MaxScan = 1024, ChunkShift = 5;
-    private const int DimensionHeight = 1024, UnloadPacket = 11; // chunk Y of dimension 1; Packet_ServerIdEnum.UnloadServerChunk
+    private const int DimensionHeight = 1024, UnloadPacket = 11; // dim 1 chunk Y; Packet_ServerIdEnum.UnloadServerChunk
 
     private static MethodBase?[] _seams = [];
     private static Type? _closure; // LoadChunkFromPacket's closure, the target of every "loadchunk" task
@@ -40,7 +32,7 @@ internal static class ChunkLoadBudget
     public static int Millis { get; set; } = DefaultMillis;
     public static bool Rewritten { get; private set; }
 
-    // The loop is gated and has a budget: a far chunk's block entities may then spread over frames (BlockEntityBudget)
+    // Loop gated with a budget: far chunks' block entities may spread over frames (BlockEntityBudget)
     internal static bool Budgeting => Rewritten && Millis != Engine;
 
     // Totals while Counting.Hud: frames the budget ended the queue, and the tasks it left for later
@@ -71,8 +63,7 @@ internal static class ChunkLoadBudget
                             "every queued chunk loads at once, as in the engine");
     }
 
-    // The task loop, LoadChunkFromPacket, which queues a chunk as "loadchunk", and that task's body: the one that never runs a
-    // chunk it reads from the closure's p before its turn
+    // Task loop, LoadChunkFromPacket ("loadchunk"), and that task's body (reads the chunk from the closure's p)
     internal static MethodBase?[] Seams()
     {
         var load = AccessTools.DeclaredMethod(typeof(ClientWorldMap), "LoadChunkFromPacket");
@@ -98,9 +89,8 @@ internal static class ChunkLoadBudget
         _ = Assert(_start > 0);
     }
 
-    // Stands in for reversedQueue.Count where the loop asks whether to go on: the count, or 0 to end the frame's tasks here. The loop
-    // only asks once no game launch task is due and tasks are not suspended, so its first look is where a part-initialised far chunk
-    // goes on; while one still is, the queue behind it waits.
+    // Replaces the loop's reversedQueue.Count: the count, or 0 to end the frame. First asked when no launch task is due
+    // and tasks aren't suspended, so it resumes a part-initialised far chunk; while one remains the queue waits.
     internal static int Gate(int count, ClientMain game)
     {
         _ = Assert(count >= 0);
@@ -121,8 +111,7 @@ internal static class ChunkLoadBudget
             : Decide(Pending(game), count, game.EntityPlayer?.Pos);
     }
 
-    // Whether the frame's tasks have taken their budget by Begin's clock, boosted as Decide boosts it: where a far chunk's block
-    // entities stop (BlockEntityBudget)
+    // By Begin's clock, boosted as Decide boosts it
     internal static bool Spent(ClientMain game)
     {
         var queue = NotNull(game) ? Pending(game) : null;
@@ -130,15 +119,13 @@ internal static class ChunkLoadBudget
         return Assert(millis is >= Engine and <= MaxMillis) && millis > Engine && Elapsed(millis);
     }
 
-    // The frame's budget for this many queued tasks: BoostMillis past BoostAbove
-    private static int Budget(int queued) => Assert(queued >= 0) && Assert(Millis >= Engine) && queued > BoostAbove ? Math.Max(Millis, BoostMillis) : Millis;
+    private static int Budget(int queued) =>
+        Assert(queued >= 0) && Assert(Millis >= Engine) && queued > BoostAbove ? Math.Max(Millis, BoostMillis) : Millis;
 
-    // Begin's clock has run this many milliseconds
     private static bool Elapsed(int millis) =>
         Assert(millis >= 0) && Assert(_start >= 0) && Stopwatch.GetTimestamp() - _start >= millis * Stopwatch.Frequency / 1000;
 
-    // Whether a chunk's load may stop half way and hold every task behind it: the budget is on, the queue is not being run through
-    // to a near chunk load, the chunk is still far, and no near chunk load waits further back
+    // Chunk load may stop half way: budget on, chunk far, no near load being run to or waiting behind
     internal static bool MayHold(ClientMain game, Packet_ServerChunk? chunk)
     {
         if (!Budgeting || _forced > 0 || game is not { Spawned: true } ||
@@ -189,8 +176,7 @@ internal static class ChunkLoadBudget
         return Assert(last < MaxScan) ? last : -1;
     }
 
-    // The loop's test, reversedQueue.Count > 0 branching back into the body, is the one get_Count on reversedQueue followed by
-    // ldc.i4.0 and a bgt to a label before it; Gate goes between the count and the comparison. Any other shape: the engine's IL.
+    // Loop test: the one reversedQueue get_Count, ldc.i4.0, bgt back; Gate goes between, else engine IL
     internal static List<CodeInstruction> Rewrite(IEnumerable<CodeInstruction> instructions)
     {
         Rewritten = false;

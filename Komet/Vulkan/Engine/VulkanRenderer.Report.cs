@@ -1,3 +1,6 @@
+using System.Globalization;
+using Komet.Diagnostics;
+using Komet.Rendering;
 using OpenTK.Graphics.OpenGL;
 
 namespace Komet.Vulkan;
@@ -6,7 +9,7 @@ internal static partial class VulkanRenderer
 {
     private const ulong Budget = 12UL << 30, LogGrowth = 512UL << 20;
     private const long GuardMs = 250;
-    private const int ReportEvery = 600, LogEvery = 3600, VerifyAt = 300;
+    private const int ReportEvery = 600, LogEvery = 3600, VerifyAt = 300, LeanEvery = 600;
     private static ulong _logged;
     private static long _guarded;
     private static string _waits = "";
@@ -30,14 +33,15 @@ internal static partial class VulkanRenderer
         var names = new List<string>(4);
         if (Taking[(int)Pass.LiquidDepth]) names.Add("liquid depth");
         if (Taking[(int)Pass.Shadows])
-            names.Add(FrustumSweep.Casters && !ShadowView.Differed ? "shadow maps (casters culled by the view)" : "shadow maps");
+            names.Add(!ShadowView.Differed
+                ? $"shadow maps (casters culled by the view, {EntityCasters.Culled} of {EntityCasters.Tested} entity shadows)"
+                : "shadow maps");
         if (Taking[(int)Pass.Opaque]) names.Add(OcclusionCulling.Drawer is null ? "opaque" : "opaque (culled on the GPU)");
         if (Taking[(int)Pass.Transparent]) names.Add("transparent");
         if (Taking[(int)Pass.WaterPlants]) names.Add("water plants");
         if (SceneParts() is { Length: > 0 } parts) names.Add("and of the rest " + parts);
         if (_windowing)
-            names.Add(_renderer?.Showing == true ? "the window, shown by Vulkan" + Unshown()
-                : "the window, shown by OpenGL");
+            names.Add(_renderer?.Showing == true ? "the window, shown by Vulkan" + Unshown() : "the window, not shown");
         _ = Assert(names.Count <= 7);
         return names.Count == 0 ? "no pass (all switched off)" : string.Join(", ", names);
     }
@@ -49,21 +53,36 @@ internal static partial class VulkanRenderer
 
     private static void Periodically(TerrainRenderer renderer)
     {
+        if (!NotNull(renderer)) return;
         var frame = renderer.Frame.Number;
-        if (!NotNull(renderer) || !Assert(frame >= 0)) return;
+        if (!Assert(frame >= 0)) return;
         if (frame == VerifyAt) Verify(renderer);
+        if (frame % LeanEvery == LeanEvery / 2 && LeanOn && renderer.LeanEarlier() is (> 0, var bytes) lean)
+            _logger?.Notification("Komet: Vulkan-only lean: {0} textures OpenGL held from before ({1} MB) given a stand-in",
+                lean.Count, bytes >> 20);
         if (frame % ReportEvery != 1) return;
-        Status = (_waits.Length > 0 ? _waits + "; " : "") + Short(renderer);
-        if (frame % LogEvery == 1 || frame == ReportEvery + 1) _logger?.Notification("Komet: {0}", Full(renderer));
+        var culture = CultureInfo.CurrentCulture;
+        CultureInfo.CurrentCulture = CultureInfo.InvariantCulture; // "1.5 ms" in the English report whatever the game's language
+        try
+        {
+            Status = (_waits.Length > 0 ? _waits + "; " : "") + Short(renderer);
+            // the first window (frames 1-600) is the post-start upload burst: its per-pass times are not steady state
+            if (frame % LogEvery == 1 || frame == 2 * ReportEvery + 1) _logger?.Notification("Komet: {0}", Full(renderer));
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = culture;
+        }
     }
 
-    // The HUD window's numbers since the last report: draws a frame through Vulkan and left to OpenGL, handoffs, memory, and what
-    // closed segments most often. Zero while Vulkan does not run.
+    // Since the last report; zero while Vulkan does not run
     internal static (double Draws, double Left, double Segments, long MemoryMb, string[] Closers) Snapshot()
     {
         if (State != Phase.Running || _renderer is not { } renderer) return (0, 0, 0, 0, []);
         var frames = Math.Max(renderer.Frame.Frames, 1);
-        var (draws, left) = (renderer.Draws + (_scene?.Draws ?? 0), renderer.Left + (_scene?.Left ?? 0));
+        var draws = renderer.Draws + (_scene?.Draws ?? 0);
+        // what Vulkan leaves is missing from the picture, OpenGL draws none of it
+        var left = renderer.Missed + renderer.MissedWaiting;
         var closers = renderer.Frame.Closers.OrderByDescending(static c => c.Value).Take(6).Select(static c => c.Key).ToArray();
         _ = Assert(frames > 0) && Assert(draws >= 0);
         return ((double)draws / frames, (double)left / frames, (double)renderer.Frame.Segments / frames, (long)(VkMemory.Bytes >> 20),
@@ -74,14 +93,7 @@ internal static partial class VulkanRenderer
     private static string Short(TerrainRenderer renderer)
     {
         var frames = Math.Max(renderer.Frame.Frames, 1);
-        _ = Assert(frames > 0) && NotNull(renderer);
-        var scene = _scene is { } s && SceneOn
-            ? $"{(double)s.Draws / frames:0} other draws ({(double)s.Left / frames:0.0} left to OpenGL), "
-            : "";
-        var own = renderer.OwnDraws > 0 ? $" ({(double)renderer.OwnDraws / frames:0} on Komet's depth)" : "";
-        return $"Vulkan draws {Passes()}: {(double)renderer.Draws / frames:0} pool draws{own}, {scene}" +
-               $"{(double)renderer.Frame.Segments / frames:0.0} handoffs, {(double)renderer.Left / frames:0.0} left to " +
-               $"OpenGL a frame; {VkMemory.Bytes >> 20} MB";
+        return Assert(frames > 0) && NotNull(renderer) ? OnlyShort(renderer, frames) : "";
     }
 
     private static string Full(TerrainRenderer renderer)
@@ -92,17 +104,11 @@ internal static partial class VulkanRenderer
         _ = Assert(frames > 0) && Finite(ms);
         return $"terrain in Vulkan ({Passes()}): {frames} frames, recording {renderer.TakeTicks * ms:0.00} ms (packing " +
                $"{TerrainDraw.PackTicks * ms:0.00}) a frame, {(double)renderer.Draws / frames:0} pool draws and " +
-               $"{(double)frame.Segments / frames:0.0} segments a frame, {renderer.Left} left to OpenGL" +
-               (renderer.Reasons.Count > 0 ? $" ({string.Join("; ", renderer.Reasons.Take(4))})" : "") +
-               $", handoff a frame {frame.OpenTicks * ms:0.00} ms opening, {frame.SignalTicks * ms:0.00} ms OpenGL's " +
-               $"signal, {frame.SubmitTicks * ms:0.00} ms submitting, {frame.WaitTicks * ms:0.00} ms OpenGL's wait, " +
-               $"{frame.CleanSignals} of {frame.CleanSignals + frame.DirtySignals} signals left out (nothing shared touched), " +
-               $"{frame.LazyWaits} waits for Vulkan, {frame.LateSignals} late signals, " +
-               $"{renderer.Pools.Count} pools ({renderer.Pools.Bytes >> 20} MB, {Born} adopted as made, " +
-               $"{renderer.Device.Arena.AheadMade} arena blocks made ahead, {renderer.Device.Arena.AheadWaited} waited for), " +
-               Copied(renderer) + "; closed by " +
+               $"{(double)frame.Segments / frames:0.0} segments a frame, {frame.SubmitTicks * ms:0.00} ms submitting a frame, " +
+               $"{renderer.Pools.Count} pools ({renderer.Pools.Bytes >> 20} MB: {renderer.Pools.Breakdown()}, {Born} adopted as made), " +
+               OnlyHeld(renderer) + $", {renderer.UnalignedFaces} face writes not whole quads; closed by " +
                string.Join(", ", frame.Closers.OrderByDescending(c => c.Value).Take(8).Select(c => $"{c.Key} {c.Value}")) +
-               Culled(renderer, frames) + Owned(renderer, frames) + SceneReport(frames) + renderer.Frame.Times() +
+               Culled(renderer, frames) + SceneReport(frames) + renderer.Frame.Times() +
                Hitches.Report() +
                Builds.Report() + ShaderCache.Report() + "; memory " +
                VkMemory.Report() + "; " + Held();
@@ -116,24 +122,66 @@ internal static partial class VulkanRenderer
         _ = Assert(Finite(ms));
         return $"; the rest of the frame: {(double)scene.Draws / frames:0} draws, {(double)scene.Clears / frames:0.0} " +
                $"clears ({scene.EarlyClears} kept from between frames), {(double)scene.Blits / frames:0.0} blits, " +
-               $"{(double)scene.Left / frames:0.0} left to OpenGL a frame" +
-               (scene.Reasons.Count > 0 ? $" ({string.Join("; ", scene.Reasons.Take(6))})" : "") +
-               $", recording {scene.Ticks * ms:0.00} ms a frame; {mirrors.Count} buffer mirrors, {mirrors.Bytes >> 20} MB, " +
-               $"{mirrors.Writes} writes, {mirrors.Renames} renamed, {mirrors.Imports} imported on the GPU " +
+               $"{(double)scene.Left / frames:0.0} missing a frame, recording {scene.Ticks * ms:0.00} ms a frame; {mirrors.Count} buffer mirrors, {mirrors.Bytes >> 20} MB, " +
+               $"{mirrors.Writes} writes, {mirrors.Renames} renamed, {mirrors.Imports} read back " +
                $"({mirrors.ImportedBytes >> 10} KB, {mirrors.Asked} sizes asked of OpenGL)" +
                (mirrors.Imports > 0 ? $" ({mirrors.Reasons})" : "");
     }
 
-    private static string Copied(TerrainRenderer renderer)
+    // The HUD line: segments, and what is missing from the picture
+    private static string OnlyShort(TerrainRenderer renderer, long frames)
     {
-        var (copies, staging) = (renderer.Copies, renderer.Staging);
-        _ = Assert(copies.Private <= copies.Count) && Assert(staging.Owned >= 0);
-        return $"{copies.Count} texture copies ({copies.Private} private, {copies.Evictions} made room for others; " +
-               $"{copies.Packs} levels packed, " +
-               $"{copies.PackedBytes >> 20} MB{copies.MostPacked()}, {copies.Fills} fills, {copies.Moves} moved between kinds, " +
-               $"{renderer.Uploads} uploads and mipmaps made from host memory; staging {staging.Bytes >> 20} MB, " +
-               $"{staging.Owned} ranges of their own)";
+        if (!NotNull(renderer) || !Assert(frames > 0)) return "";
+        var scene = _scene is { } s ? $"{(double)s.Draws / frames:0} other draws, " : "";
+        return $"Vulkan-only draws {Passes()}: {(double)renderer.Draws / frames:0} pool draws, {scene}" +
+               $"{(double)renderer.Frame.Segments / frames:0.0} segments a frame, " +
+               $"{(double)(renderer.Missed + renderer.MissedWaiting) / frames:0.0} calls missing a frame " +
+               $"({renderer.MissedKind} kinds){(Bridging ? $", {(double)renderer.Bridged / frames:0.00} frames bridged a frame" : "")}" +
+               $"{(renderer.FarRefreshes > 0 ? $", far cache laid {renderer.FarLays} frames, drawn anew {renderer.FarRefreshes}" : "")}; " +
+               $"{VkMemory.Bytes >> 20} MB";
     }
+
+    // Vulkan-only: the images and mappings of its own, and what it had to read back from OpenGL
+    private static string OnlyHeld(TerrainRenderer renderer)
+    {
+        if (renderer.Images is not { } images || renderer.Maps is not { } maps || !Assert(renderer.Frame.Number >= 0)) return "";
+        _ = Assert(images.Count >= 0) && Assert(maps.Count >= 0);
+        return $"Vulkan-only: {images.Count} texture images (about {images.Bytes >> 20} MB), {images.Uploads} uploads, " +
+               $"mipmaps and copies made by Vulkan, {images.Readbacks} read back from OpenGL ({images.ReadBytes >> 20} MB), " +
+               $"{images.Unseen} changes it could not follow, {images.Refused} uploads or images it had no room or format " +
+               $"for, {GlTap.UntrackedCalls} calls on textures it does not follow; {maps.Count} persistent mappings of " +
+               $"its own ({maps.Bytes >> 20} MB), {renderer.PoolWrites} pool uploads ({renderer.PoolWritesLost} lost), " +
+               $"{renderer.Pools.Readbacks} pool buffers read back from OpenGL; {renderer.Answered} OpenGL reads answered " +
+               $"from Vulkan's images; {renderer.Missed} GPU calls missing from the picture" +
+               (renderer.Missed > 0 ? $" ({renderer.MissedKinds(6)})" : "") +
+               $", {renderer.MissedWaiting} draws missing while their port or pipeline was made" +
+               (_scene is { Unported.Length: > 0 } scene ? $"; programs with no Vulkan port: {scene.Unported}" : "") +
+               $"; {renderer.Snapshots} snapshots of images drawn into while sampled" + Warmed(renderer) +
+               $"; {renderer.Frame.EarlyBegins} frames begun by work between frames, {GlTap.MultiDrawRanges} multi-draw " +
+               $"ranges taken one by one (at most {GlTap.LargestMultiDraw} in one), " +
+               $"{_scene?.Mirrors.PersistentReads ?? 0} inputs read from persistent mappings without OpenGL's fences" +
+               (OcclusionCulling.Suspended ? "; OcclusionCulling suspended (the device draws with no count the GPU wrote)" : "") +
+               (GlTap.Leaned > 0
+                   ? $"; lean: {GlTap.Leaned} large textures and buffers ({GlTap.LeanBytes >> 20} MB) kept out of OpenGL's " +
+                     $"memory, {GlTap.LeanMapped} given back for a map"
+                   : "") + ForMods(renderer.Device);
+    }
+
+    // What the device gives mods' raw OpenGL (VulkanDevice.Only)
+    private static string ForMods(VulkanDevice device)
+    {
+        if (!NotNull(device) || !Assert(device.DepthStencil is 0 or Vk.FormatD24S8 or Vk.FormatD32S8)) return "";
+        var stencil = device.DepthStencil switch { Vk.FormatD24S8 => "D24S8", Vk.FormatD32S8 => "D32S8", _ => "none" };
+        return $"; for mods: depth and stencil {stencil}, 8-bit indices {(device.IndexUint8 ? "yes" : "no")}, instance " +
+               $"divisors past 1 {(device.Divisors ? "yes" : "no")}, several indirect draws at once " +
+               $"{(device.MultiDraws ? "yes" : "no")}";
+    }
+
+    private static string Warmed(TerrainRenderer renderer) =>
+        _scene is { } scene && Assert(scene.PipelinesStarted >= 0) && NotNull(renderer)
+            ? $"; {scene.PipelinesStarted} scene and {renderer.PipelinesStarted} terrain pipelines begun before their first " +
+              "draw (known from earlier starts)"
+            : "";
 
     private static string Culled(TerrainRenderer renderer, long frames)
     {
@@ -141,20 +189,10 @@ internal static partial class VulkanRenderer
         return $"; OcclusionCulling in Vulkan: {(double)renderer.Counted / frames:0.0} draws a frame, " +
                $"{OcclusionCulling.Refused} refused, {renderer.Compute.Refused} passes without a segment or memory" +
                (OcclusionCulling.RowsUsed > 0
-                   ? $", from rows ({OcclusionCulling.RowsUsed} rows, {OcclusionCulling.Rewrites} regions written in full)"
+                   ? $", from rows ({OcclusionCulling.RowsUsed} rows, {OcclusionCulling.Rewrites} regions written in full, {OcclusionCulling.Resyncs} brought up to date)"
                    : "") + $", {(double)OcclusionCulling.SortedDraws / frames:0.0} draws a frame sorted near to far, shadow casters " +
                (ShadowView.Differed ? "no longer culled by the view (it differed from the engine's)" : "culled by the view") +
                DrawnTerrain();
-    }
-
-    private static string Owned(TerrainRenderer renderer, long frames)
-    {
-        if (!NotNull(renderer) || !Assert(frames > 0)) return "";
-        if (!OwnDepth) return "; Komet's own depth for the opaque terrain and the shadow maps switched off";
-        return $"; Komet's own depth (compressed, tested before shading) for {(double)renderer.OwnDraws / frames:0.0} pool " +
-               $"draws a frame (the opaque terrain{(SceneOn ? ", the shadow maps" : "; shadow maps need the scene")}), " +
-               $"{(double)renderer.OwnCopies / frames:0.0} depth copies and {(double)renderer.OwnClears / frames:0.0} clears " +
-               "in place of a copy a frame";
     }
 
     // NaN: no statistics read back yet (a report after the first frame, before the readback ring filled)

@@ -1,3 +1,5 @@
+using Komet.Diagnostics;
+
 namespace Komet.Test.Diagnostics;
 
 public sealed class DiagnosticsTests
@@ -293,6 +295,16 @@ public sealed class FrameStatsTests
         }
     }
 
+    // IconBudget and HangWatch count frames with the HUD off too: Completed stood still there, the creative inventory stayed empty
+    [Test]
+    public void FramesCountWithoutTheHud() => Clock.With(false, null, () =>
+    {
+        var (frames, completed) = (FrameClock.Frames, FrameClock.Completed);
+        FrameClock.Begin();
+        FrameClock.Begin();
+        Assert.That((FrameClock.Frames, FrameClock.Completed), Is.EqualTo((frames + 2, completed)));
+    });
+
     // Read in the Ortho stage, the dt that ended at this frame's start pairs with the GC pause since the previous Ortho, so a collection
     // early in a frame lands on the one before. FrameClock cuts both at frame starts.
     [Test]
@@ -382,5 +394,20 @@ internal static class Clock
             (FrameClock.Stats, ScreenManager.FrameProfiler, FrameClock.Sink) = (saved.Stats, saved.FrameProfiler, null);
             FrameClock.Begin();
         }
+    }
+}
+
+public sealed class DrmMemoryTests
+{
+    // amdgpu's fdinfo: the client id, its VRAM and GTT; a file without a client id is no client
+    [Test]
+    public void ParsesAClient()
+    {
+        var client = DrmMemory.Parse(["pos:\t0", "drm-driver:\tamdgpu", "drm-client-id:\t42", "drm-memory-vram:\t6291456 KiB",
+            "drm-memory-gtt:\t\t20480 KiB"]);
+        Assert.That(client, Is.EqualTo(new DrmMemory.Client(42, "amdgpu", 6291456, 20480)));
+        Assert.That(DrmMemory.Parse(["pos:\t0", "flags:\t02"]), Is.Null);
+        Assert.That(DrmMemory.Text([client!.Value, new DrmMemory.Client(7, "amdgpu", 1024 * 1024, 0)], 6100),
+            Is.EqualTo("Vulkan 6144 MB (GTT 20 MB), OpenGL 1024 MB (GTT 0 MB)"));
     }
 }

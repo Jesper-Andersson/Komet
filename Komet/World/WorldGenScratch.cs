@@ -2,25 +2,18 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet.Core;
 using Vintagestory.API.MathTools;
 using Vintagestory.Common;
 
 namespace Komet.World;
 
-// Three of the integrated server's generators and its chunk thread make garbage the client pays for in singleplayer (one heap, one
-// set of GC pauses): together ~1 GB a minute flying into new terrain, measured with allocation traces.
-// - ChunkIlluminator.SpreadSunLightInColumn pushed a new BlockPos for every position its sunlight flood reached (200 MB a minute). The
-//   positions come from a pool per thread now, and a popped one goes back to it when the flood pops the next: the flood reads a popped
-//   position only during its turn (GetLightAbsorptionAt reads its coordinates), and the callers only push new positions and hand over
-//   the stack. The flood's order and values stay the engine's.
-// - GenRockStrataNew.genBlockColumn made a float[] of province weights per block column (95 MB): the thread's array of that length,
-//   cleared as a new one is, which LerpedWeightedIndex2DMap.WeightsAt fills and nothing keeps.
-// - GenVegetationAndPatches.genPatches asked RegistryObject.LastCodePart(0) for every rock it looks under a patch at, which splits the
-//   block's code anew each time (130 MB): the last part of each block's code is kept, codes do not change once the game runs.
-// - ServerSystemSupplyChunks.moveRequestsToGeneratingQueue made a new List<long> on every chunk thread tick, and the thread ticks
-//   without sleeping while it has work (11 MB/s, 2026-10-08 trace): the thread's list, emptied. The list only collects the requests
-//   it hands on in the same call (Add, Count and the indexer, checked on the IL).
-// Another mod's patch on one of the four found at Install leaves that one as shipped.
+// Integrated-server garbage the client pays for in singleplayer (~1 GB a minute flying):
+// - SpreadSunLightInColumn: a BlockPos per flood step (200 MB/min); pooled, a popped one returns on the next pop.
+// - GenRockStrataNew.genBlockColumn: float[] weights per column (95 MB); the thread's cleared array.
+// - GenVegetationAndPatches.genPatches: LastCodePart(0) splits the code per rock (130 MB); kept per block.
+// - moveRequestsToGeneratingQueue: a List<long> per tick of a spinning thread (11 MB/s); the thread's list.
+// A foreign patch on one found at Install leaves it as shipped.
 internal static class WorldGenScratch
 {
     private const int MaxInstructions = 4096, MaxPooled = 1 << 14, MaxWeights = 4096;
@@ -80,8 +73,8 @@ internal static class WorldGenScratch
     internal static List<CodeInstruction> RewriteRock(IEnumerable<CodeInstruction> instructions)
     {
         if (!Assert(Il.Take(instructions, MaxInstructions, out var code))) return code;
-        var at = Il.Single(code, static c => c.opcode == OpCodes.Newarr && c.operand is Type t && t == typeof(float));
-        if (at >= 0 && Index(at, code.Count) && Il.Substitute(code, at, AccessTools.Method(typeof(WorldGenScratch), nameof(Weights))))
+        if (Il.SubstituteSingle(code, static c => c.opcode == OpCodes.Newarr && c.operand is Type t && t == typeof(float),
+                AccessTools.Method(typeof(WorldGenScratch), nameof(Weights))))
             Rewritten |= 2;
         return code;
     }
@@ -90,9 +83,9 @@ internal static class WorldGenScratch
     internal static List<CodeInstruction> RewritePatches(IEnumerable<CodeInstruction> instructions)
     {
         if (!Assert(Il.Take(instructions, MaxInstructions, out var code))) return code;
-        var at = Il.Single(code, static c => c.operand is MethodInfo { Name: nameof(RegistryObject.LastCodePart) } m &&
-                                             m.DeclaringType == typeof(RegistryObject));
-        if (at >= 0 && Index(at, code.Count) && Il.Substitute(code, at, AccessTools.Method(typeof(WorldGenScratch), nameof(LastCodePart)))) Rewritten |= 4;
+        if (Il.SubstituteSingle(code, static c => c.operand is MethodInfo { Name: nameof(RegistryObject.LastCodePart) } m &&
+                m.DeclaringType == typeof(RegistryObject), AccessTools.Method(typeof(WorldGenScratch), nameof(LastCodePart))))
+            Rewritten |= 4;
         return code;
     }
 

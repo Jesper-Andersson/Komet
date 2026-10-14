@@ -1,28 +1,19 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
-using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using HarmonyLib;
+using Komet.Api;
+using Komet.Core;
+using Komet.Diagnostics;
 
 namespace Komet.Shapes;
 
-// Animation.GenerateAllFrames compiles an animation into QuantityFrames pairs of pose trees, lazily: ClientAnimator.AnimNowActive and
-// OnFrame call it whenever PrevNextKeyFrameByFrame is null, inside esr-afteranim on the render thread (and the singleplayer server's
-// animators on its thread). Animation.Clone does not copy PrevNextKeyFrameByFrame and Entity.OnTesselation nulls it, so every
-// re-tesselation of a geared entity compiles again: EntityBehaviorContainer.addGearToShape clones the shared shape. The engine's own
-// AnimationCache keys on entity code and shape path and leaves cloned shapes out, because Shape.StepParentShape reparents gear
-// elements and merges the gear's keyframes, after which that key no longer identifies the compile.
-//
-// So this cache keys on what the compile reads: the element names in the order GenerateFrame visits them with their depth, and the
-// animation's code, QuantityFrames and keyframes. A shape whose compile also reads object identity (a keyframe element object in two
-// places or stamped by another keyframe, an element the tree holds twice) or an element's own Equals (a subclass) is not described:
-// it compiles uncached. The model matrix GenerateFrame threads through is never stored (AnimationFrame's SetTransform and
-// FinalizeMatrices are [Obsolete] no-ops), JointId only feeds jointsDone, and ShapeElement.GetLocalTransformMatrix writes only its
-// output argument, so geometry stays out of the key and two entities in the same outfit share one compiled set.
-// Sharing needs no copy: nothing in the shipped assemblies writes into a compiled set (calculateMatrices reads the poses only as
-// ElementPose.Add arguments, ForElement on a cached pose is dead because its readers walk RootPoses, AnimModelMatrix is never set).
-// A hit compares the whole descriptor, not the hash, so no hash collision hands an animator the pose tree of another shape.
+// GenerateAllFrames compiles lazily on the render thread whenever PrevNextKeyFrameByFrame is null; clones lack it and
+// OnTesselation nulls it, so geared entities recompile on every re-tesselation (the engine's AnimationCache skips
+// cloned shapes). This cache keys on what the compile reads: element names in visit order with depth, code,
+// QuantityFrames, keyframes; identity-dependent shapes run uncached. Geometry stays out, so one outfit shares one set,
+// nothing writes into a set. Hits compare the whole descriptor.
 internal static partial class AnimationFrames
 {
     internal const int MaxEntries = 512;
@@ -30,22 +21,26 @@ internal static partial class AnimationFrames
     private static readonly Lock Gate = new();
     private static readonly Dictionary<ulong, List<Entry>> Cache = [];
 
-    // What Describe met, under Gate
     private static readonly HashSet<object> Seen = new(ReferenceEqualityComparer.Instance);
 
     private static byte[] _buffer = new byte[4096];
     private static string[] _names = new string[64];
     private static int _at, _entries;
-    private static MethodBase?[] _seams = [];
-    private static ILogger? _logger;
-    private static bool _shaped, _installed, _foreign;
+    private static readonly SeamGuard Guard = new(nameof(AnimationFrames), PatchKinds.All, [typeof(AnimationFrames)],
+        unblocked: true);
+    private static bool _installed;
 
     public static bool Enabled { get; set; } = true;
 
-    // Another mod patches the compile, or the engine's is not the one reproduced here: the engine compiles everything
-    public static bool Blocked { get; private set; }
+    // Another mod patches the compile, or the engine's body differs: the engine compiles everything
+    public static bool Blocked => Guard.Blocked;
 
-    public static bool Matched => _shaped; // the engine's bodies are the ones reproduced
+    public static bool Matched => Guard.Matched; // the engine's bodies are the ones reproduced
+
+    // Only a rewritten body counts: a later skipping prefix, or a patch on a callee, is skipped whenever Komet answers
+    internal static Action Recheck { get; } = static () => Guard.Report(Guard.Matched,
+        Guard.Seams.Length == SeamCount && (EngineShape.Foreign(Guard.Seams.AsSpan(0, 1), PatchKinds.Body, null) ||
+                                            EngineShape.Foreign(Guard.Seams.AsSpan(1), PatchKinds.All, null)));
 
     public static int Count => Assert(_entries <= MaxEntries) ? _entries : MaxEntries; // compiled sets kept
 
@@ -60,7 +55,7 @@ internal static partial class AnimationFrames
         (WorstMs, WorstCode) = (0, "");
     }
 
-    // A compiled set belongs to the shapes of one world, and the descriptor holds element names that world interned
+    // A compiled set belongs to one world's shapes; the descriptor holds names that world interned
     public static void Clear()
     {
         lock (Gate)
@@ -78,36 +73,21 @@ internal static partial class AnimationFrames
     {
         Clear();
         ResetPeaks();
-        (_installed, _shaped, Blocked, _seams, _logger, _foreign) = (false, false, true, Seams(), logger, false);
+        _installed = false;
+        var seams = Guard.Reset(Seams(), logger);
         var clone = AccessTools.Method(typeof(Animation), nameof(Animation.Clone), []);
-        if (!NotNull(harmony) || !NotNull(clone) || !Assert(_seams.Length == SeamCount)) return;
+        if (!NotNull(harmony) || !NotNull(clone) || !Assert(seams.Length == SeamCount)) return;
         // JointsDone throws otherwise
         if (Assert(AccessTools.Field(typeof(Animation), "jointsDone")?.FieldType == typeof(HashSet<int>)))
             _ = NotNull(harmony.Patch(clone, postfix: new HarmonyMethod(Cloned)));
-        _shaped = EngineShape.Matches(Shaped(), fingerprint, nameof(AnimationFrames), logger);
-        // the compile's accessors name fields of those bodies: on a changed engine they could throw
-        if (!_shaped) return;
-        _ = NotNull(harmony.Patch(_seams[0], new HarmonyMethod(Generate), new HarmonyMethod(Generated)));
+        // the compile's accessors name fields of those bodies; on a changed engine they could throw
+        if (!Guard.Match(Shaped(), fingerprint)) return;
+        _ = NotNull(harmony.Patch(seams[0], new HarmonyMethod(Generate), new HarmonyMethod(Generated)));
         Recheck();
         _installed = WarmUp();
     }
 
-    // Seam 0 is patched here and only a rewritten body there counts: a prefix ordered before Komet's and every postfix still run, a
-    // later prefix that Harmony lets skip the original (bool result, or an out/ref/reference argument) is skipped whenever Komet
-    // answers, as the engine body is. Any patch on what it calls would be skipped too. Harmony patches are process wide, so
-    // KometModSystem asks again on LevelFinalize.
-    internal static void Recheck()
-    {
-        var seamed = _shaped && Assert(_seams.Length == SeamCount);
-        var foreign = seamed && (EngineShape.Foreign(_seams.AsSpan(0, 1), EngineShape.Kinds.Body, null) ||
-                                 EngineShape.Foreign(_seams.AsSpan(1), EngineShape.Kinds.All, null));
-        _foreign = EngineShape.Report(_logger, nameof(AnimationFrames), _foreign, foreign);
-        Blocked = !seamed || _foreign;
-    }
-
-    // Animation.Clone copies jointsDone by reference, so an animation and its clones share one HashSet that GenerateAllFrames clears
-    // once per keyframe: a race as soon as two threads compile, and the singleplayer server compiles its animators on its own thread.
-    // Kept on a changed engine too: every compile is then the engine's, and a clone still shares the set.
+    // Clones share jointsDone, which GenerateAllFrames clears per keyframe: a race once two threads compile
     private static void Cloned(Animation __result)
     {
         if (!NotNull(__result)) return;
@@ -144,7 +124,7 @@ internal static partial class AnimationFrames
         Record(pending.Start, __instance.Code);
     }
 
-    // What the engine throws on (no keyframes, QuantityFrames, the joint cap) it throws itself, with its own message
+    // What the engine throws on (no keyframes, QuantityFrames, joint cap) it throws itself
     private static bool Compilable(Animation? animation, ShapeElement[]? roots, Dictionary<int, AnimationJoint>? joints)
     {
         if (animation?.KeyFrames is not { Length: > 0 } || animation.QuantityFrames <= 0 || roots is null ||
@@ -152,9 +132,8 @@ internal static partial class AnimationFrames
         return roots.Length <= ElementWalk.MaxElements && joints.Count < GlobalConstants.MaxAnimatedElements;
     }
 
-    // On a miss key is the descriptor to store the compile under, null for one too large. GenerateAllFrames opens with
-    // ShapeElement.CacheInverseTransformMatrixRecursive on every root, which calculateMatrices reads, so a hit runs that lazy idempotent
-    // init too; a recursive descriptor has seen every element non-null, so it throws only where the engine's first statement would.
+    // On a miss key is the descriptor to store under, null if too large. A hit also runs the engine's lazy idempotent
+    // CacheInverseTransformMatrixRecursive.
     private static bool Hit(Animation animation, ShapeElement[] roots, bool recursive, ref Snapshot? key)
     {
         if (!NotNull(animation) || !Assert(roots.Length <= ElementWalk.MaxElements)) return false;
@@ -206,7 +185,7 @@ internal static partial class AnimationFrames
         return true;
     }
 
-    // A dictionary's iteration order is not part of its content, so the element names are sorted before they are written
+    // Dictionary order is not content, so element names are sorted first
     private static bool Frame(AnimationKeyFrame? key)
     {
         if (!NotNull(key) || !Int(key.Frame)) return false;
@@ -224,9 +203,7 @@ internal static partial class AnimationFrames
         return true;
     }
 
-    // Origin and the shortest-distance flags do not reach the compiled pose (GenerateFrameForElement walks flags 0 to 2), but a key
-    // that covers more than the compile reads can only cost a miss, never a wrong hit. The object itself is read too: by
-    // GenerateFrameForElement's left == right, and for t by the Frame the last AnimationKeyFrame.Resolve stamped on it.
+    // Over-keying only costs a miss. The object is read too: left == right, and t from its Resolve-stamped Frame.
     private static bool Element(AnimationKeyFrameElement? element, int frame)
     {
         if (!NotNull(element) || !Seen.Add(element) || At(element) != frame) return false;
@@ -238,8 +215,7 @@ internal static partial class AnimationFrames
                Int(element.RotShortestDistanceZ ? 1 : 0);
     }
 
-    // GenerateFrame's visit order with each element's depth, so that a child and a sibling cannot describe the same way. GenerateFrame
-    // poses an element the tree holds twice at each place, and a subclass could override Equals, which the engine looks elements up by.
+    // Visit order with depth, so child and sibling differ; a twice-held element or subclass Equals is declined
     private static bool Tree(ShapeElement[] roots, bool recursive)
     {
         var walk = new ElementWalk(roots);
@@ -273,7 +249,7 @@ internal static partial class AnimationFrames
         return true;
     }
 
-    // The raw bits, so that a NaN keyframe still compares equal to itself
+    // Raw bits, so a NaN keyframe still equals itself
     private static bool Num(double? value)
     {
         if (!Int(value.HasValue ? 1 : 0) || !Assert(_at >= 0)) return false;
@@ -316,7 +292,7 @@ internal static partial class AnimationFrames
     private static Snapshot Take(ulong hash) =>
         new(hash, Assert(_at >= 0) && Assert(_at <= _buffer.Length) ? _buffer.AsSpan(0, _at).ToArray() : []);
 
-    // Bounded by entries, each a compiled set of up to ~180 KiB: past MaxEntries the cache starts over rather than grow
+    // Past MaxEntries (each up to ~180 KiB) the cache starts over rather than grow
     private static void Store(Snapshot key, AnimationFrame[][] frames)
     {
         if (!NotNull(frames) || !NotNull(key.Bytes)) return;
@@ -338,6 +314,6 @@ internal static partial class AnimationFrames
 
     private readonly record struct Entry(byte[] Bytes, AnimationFrame[][] Compiled);
 
-    // What a miss hands the postfix when the engine compiles: the descriptor to store its result under, and when the compile began
+    // What a miss hands the postfix when the engine compiles: the descriptor and the start time
     private readonly record struct Pending(Snapshot? Key, long Start);
 }

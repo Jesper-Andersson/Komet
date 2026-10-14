@@ -2,19 +2,16 @@ using System.Collections.Concurrent;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet.Core;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
 
 namespace Komet.Chunks;
 
-// ClientWorldMap.GetChunk and GetChunkAtBlockPos take chunksLock on every call, from the block accessors of every client thread. A
-// ConcurrentDictionary mirror of ClientWorldMap.chunks answers them without it. The mirror is written only where the engine mutates the
-// dictionary, on the main thread (loadChunkMT, OverloadChunkMT, HandleChunkUnload), and only for the dictionary it was filled from:
-// OnMapSizeReceived replaces the dictionary, and lookups on another one go to the engine. A chunk the mirror lacks is a miss, answered
-// by the engine, never a wrong chunk.
-// A chunk that is not loaded is answered too, on the main thread: the mirror only ever holds chunks the dictionary holds, so outside
-// the engine's own changes, as many entries as the dictionary means the same ones, and a key it lacks the dictionary lacks. The
-// render systems ask for many such chunks every frame (GetEntitiesAround), each a take of chunksLock the chunk threads contend for.
+// GetChunk and GetChunkAtBlockPos take chunksLock on every call from every thread; a ConcurrentDictionary mirror of
+// ClientWorldMap.chunks answers without it. Written only where the engine mutates it on the main thread (loadChunkMT,
+// OverloadChunkMT, HandleChunkUnload), for the dictionary it was filled from. Missing = engine lookup, never a wrong
+// chunk. Main thread also answers unloaded keys (Whole): renderers ask for many per frame.
 internal static class ChunkLookup
 {
     private const int MaxChunks = 1 << 18;
@@ -28,11 +25,11 @@ internal static class ChunkLookup
 
     private static Dictionary<long, ClientChunk>? _chunks;
 
-    // Main thread: the mirror's entries, and whether one of the engine's changes to the dictionary is under way
+    // Main thread: mirror entry count, and whether an engine change to the dictionary is under way
     private static int _count;
     private static bool _changing;
 
-    // Totals while Counting.Hud, in a Tally: every client thread that looks a chunk up counts it, too often for one shared line
+    // Counting.Hud totals in a Tally: every client thread counts
     private const int HitCounter = 0, MissCounter = 1;
     private static readonly Tally Counts = new(2);
 
@@ -42,12 +39,12 @@ internal static class ChunkLookup
     public static int Count => Assert(_count >= 0) ? _count : 0; // the chunks mirrored (the engine's own, no copies)
 
     [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "chunks")]
-    private static extern ref Dictionary<long, ClientChunk> Chunks(ClientWorldMap map);
+    internal static extern ref Dictionary<long, ClientChunk> Chunks(ClientWorldMap map);
 
     [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "chunksLock")]
     private static extern ref object Gate(ClientWorldMap map);
 
-    // All or nothing: a mirror that misses an unload or an overload would hand out chunks the engine no longer has
+    // All or nothing: a mirror missing an unload or overload would hand out chunks the engine no longer has
     public static void Install(Harmony harmony)
     {
         Clear();
@@ -85,7 +82,7 @@ internal static class ChunkLookup
             ? MapUtil.Index3dL(chunkX, chunkY, chunkZ, map.index3dMulX, map.index3dMulZ)
             : long.MinValue;
 
-    // Answered from the mirror: its chunk, or none when the key is not loaded (Whole); false leaves the lookup to the engine
+    // From the mirror: its chunk, or none when the key is not loaded (Whole); false leaves the lookup to the engine
     private static bool Hit(ClientWorldMap map, long key, out ClientChunk? chunk)
     {
         chunk = null;
@@ -101,8 +98,7 @@ internal static class ChunkLookup
         return true;
     }
 
-    // Whether the mirror holds every chunk the dictionary does: on the main thread, between the engine's changes, with as many
-    // entries (it never holds one the dictionary lacks: loads go in after the engine's insert, unloads out before its removal)
+    // Main thread between engine changes: equal counts mean equal entries (loads after insert, unloads before)
     private static bool Whole(ClientWorldMap map)
     {
         if (_changing || Environment.CurrentManagedThreadId != RuntimeEnv.MainThreadId) return false;
@@ -125,7 +121,7 @@ internal static class ChunkLookup
         return false;
     }
 
-    // The engine shifts instead of dividing here, so negative coordinates land one chunk lower
+    // The engine shifts instead of dividing, so negative coordinates land one chunk lower
     private static bool AtBlockPos(ClientWorldMap __instance, int posX, int posY, int posZ, ref ClientChunk? __result)
     {
         if (!NotNull(__instance) ||
@@ -154,19 +150,18 @@ internal static class ChunkLookup
         _count = 0;
     }
 
-    // Prefix on loadChunkMT: the engine inserts before Loaded mirrors it
+    // Prefix on loadChunkMT: the engine inserts, then Loaded mirrors it
     private static void Loading()
     {
         _changing = true;
         _ = Assert(_count >= 0) && Assert(_count <= MaxChunks);
     }
 
-    // On the main thread, like the engine's own inserts and removals, so a fill never races a removal. loadChunkMT may replace a chunk:
-    // past MaxChunks (more than any view distance loads) the key is dropped instead, and its lookups miss.
+    // Past MaxChunks (beyond any view distance) the key is dropped instead and its lookups miss
     private static void Loaded(ClientWorldMap __instance, Packet_ServerChunk p, ClientChunk chunk)
     {
         _changing = false;
-        if (!NotNull(p) || !NotNull(chunk) || !Enabled || !NotNull(__instance)) return;
+        if (!NotNull(p) || !NotNull(chunk) || !NotNull(__instance)) return;
         var chunks = Chunks(__instance);
         if (!ReferenceEquals(chunks, _chunks))
         {
@@ -176,7 +171,8 @@ internal static class ChunkLookup
 
         var key = Key(__instance, p.X, p.Y, p.Z);
         if (!NotNull(chunks) || !Assert(key != long.MinValue)) return;
-        if (Assert(chunks.Count <= MaxChunks)) Put(key, chunk);
+        // dropped even when switched off: loadChunkMT may have replaced the mirrored chunk
+        if (Enabled && Assert(chunks.Count <= MaxChunks)) Put(key, chunk);
         else Drop(key);
     }
 
@@ -188,7 +184,7 @@ internal static class ChunkLookup
         if (Assert(key != long.MinValue)) Drop(key);
     }
 
-    // An overload may re-enqueue itself instead of inserting, so afterwards the mirror takes whatever the dictionary actually holds
+    // An overload may re-enqueue itself instead of inserting, so the mirror then takes what the dictionary holds
     private static void Overloaded(ClientWorldMap __instance, Packet_ServerChunk p, ClientChunk newchunk)
     {
         _changing = false;
@@ -202,8 +198,7 @@ internal static class ChunkLookup
         }
     }
 
-    // A packet lists every chunk the server unloaded that tick, however many: one the mirror cannot read whole empties it, so lookups
-    // go to the engine instead of finding a disposed chunk
+    // An unload packet not readable whole empties the mirror: lookups go to the engine, never to a disposed chunk
     private static void Unloading(ClientMain ___game, Packet_Server packet)
     {
         _changing = true;

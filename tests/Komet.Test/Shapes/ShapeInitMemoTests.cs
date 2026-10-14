@@ -1,3 +1,6 @@
+using Komet.Core;
+using Komet.Shapes;
+
 namespace Komet.Test.Shapes;
 
 // ShapeInitMemo skips Shape.InitForAnimations on a shape whose last init it remembers and which has not changed since. That is only

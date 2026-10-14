@@ -11,14 +11,16 @@
 #                   gcreg about 25)
 #   --arm           replaces the profile's arms, e.g. --arm off:OcclusionCulling=false --arm on:OcclusionCulling=true; values are
 #                   true/false for a switch, a number for a slider; laps must stay a multiple of the arms
-#   --hud           KEY=VALUE into the sandbox's komet-hud.json before the start, for a knob that acts at the world's start
+#   --hud           KEY=VALUE into the sandbox's komet.json before the start, for a knob that acts at the world's start
 #                   (--hud JitWarm=false); true/false or a number
 #   --freeze        seconds without a frame (the mod's pulse file) that count as a freeze: the stacks of every thread go to
 #                   logs/freeze-stacks.txt (dotnet-stack), then the game is stopped; default 20
 #   --mod DIR       the build under test, a Release folder mod (default Releases/komet); two builds measured against each
-#                   other are launched alternately, A B B A, with the same profile. Only builds with this harness (result
-#                   schema komet-bench/2) read the bench.json written here: an older build runs with its own tree's bench.sh
-#   --build         run ./build.sh (Release) into Releases/komet first; not with another --mod
+#                   other are launched alternately, A B B A, with the same profile. The benchmark itself is the mod kometbench
+#                   (Komet.Bench, never released) from the folder beside it (Releases/kometbench). Only builds with this harness
+#                   (result schema komet-bench/2) read the bench.json written here: an older build runs with its own tree's bench.sh
+#   --build         run ./build.sh (Release) into Releases/komet and package Komet.Bench into Releases/kometbench first; not
+#                   with another --mod
 #   --golden        make the golden copy of the save again (the game must be closed)
 #   --keep          keep the copied clientsettings.json and save in the run folder (they hold the session key)
 #   --env N=V       extra environment for the game process, e.g. --env DOTNET_gcServer=1 --env DOTNET_GCgen0size=0x4000000
@@ -53,7 +55,7 @@ DATA=${VS_DATA:-$HOME/.config/VintagestoryData}
 GAME=${VS_GAME:-/opt/vintagestory}
 CACHE=${KOMET_BENCH_CACHE:-$HOME/.cache/komet-bench}
 
-usage() { sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 die() { echo "bench: $*" >&2; exit 2; }
 
 while (($#)); do
@@ -113,14 +115,22 @@ DEFAULT_MOD=$(realpath -m "$REPO/Releases/komet")
 MOD=${MOD:-$DEFAULT_MOD}
 if ((BUILD)) && [[ $MOD != "$DEFAULT_MOD" ]]; then die "--build builds $DEFAULT_MOD; drop --mod or --build"; fi
 # no build servers: they outlive the build holding every fd it inherited, a caller's flock on the GPU lock among them
-if ((BUILD)); then (cd "$REPO" && ./build.sh --disable-build-servers) || die "build failed"; fi
+if ((BUILD)); then
+  (cd "$REPO" && ./build.sh --disable-build-servers &&
+    dotnet build Komet.Bench/Komet.Bench.csproj -c Release -t:Package --disable-build-servers) || die "build failed"
+fi
 [[ -f $MOD/Komet.dll && -f $MOD/modinfo.json ]] || die "no build in $MOD, run ./build.sh or pass --build"
+# The benchmark mod lies beside the build under test: the same tree built both, so its view of Komet's internals matches
+BENCH_MOD=$(dirname "$MOD")/kometbench
+[[ -f $BENCH_MOD/Komet.Bench.dll && -f $BENCH_MOD/modinfo.json ]] ||
+  die "no benchmark mod in $BENCH_MOD, pass --build (or: dotnet build Komet.Bench -c Release -t:Package)"
 # BenchReport.Schema, a UTF-16 literal in the assembly; an older harness refuses the bench.json below only once the world is up
-python3 -c 'import sys; sys.exit(open(sys.argv[1], "rb").read().find("komet-bench/2".encode("utf-16-le")) < 0)' "$MOD/Komet.dll" ||
-  die "$MOD holds an older bench harness than this script (no komet-bench/2): run it with its own tree's scripts/bench.sh"
+python3 -c 'import sys; sys.exit(open(sys.argv[1], "rb").read().find("komet-bench/2".encode("utf-16-le")) < 0)' "$BENCH_MOD/Komet.Bench.dll" ||
+  die "$BENCH_MOD holds an older bench harness than this script (no komet-bench/2): run it with its own tree's scripts/bench.sh"
 if [[ $MOD == "$DEFAULT_MOD" ]] &&
-  [[ -n $(find "$REPO/Komet" -name '*.cs' -newer "$MOD/Komet.dll" -not -path '*/obj/*' -not -path '*/bin/*' -print -quit) ]]; then
-  echo "bench: warning: sources are newer than $MOD/Komet.dll, pass --build to benchmark them" >&2
+  [[ -n $(find "$REPO/Komet" -name '*.cs' -newer "$MOD/Komet.dll" -not -path '*/obj/*' -not -path '*/bin/*' -print -quit) ||
+     -n $(find "$REPO/Komet.Bench" -name '*.cs' -newer "$BENCH_MOD/Komet.Bench.dll" -not -path '*/obj/*' -not -path '*/bin/*' -print -quit) ]]; then
+  echo "bench: warning: sources are newer than the builds in $(dirname "$MOD"), pass --build to benchmark them" >&2
 fi
 REVISION=$(git -C "$MOD" describe --always --dirty 2>/dev/null || true)
 
@@ -179,6 +189,7 @@ done
 cp "$GOLDEN_SAVE" "$RUN/data/Saves/bench.vcdbs"
 if [[ -f $GOLDEN_MAP ]]; then cp "$GOLDEN_MAP" "$RUN/data/Maps/$SAVEGAME_ID.db"; fi
 cp -r "$MOD" "$RUN/data/Mods/komet"
+cp -r "$BENCH_MOD" "$RUN/data/Mods/kometbench"
 
 # Patch the copies in place and write the flat bench.json the mod reads. Prints the time budget and the game's extra environment.
 mapfile -t PLAN < <(KOMET_BENCH_ARMS="${ARMS[*]}" KOMET_BENCH_HUD="${HUDS[*]}" python3 - "$CONFIG" "$PROFILE" "$RUN" "$SAVEGAME_ID" "$REVISION" "${EXTRA_ENV[@]}" <<'PY'
@@ -221,7 +232,8 @@ def put(section, key, value):
 data = f"{run}/data"
 settings_path = f"{data}/clientsettings.json"
 settings = json.load(open(settings_path, encoding="utf-8-sig"))
-lists, ints, bools = (settings.setdefault(name, {}) for name in ("stringListSettings", "intSettings", "boolSettings"))
+lists, ints, bools, floats = (settings.setdefault(name, {}) for name in
+                              ("stringListSettings", "intSettings", "boolSettings", "floatSettings"))
 put(lists, "modPaths", ["Mods", f"{data}/Mods"])  # "Mods" resolves against the game folder: game, survival, creative
 put(lists, "disabledMods", [])
 width, height = sandbox.get("window", [1920, 1080])
@@ -235,6 +247,8 @@ put(bools, "extendedDebugInfo", False)  # it also switches on CalcFragmentation 
 put(bools, "showSurvivalHelpDialog", False)
 for key, value in sandbox.get("bools", {}).items():  # a profile's own switches, e.g. glDebugMode to find a GL error
     put(bools, key, bool(value))
+for key, value in sandbox.get("floats", {}).items():  # e.g. ssaa, the render resolution
+    put(floats, key, float(value))
 with open(settings_path, "w", encoding="utf-8") as out:
     json.dump(settings, out, indent=2)
 
@@ -246,7 +260,7 @@ json.dump(magic, open(magic_path, "w"), indent=2)
 hud = {"Visible": False, "UpdateCheck": False, "UpdateAsked": True}  # no opt-in dialog, no GitHub call, no HUD cost
 hud.update(sandbox.get("hud", {}))  # a profile that tests the HUD itself switches it on here
 hud.update((k, parsed(v)) for k, v in (item.split("=", 1) for item in os.environ.get("KOMET_BENCH_HUD", "").split(" ") if item))
-json.dump(hud, open(f"{data}/ModConfig/komet-hud.json", "w"), indent=2)
+json.dump(hud, open(f"{data}/ModConfig/komet.json", "w"), indent=2)
 
 json.dump(flat, open(f"{run}/bench.json", "w"), indent=2)
 

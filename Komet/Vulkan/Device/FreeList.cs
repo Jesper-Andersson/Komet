@@ -1,6 +1,6 @@
 namespace Komet.Vulkan;
 
-// The free ranges of a block, sorted by offset (DeviceHeap, SharedArena): a range given back merges with its neighbours
+// The free ranges of a block, sorted by offset (DeviceHeap): a range given back merges with its neighbours
 internal static class FreeList
 {
     public const int MaxRanges = 1 << 14;

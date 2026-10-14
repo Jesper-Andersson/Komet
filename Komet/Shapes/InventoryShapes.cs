@@ -1,16 +1,14 @@
 using System.Reflection;
 using HarmonyLib;
 using System.Text;
+using Komet.Core;
 using Newtonsoft.Json;
 
 namespace Komet.Shapes;
 
-// The first time a creature item (ItemCreature: a deer, a moose, a trader) or a wearable (CollectibleBehaviorWearableAttachment's
-// full-body mesh) is drawn - a row of the creative inventory scrolling in - the engine parses its shape files whole, animations and
-// all, only to tesselate their elements once: up to 1.7 MB of JSON per creature, 812 MB of garbage and a 2 s frame for one row. The
-// mesh never reads an animation (step parenting only merges animations into animations, the tesselator reads elements), so these
-// builders get their shapes with the root's "animations" cut from the JSON before Newtonsoft sees it, and the full-body mesh no
-// clone of the wearer's animations. The same mesh from a fraction of the parsing.
+// Creature items and wearables' full-body meshes parse whole shape files on first draw only to tesselate elements
+// (812 MB and a 2 s frame per creative row). These builders get shapes with the root's "animations" cut before
+// Newtonsoft, and no clone of the wearer's animations.
 internal static class InventoryShapes
 {
     private const int MaxInstructions = 4096, MaxChars = 1 << 26;
@@ -50,7 +48,7 @@ internal static class InventoryShapes
         return code;
     }
 
-    // Every Shape.TryGet (the inventory shape, the attached shape, its overlays) and the clone of the wearer's animations
+    // Every Shape.TryGet (inventory, attached and overlay shapes) and the clone of the wearer's animations
     internal static List<CodeInstruction> RewriteWearable(IEnumerable<CodeInstruction> instructions)
     {
         var (tryGet, none) = (AccessTools.Method(typeof(InventoryShapes), nameof(TryGet)),
@@ -73,9 +71,7 @@ internal static class InventoryShapes
         _ = Assert(MaxInstructions > 0) && Assert(MaxChars > 0);
     }
 
-    // IAsset.ToObject<Shape>, its errors the same, without the animations. The file is decoded into a pooled buffer and read past the
-    // animations' range: no string of the whole file, nor a second one without them (both large-object-heap garbage, each
-    // collected only by a full collection).
+    // IAsset.ToObject<Shape> minus animations, from a pooled buffer: no whole-file string on the LOH
     internal static Shape? Lean(IAsset asset, JsonSerializerSettings? settings)
     {
         if (!Enabled || !NotNull(asset) || asset.Data is not { Length: > 0 } data || Utf16(data)) return asset.ToObject<Shape>(settings);
@@ -150,8 +146,7 @@ internal static class InventoryShapes
         }
     }
 
-    // Shape.TryGet as the engine has it; lean only where the shape goes into the wearer's clone (else step parenting would merge its
-    // animations into the wearer's own shape, which the engine's does)
+    // Shape.TryGet; lean only for the wearer's clone (else step parenting merges animations into the wearer's shape)
     internal static Shape? TryGet(ICoreAPI api, AssetLocation path)
     {
         if (!Enabled || !_cloned || !NotNull(api)) return Shape.TryGet(api, path);
@@ -169,7 +164,7 @@ internal static class InventoryShapes
 
     internal static Animation[]? NoAnimations(Shape shape) => Enabled || !NotNull(shape) || !Assert(MaxChars > 0) ? null : shape.CloneAnimations();
 
-    // Where the root object's "animations" array or object lies. Strings, escapes and comments are skipped as Newtonsoft reads them.
+    // Where the root's "animations" value lies; strings, escapes and comments skipped as Newtonsoft does
     internal static bool Animations(ReadOnlySpan<char> json, out int from, out int to)
     {
         (from, to) = (0, 0);
@@ -190,7 +185,7 @@ internal static class InventoryShapes
         return false;
     }
 
-    // A key "animations" (any case) at i: where its value starts
+    // A key "animations" (any case) at json[at]: where its value starts
     private static bool Key(ReadOnlySpan<char> json, int at, out int value)
     {
         var end = Skipped(json, at);
@@ -237,7 +232,7 @@ internal static class InventoryShapes
         return false;
     }
 
-    // Past a string (quoted either way, escapes honoured) or a comment at i; a lone slash is one character
+    // Past a string (quoted either way, escapes honoured) or a comment at json[at]; a lone slash is one character
     private static int Skipped(ReadOnlySpan<char> json, int at)
     {
         if (!Index(at, json.Length)) return json.Length;

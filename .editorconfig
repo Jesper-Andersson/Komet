@@ -62,29 +62,29 @@ dotnet_diagnostic.S1075.severity = none     # the release feed URL has exactly o
 [{Komet/KometModSystem.cs,Komet/Host/HostSystem.cs}]
 dotnet_diagnostic.CA1063.severity = none    # sealed override of ModSystem's virtual Dispose
 
-[Komet/Bench/Benchmark.cs]
+[Komet.Bench/Benchmark.cs]
 dotnet_diagnostic.CA2000.severity = none    # the engine disposes a registered renderer with the world
 
-[Komet/Rendering/IndirectDraw.cs]
+[Komet/Rendering/Pools/IndirectDraw.cs]
 dotnet_diagnostic.S6640.severity = none     # the persistent GL mapping is a raw pointer
 
-[{Komet/Gpu/IGpuBackend.cs,Komet/Rendering/OcclusionCulling.Gather.cs,Komet/Rendering/FacePacking.cs}]
+[{Komet/Gpu/IGpuBackend.cs,Komet/Rendering/Occlusion/OcclusionCulling.Gather.cs,Komet/Rendering/Pools/FacePacking.cs}]
 dotnet_diagnostic.S6640.severity = none     # mapped memory (the backend's staging, GL's persistent mappings), filled through a raw pointer
 
 [Komet/Rendering/IdleAnimators.Ahead.cs]
 dotnet_diagnostic.S6640.severity = none     # an object's address handed to a prefetch hint, never read through
 
 [Komet/Vulkan/**.cs]
-dotnet_diagnostic.S6640.severity = none     # Vulkan and the GL interop are a C API: structures with pointers, function pointers
+dotnet_diagnostic.S6640.severity = none     # Vulkan and the GL extensions are a C API: structures with pointers, function pointers
 
 [Komet/Vulkan/Device/VulkanCore.cs]
-dotnet_diagnostic.CA2000.severity = none    # a proven device passes to VulkanCore.Device, the rest are disposed in a finally
+dotnet_diagnostic.CA2000.severity = none    # the device made passes to VulkanCore.Device
 
 [Komet/Vulkan/Terrain/**.cs]
-dotnet_diagnostic.CA2000.severity = none    # the renderer owns its pools, targets, copies, samplers, pipelines and frames until Dispose; an adopted pool its shared buffers, the targets their swapped images, the quad pattern goes to its caller
+dotnet_diagnostic.CA2000.severity = none    # the renderer owns its pools, targets, images, samplers, pipelines and frames until Dispose; an adopted pool its buffers, the targets their images, the quad pattern goes to its caller
 
 [Komet/Vulkan/Frame/**.cs]
-dotnet_diagnostic.CA2000.severity = none    # the frame owns its slots' uploads, semaphores and fences until Dispose
+dotnet_diagnostic.CA2000.severity = none    # the frame owns its slots' uploads and fences until Dispose
 
 [Komet/Vulkan/Scene/**.cs]
 dotnet_diagnostic.CA2000.severity = none    # the scene owns its mirrors, heap, staging buffers, pipelines and query pool until Dispose
@@ -118,8 +118,8 @@ dotnet_diagnostic.CA1819.severity = none    # the arrays are the engine's own bu
 dotnet_diagnostic.RS2008.severity = none
 dotnet_diagnostic.CA1062.severity = none
 
-[Komet/Rendering/GlQueryCache.cs]
+[Komet/Rendering/Gl/GlQueryCache.cs]
 dotnet_diagnostic.S6640.severity = none     # GL entry points are C functions taking pointers
 
-[Komet/Rendering/RoundTrips.cs]
+[Komet/Rendering/Gl/RoundTrips.cs]
 dotnet_diagnostic.S6640.severity = none     # the query buffer is read through its persistent mapping

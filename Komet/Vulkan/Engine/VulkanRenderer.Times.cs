@@ -3,8 +3,7 @@ using static Komet.Rendering.Fields;
 
 namespace Komet.Vulkan;
 
-// Draws and dispatches name their section before they are recorded; what else a segment records (clears, copies,
-// barriers) counts to the section before.
+// Draws/dispatches name their section first; other work (clears, copies, barriers) counts to the one before.
 internal static partial class VulkanRenderer
 {
     public enum Drawn
@@ -44,8 +43,7 @@ internal static partial class VulkanRenderer
         });
     }
 
-    // RenderCost's groups by the stages the terrain is drawn in: the shadow maps, opaque, and the liquid depth before, the
-    // transparent pass and the one after it
+    // RenderCost groups by terrain stage: shadow maps, opaque plus liquid depth, transparent and the pass after
     private static readonly EnumRenderStage[] TerrainStages =
     [
         EnumRenderStage.ShadowFar, EnumRenderStage.ShadowNear, EnumRenderStage.Opaque, EnumRenderStage.Before,
@@ -54,20 +52,17 @@ internal static partial class VulkanRenderer
 
     private static readonly int[] TerrainGroups = [0, 0, 1, 2, 2, 2], TerrainSections = [-1, -1, -1, -1, -1, -1];
 
-    // While Vulkan draws the opaque terrain: the HUD's terrain GPU rows from the last timed frame's sections, in RenderCost's
-    // groups; false while OpenGL draws it (its timer queries tell then)
+    // Vulkan drawing opaque terrain: HUD terrain GPU rows of the last timed frame, in RenderCost groups; false under GL
     public static bool TerrainGpuMs(Span<double> groups) => TimesTerrain && TerrainMs(_renderer!.Frame, groups);
 
     public static bool TimesTerrain => Runs(Pass.Opaque) && _renderer is not null;
 
-    // The opaque terrain's pipeline statistics in the last counted frame (Occlusion's order) while Vulkan draws it, and the area it
-    // drew into; NaN while OpenGL draws it
+    // Opaque terrain pipeline statistics (Occlusion's order) and area of the last counted frame; NaN under GL
     public static double TerrainStatistic(int at) => TimesTerrain ? _renderer!.Frame.LastStatistic(at) : double.NaN;
 
     public static double TerrainPixels => TimesTerrain ? _renderer!.Frame.CountedPixels : double.NaN;
 
-    // The whole frame's GPU time while Vulkan draws all of it (the window too): Vulkan's busy time in the last timed frame; NaN
-    // while OpenGL draws any of it
+    // Whole-frame GPU time (Vulkan busy, last timed frame) while Vulkan draws all incl. the window; else NaN
     public static double FrameGpuMs => State == Phase.Running && _windowing && _renderer is { } renderer
         ? renderer.Frame.LastBusyMs
         : double.NaN;

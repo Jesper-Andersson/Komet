@@ -1,3 +1,5 @@
+using Komet.World;
+
 namespace Komet.Test.World;
 
 // A tree read back through the rewritten FromBytes is the tree written: keys new and seen before, non-ASCII, nested, and every value

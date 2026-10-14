@@ -2,7 +2,7 @@ using System.Text;
 
 namespace Komet.Hud;
 
-// One section of the HUD's report: its rows read every interval, the bench averages them and the debug protocol quotes the means
+// One HUD report section: rows read every interval, the bench averages them, the protocol quotes the means
 internal sealed class HudPanel
 {
     private const int MaxRows = 64, MaxLines = 4 * MaxRows;
@@ -66,7 +66,6 @@ internal sealed class HudPanel
         _peaksRead = true;
     }
 
-    // After the interval's reader, so it saw the maxima
     public void ResetPeaks()
     {
         if (!_peaksRead || !Assert(_lines.Count > 0)) return;
@@ -86,7 +85,6 @@ internal sealed class HudPanel
         foreach (var line in _lines.Bounded(MaxLines)) line.Prime();
     }
 
-    // The means of every row, a blank line before the section
     public void AppendMeans(StringBuilder text)
     {
         if (!Assert(_lines.Count > 0) || !NotNull(text)) return;

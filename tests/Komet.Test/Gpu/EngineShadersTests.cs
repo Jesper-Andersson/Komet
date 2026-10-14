@@ -43,6 +43,19 @@ public sealed class EngineShadersTests
         Assert.That(uniforms.First(u => u.Name == "shadowIntensity").Default, Is.EqualTo(One));
     }
 
+    // Vulkan-only's packed face data: each chunk program takes the patch and still ports and compiles, reading the same block
+    [TestCase("chunkopaque"), TestCase("chunktopsoil"), TestCase("chunktransparent"), TestCase("chunkshadowmap")]
+    public void TheChunkProgramsReadPackedFaces(string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        var (vertex, fragment) = EngineShaders.Program(name, true);
+        var patched = CompactFaces.Patch(vertex);
+        Assert.That(patched, Is.Not.Null.And.Contains("kometFace(gl_VertexID / 4)"));
+        var ported = GlslPort.Build(name, patched!, fragment, EngineShaders.Attributes(name), out var error);
+        Assert.That(ported, Is.Not.Null, error);
+        Assert.That(ported!.Blocks, Does.Contain(Faces));
+    }
+
     // Every vertex and fragment pair the game ships: what the port cannot take yet, by name and reason, so the list only shrinks
     [Test]
     public void TheGamesProgramsPort()

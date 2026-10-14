@@ -1,10 +1,11 @@
+using Komet.Diagnostics;
+
 namespace Komet.Vulkan;
 
-// A draw it cannot take is left to OpenGL: GlTap's Touch group then closes the open segment where OpenGL's draw must follow
-// Vulkan's work. So is a draw whose port or pipeline is still being made off the engine's thread (Builds), until it is done.
+// Every GL draw, clear and blit outside the terrain passes; what it cannot take is missing from the picture.
 internal sealed partial class SceneRenderer : IGlWrites, IDisposable
 {
-    private const int MaxUnported = 1024, MaxScenePrograms = 256, MaxReasons = 32;
+    private const int MaxUnported = 1024, MaxScenePrograms = 256;
 
     private readonly TerrainRenderer _terrain;
     private readonly ILogger? _logger;
@@ -24,43 +25,50 @@ internal sealed partial class SceneRenderer : IGlWrites, IDisposable
         public TerrainDraw.Texture[] Resolved { get; set; } = [];
         public TerrainDraw.Program? Recorded { get; set; }
 
-        // Whether its hot uniforms are settled (watched over its first draws, or it came with them)
+        // Hot uniforms settled (watched over first draws, or came with them)
         public bool Settled { get; set; }
 
-        // Since it settled: its draws and its mirror's packs when they were last counted, and how often it was watched again
+        // Since settling: draws and mirror packs at the last count, and re-watch rounds
         public int Draws { get; set; }
         public long PacksAt { get; set; }
         public long FrameAt { get; set; }
         public int Rounds { get; set; }
 
-        // Its port with the hot uniforms it settled on, being made, and their names
+        // Port with the settled hot uniforms being made, and their names
         public (Build<GlslPort.Ported> Port, string Hot)? Again { get; set; }
 
-        // Which of the program's ports it draws with (PipelineKey), and the next one, made, with its pipelines being made
+        // Port in use (PipelineKey), and the next one, made, with its pipelines being made
         public int Port { get; init; }
+
+        // Vulkan-only: ShaderCache key of its pipelines (SceneRenderer.Warm), "" for none
+        public string Sources { get; init; } = "";
         public (GlslPort.Ported Ported, int Port, PipelineKey[] Pipelines)? Next { get; set; }
 
-        // What its textures were last resolved against, and the images they gave: the same again while nothing changed
-        public (long Textures, int Samplers, long Copies, long Targets, VulkanFrame.Target? Into) Key { get; set; }
+        // Last texture resolve key and its images: reused while nothing changed
+        public (long Textures, int Samplers, long Images, long Targets, VulkanFrame.Target? Into) Key { get; set; }
         public SharedImage[] Images { get; set; } = [];
 
-        // The same again after other binds too, while the units its samplers read hold the textures and sampler objects they
-        // held then (Bound) and no texture was deleted, no sampler uniform set, no copy or target changed since (Held)
-        public (long Deleted, int Samplers, long Copies, long Targets, VulkanFrame.Target? Into) Held { get; set; }
+        // Reused across other binds while units hold the same textures and samplers (Bound) and nothing was deleted,
+        // set or changed (Held)
+        public (long Deleted, int Samplers, long Images, long Targets, VulkanFrame.Target? Into) Held { get; set; }
         public (int Unit, uint Kind, uint Texture, int Sampler)[] Bound { get; set; } = [];
 
-        // The kind of each sampler's texture, and what the samplers resolved to before by what their units held, while Held
-        // stays SeenHeld: the units switch between a few textures (a GUI element's, an entity's) without a resolve each time
+        // Texture kind per sampler, and resolves by unit contents while Held stays SeenHeld (units cycle among a few
+        // textures)
         public uint[] Kinds { get; } = [.. program.Ported.Samplers.Select(s => TargetOf(s.Type))];
         public Dictionary<Units, Seen> Seen { get; } = [];
-        public (long Deleted, int Samplers, long Copies, long Targets, VulkanFrame.Target? Into) SeenHeld { get; set; }
+        public (long Deleted, int Samplers, long Images, long Targets, VulkanFrame.Target? Into) SeenHeld { get; set; }
     }
 
     private SceneRenderer(TerrainRenderer terrain, ILogger? logger, HostBuffer constants)
     {
         _ = NotNull(terrain) && NotNull(constants);
         (_terrain, _logger, Constants) = (terrain, logger, constants);
-        Mirrors = new BufferMirrors(terrain.Device, terrain.Frame, terrain.Staging);
+        Mirrors = new BufferMirrors(terrain.Device, terrain.Frame)
+        {
+            Mapped = terrain.Maps.Read, Early = terrain.Images, Pooled = terrain.Pools.Range
+        };
+        terrain.Pools.Held = Mirrors.Taken;
         _pipelines = new PipelineSet<PipelineKey>(terrain.Device, terrain.Frame, logger, MaxPipelines);
     }
 
@@ -76,28 +84,26 @@ internal sealed partial class SceneRenderer : IGlWrites, IDisposable
 
     public BufferMirrors Mirrors { get; }
 
-    // (0, 0, 0, 1) as floats at 0 and as integers at 16: what a vertex shader reads from a disabled attribute
+    // (0, 0, 0, 1) as floats at 0 and integers at 16: what a disabled attribute reads
     private HostBuffer Constants { get; }
 
     public System.Func<int, string, bool> Takes { get; set; } = (_, _) => false;
 
-    public System.Func<bool> Deferring { get; set; } = () => false;
-
-    // Between the frame's start and its end: draws and clears are taken only then
+    // Draws and clears are taken only between frame start and end
     public bool Framing { get; set; }
+
+    public string Unported => string.Join("; ", ((IEnumerable<string>)_unported.Values).Bounded(16));
 
     public long Draws { get; private set; }
     public long Clears { get; private set; }
     public long Left { get; private set; }
 
-    // Draws left to OpenGL while their port was being made (the pipelines' are PipelineWaits)
+    // Draws that waited for their port (pipelines: PipelineWaits)
     public long PortWaits { get; private set; }
     public long PipelineWaits => _pipelines.Waits;
 
-    // Ports and pipelines being made for it now
     public int Building => _porting.Count + _pipelines.Building;
     public long Ticks { get; private set; }
-    public HashSet<string> Reasons { get; } = new(StringComparer.Ordinal);
 
     private Drawn? ProgramFor(int id, out string why)
     {
@@ -113,24 +119,26 @@ internal sealed partial class SceneRenderer : IGlWrites, IDisposable
             if (waiting) return null;
             if (ported is null || _programs.Count >= MaxScenePrograms)
             {
-                if (_unported.Count < MaxUnported) _unported[id] = $"{name} has no Vulkan port: {error}";
-                return Refused(out why, $"{name} has no Vulkan port: {error}");
+                var unported = $"{name} (no Vulkan port: {error})";
+                if (_unported.Count < MaxUnported) _unported[id] = unported;
+                return Refused(out why, unported);
             }
 
-            // its hot uniforms are settled over its first draws, unless the port has the ones an earlier start settled on
+            // hot uniforms settle over the first draws unless the port has an earlier start's
             program = _terrain.Watch(name, id, ported, measuring: ported.HotUniforms.Size == 0);
         }
 
         var drawn = new Drawn(program, ProgramPorts.Points(id, program.Ported))
         {
             Settled = program.Ported.HotUniforms.Size > 0, // the terrain's own, ported with its hot uniforms, or cached ones
-            Port = ++_ports
+            Port = ++_ports, Sources = SourcesOf(id)
         };
         _programs[id] = drawn;
+        Warm(drawn);
         return drawn;
     }
 
-    // Read back on this thread, ported on a builder: waiting until it is done
+    // Read back here, ported on a builder: waiting until done
     private GlslPort.Ported? Ported(int id, string name, out bool waiting, out string error)
     {
         (waiting, error) = (false, "");
@@ -144,7 +152,7 @@ internal sealed partial class SceneRenderer : IGlWrites, IDisposable
             _porting[id] = porting;
         }
 
-        if (!porting.Done)
+        if (!porting.Done && !porting.Awaited(Hitches.Kind.Port)) // waits: the draw would be missing
         {
             (waiting, PortWaits) = (true, PortWaits + 1);
             return null;
@@ -164,7 +172,7 @@ internal sealed partial class SceneRenderer : IGlWrites, IDisposable
         return null;
     }
 
-    // The engine rebuilt its shaders; the GL name may come back for another program. keep: a port whose pipelines stay
+    // The GL name may return for another program. keep: a port whose pipelines stay
     public void Forget(int id, int keep = 0)
     {
         if (!Assert(id >= 0) || !Assert(_programs.Count <= MaxScenePrograms)) return;
@@ -176,11 +184,12 @@ internal sealed partial class SceneRenderer : IGlWrites, IDisposable
         _terrain.Forget(id);
     }
 
+    // OpenGL's picture is not shown, so the draw is missing
     private bool Leave(string why)
     {
         Left++;
-        if (NotNull(why) && why.Length > 0 && Reasons.Count < MaxReasons && Reasons.Add(why))
-            _logger?.Warning("Komet: Vulkan leaves a draw to OpenGL: {0}", why);
+        _asked = !GlTap.LaterRange; // a later range of a multi-draw: no Touched comes to take it
+        if (NotNull(why)) _terrain.Miss(why);
         _ = Assert(Left > 0);
         return false;
     }
@@ -188,11 +197,13 @@ internal sealed partial class SceneRenderer : IGlWrites, IDisposable
     public void BufferData(uint buffer, long size, IntPtr data, bool persistent)
     {
         if (Assert(size >= 0) && NotNull(Mirrors)) Mirrors.Data(buffer, size, data, persistent);
+        if (persistent) _terrain.Maps.Specified(buffer, data != IntPtr.Zero);
     }
 
     public void BufferSubData(uint buffer, long offset, long size, IntPtr data)
     {
         if (Assert(offset >= 0) && Assert(size >= 0)) Mirrors.SubData(buffer, offset, size, data);
+        _ = _terrain.PoolWritten(buffer, offset, size, data);
     }
 
     public void BufferCopy(uint from, uint to, long fromOffset, long toOffset, long size)
@@ -208,24 +219,12 @@ internal sealed partial class SceneRenderer : IGlWrites, IDisposable
     public void BuffersGone(ReadOnlySpan<uint> buffers)
     {
         if (Assert(buffers.Length < 1 << 20) && NotNull(Mirrors)) Mirrors.Gone(buffers);
-    }
-
-    public bool TextureUploaded(uint texture, int level, (int X, int Y, int Width, int Height) rect,
-        (uint Format, uint Type) data, IntPtr pixels) =>
-        texture > 0 && Assert(texture < int.MaxValue) && NotNull(_terrain) &&
-        _terrain.Uploaded((int)texture, level, rect, data, pixels);
-
-    public void TextureSpecified(uint texture, int level, (int Format, int Width, int Height) spec,
-        (uint Format, uint Type) data, IntPtr pixels)
-    {
-        if (texture > 0 && Assert(texture < int.MaxValue) && Assert(level >= 0))
-            _terrain.Specified((int)texture, level, spec, data, pixels);
+        _terrain.BuffersGone(buffers);
     }
 
     public void TextureTuned(uint texture, uint name, float value)
     {
-        if (texture > 0 && Assert(texture < int.MaxValue) && NotNull(_terrain.Copies))
-            _terrain.Tuned((int)texture, name, value);
+        if (texture > 0 && Assert(texture < int.MaxValue) && NotNull(_terrain)) _terrain.Tuned((int)texture, name, value);
     }
 
     public bool TextureMipmapped(uint texture) =>
@@ -233,8 +232,28 @@ internal sealed partial class SceneRenderer : IGlWrites, IDisposable
 
     public void TextureChanged(uint texture)
     {
-        if (texture > 0 && Assert(texture < int.MaxValue) && NotNull(_terrain.Copies)) _terrain.Changed((int)texture);
+        if (texture > 0 && Assert(texture < int.MaxValue) && NotNull(_terrain)) _terrain.Changed((int)texture);
     }
+
+    public void TextureImaged(uint texture, uint target, (int Level, int Levels) levels,
+        (int Format, int Width, int Height, int Depth) spec, (uint Format, uint Type) data, IntPtr pixels)
+    {
+        if (texture > 0 && Assert(texture < int.MaxValue) && Assert(levels.Level >= 0))
+            _terrain.Imaged((int)texture, target, levels, spec, data, pixels);
+    }
+
+    public bool TextureSubImaged(uint texture, uint target, int level,
+        (int X, int Y, int Z, int Width, int Height, int Depth) box, (uint Format, uint Type) data, IntPtr pixels) =>
+        texture > 0 && Assert(texture < int.MaxValue) && Assert(target > 0) &&
+        _terrain.SubImaged((int)texture, level, box, data, pixels);
+
+    public bool TextureCopied((uint Texture, int Level, int X, int Y, int Z) to,
+        (uint Texture, int Level, int X, int Y, int Z) from, (int Width, int Height, int Depth) size) =>
+        to.Texture is > 0 and < int.MaxValue && Assert(from.Texture < int.MaxValue) && _terrain.Copied(to, from, size);
+
+    public bool TextureRead(uint texture, int level, (int X, int Y, int Z) at, (int Fbo, int Read) from,
+        (int X, int Y, int Width, int Height) rect) =>
+        texture is > 0 and < int.MaxValue && Assert(level >= 0) && _terrain.FramebufferRead((int)texture, level, at, from, rect);
 
     public void Dispose()
     {

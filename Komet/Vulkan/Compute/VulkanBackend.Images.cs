@@ -11,19 +11,17 @@ internal sealed unsafe partial class VulkanBackend
         if (!Assert(width > 0 && height > 0) || !Assert(_handle != IntPtr.Zero)) return 0;
         levels = 1 + (int)Math.Floor(Math.Log2(Math.Max(width, height)));
         var at = Free(_images);
-        var image = Create(width, height, levels);
-        if (at == 0 || image is null) return 0;
+        if (at == 0 || Create(width, height, levels) is not { } image) return 0;
         _images[at] = image;
         return at;
     }
 
-    // A one-level image of the given size holding value everywhere: depth for tests and for callers without a GL depth buffer
+    // A one-level image of the given size filled with value: depth for tests and callers without a GL depth buffer
     internal int Filled(int width, int height, float value)
     {
         if (!Assert(width > 0 && height > 0) || !Finite(value)) return 0;
         var at = Free(_images);
-        var image = Create(width, height, 1);
-        if (at == 0 || image is null) return 0;
+        if (at == 0 || Create(width, height, 1) is not { } image) return 0;
         _images[at] = image;
         var staging = Buffer();
         var pixels = new float[width * height];
@@ -52,19 +50,20 @@ internal sealed unsafe partial class VulkanBackend
             Usage = ImageUsage,
             InitialLayout = Vk.LayoutUndefined
         };
-        ulong handle, memory;
+        ulong handle, memory = 0;
         if (VkApi.CreateImage(_handle, &info, null, &handle) != Vk.Success) return null;
         Vk.MemoryRequirements needs;
         VkApi.GetImageMemoryRequirements(_handle, handle, &needs);
         var type = _device.MemoryType(needs.TypeBits, Vk.DeviceLocal);
         var allocate = new Vk.AllocateInfo { SType = Vk.MemoryAllocateInfo, Size = needs.Size, TypeIndex = (uint)type };
-        if (type < 0 || VkApi.AllocateMemory(_handle, &allocate, null, &memory) != Vk.Success)
+        if (type < 0 || VkApi.AllocateMemory(_handle, &allocate, null, &memory) != Vk.Success ||
+            VkApi.BindImageMemory(_handle, handle, memory, 0) != Vk.Success)
         {
             VkApi.DestroyImage(_handle, handle, null);
+            VkApi.FreeMemory(_handle, memory, null); // 0 when the allocation failed
             return null;
         }
 
-        _ = VkApi.BindImageMemory(_handle, handle, memory, 0);
         var image = new ImageSlot(handle, memory, View(handle, 0, levels), new ulong[levels]);
         for (var level = 0; level < Math.Min(levels, 16); level++) image.Levels[level] = View(handle, level, 1);
         General(handle, levels);

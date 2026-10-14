@@ -21,24 +21,23 @@ internal static unsafe partial class GlTap
     private static uint _unit, _current;
     private static Watched? _using;
 
-    // A program's uniforms by location: the uniform, the array element, and the words one element takes. Every glUniform call
-    // looks its location up, and a driver hands locations out densely from 0: those index an array (Entry null where none is
-    // watched), the rare ones past NearLocations to the dictionary.
+    // A program's uniforms by location: uniform, array element, words per element. Drivers hand out locations densely
+    // from 0, so those index an array (Entry null if unwatched); rare ones past NearLocations use the dictionary.
     private sealed class Watched(UniformMirror mirror, Slot[] near, Dictionary<int, Slot> far)
     {
         public UniformMirror Mirror { get; } = mirror;
         public Slot[] Near { get; } = near;
         public Dictionary<int, Slot> Far { get; } = far;
+        public bool Unsent { get; set; } // values the mirror holds that resting GL was not sent (Withheld)
     }
 
     private const int NearLocations = 1024;
 
-    private readonly record struct Slot(UniformMirror.Entry Entry, int Element, int Words, bool Whole);
+    private readonly record struct Slot(UniformMirror.Entry Entry, int Element, int Words, bool Whole, char Kind = 'i');
 
     public static int Program => (int)_current;
 
-    // Bumps whenever what a unit holds may have changed (another texture or sampler bound, a sampler uniform set to another unit, a
-    // texture deleted): a program's samplers read what they read the last time while it stays
+    // Bumps when a unit's content may change (bind, sampler uniform retarget, delete); else samplers read as before
     public static long TextureVersion { get; private set; }
 
     // Bumps whenever a sampler uniform of the program in use is set
@@ -73,11 +72,11 @@ internal static unsafe partial class GlTap
         new("glBindSampler", (IntPtr)(delegate* unmanaged<uint, uint, void>)&BindSampler, Group.Programs)
     ];
 
-    // Watches a program: its uniforms (from the port) by location into the mirror, which first gets what the program holds
-    // (values set before the watch count too)
+    // Watches a program: uniforms (from the port) by location into the mirror, seeded with the program's current values
     public static void Watch(int program, GlslPort.Ported ported, UniformMirror mirror)
     {
         if (!NotNull(ported) || !NotNull(mirror) || program <= 0) return;
+        if (Programs.GetValueOrDefault((uint)program) is { Unsent: true } before) Send((uint)program, before); // read below
         var at = new Dictionary<int, Slot>();
         GlslPort.Uniform[] members =
             [.. ported.VertexUniforms.Members, .. ported.FragmentUniforms.Members, .. ported.HotUniforms.Members];
@@ -90,13 +89,13 @@ internal static unsafe partial class GlTap
             if (mirror.EntryOf(u.Name) is not { } entry) continue;
             for (var e = 0; e < Math.Min(u.Count, MaxArray); e++)
             {
-                var location = GL.GetUniformLocation(program, u.Count > 1 ? $"{u.Name}[{e}]" : u.Name);
-                if (location >= 0) at[location] = new Slot(entry, e, columns * rows, integer);
+                var location = UniformLocation(program, u.Count > 1 ? $"{u.Name}[{e}]" : u.Name);
+                if (location >= 0) at[location] = new Slot(entry, e, columns * rows, integer, KindOf(u.Type, columns));
             }
         }
 
         foreach (var sampler in ported.Samplers.Bounded(32))
-            if (GL.GetUniformLocation(program, sampler.Name) is var location and >= 0 &&
+            if (UniformLocation(program, sampler.Name) is var location and >= 0 &&
                 mirror.EntryOf(sampler.Name) is { } entry)
                 at[location] = new Slot(entry, 0, 1, true);
         var (floats, ints) = (new float[16], new int[16]);
@@ -117,6 +116,83 @@ internal static unsafe partial class GlTap
         _ = Assert(program > 0) && NotNull(mirror);
     }
 
+    // A uniform's replay call: 'f' floats (columns > 1: a matrix), 'i' ints, bools and samplers, 'u' unsigned
+    private static char KindOf(string type, int columns)
+    {
+        _ = Assert(type.Length > 0) && Assert(columns >= 0);
+        if (columns > 1) return 'm';
+        if (type[0] == 'u') return 'u';
+        return type is "int" or "bool" || type[0] is 'i' or 'b' ? 'i' : 'f';
+    }
+
+    // Resting GL (QuietUniforms) is not sent a uniform the mirror holds: the program is marked, SendUnsent gives
+    // the mirror's values to OpenGL before it may draw or be read from again
+    private static bool Withheld(bool held)
+    {
+        if (!held || !MutedUniforms || _using is not { } w) return false;
+        if (!w.Unsent) (w.Unsent, _unsent) = (true, _unsent + 1);
+        return Assert(_unsent > 0) && Assert(w.Unsent);
+    }
+
+    private static int _unsent;
+
+    // OpenGL draws again (or a program is watched anew): every withheld value is given to it from the mirror
+    private static void SendUnsent()
+    {
+        if (_unsent == 0 || !Assert(Programs.Count <= MaxPrograms)) return;
+        foreach (var (program, w) in Programs.Bounded(MaxPrograms))
+            if (w.Unsent)
+                Send(program, w);
+        _unsent = 0;
+        _ = Assert(Programs.Count <= MaxPrograms);
+    }
+
+    private static void Send(uint program, Watched w)
+    {
+        w.Unsent = false;
+        for (var location = 0; location < Math.Min(w.Near.Length, NearLocations); location++)
+            if (w.Near[location] is { Entry: not null, Element: 0 } slot)
+                Sent(program, location, slot);
+        foreach (var (location, slot) in w.Far.Bounded(MaxMembers * MaxArray))
+            if (slot.Element == 0)
+                Sent(program, location, slot);
+        _ = Assert(!w.Unsent) && Assert(program > 0);
+    }
+
+    // The whole array (or value) from element 0's location; GL ignores elements past the array's end
+    private static void Sent(uint program, int location, Slot slot)
+    {
+        var held = slot.Entry.Held;
+        if (location < 0 || !Assert(slot.Words is > 0 and <= 16) || held.Length < slot.Words) return;
+        var count = held.Length / slot.Words;
+        fixed (uint* words = held)
+        {
+            var p = (int)program;
+            var f = (float*)words;
+            var i = (int*)words;
+            switch (slot.Kind, slot.Words)
+            {
+                case ('m', 4): GL.ProgramUniformMatrix2(p, location, count, false, f); break;
+                case ('m', 9): GL.ProgramUniformMatrix3(p, location, count, false, f); break;
+                case ('m', 16): GL.ProgramUniformMatrix4(p, location, count, false, f); break;
+                case ('f', 1): GL.ProgramUniform1(p, location, count, f); break;
+                case ('f', 2): GL.ProgramUniform2(p, location, count, f); break;
+                case ('f', 3): GL.ProgramUniform3(p, location, count, f); break;
+                case ('f', 4): GL.ProgramUniform4(p, location, count, f); break;
+                case ('i', 1): GL.ProgramUniform1(p, location, count, i); break;
+                case ('i', 2): GL.ProgramUniform2(p, location, count, i); break;
+                case ('i', 3): GL.ProgramUniform3(p, location, count, i); break;
+                case ('i', 4): GL.ProgramUniform4(p, location, count, i); break;
+                case ('u', 1): GL.ProgramUniform1(program, location, count, words); break;
+                case ('u', 2): GL.ProgramUniform2(program, location, count, words); break;
+                case ('u', 3): GL.ProgramUniform3(program, location, count, words); break;
+                case ('u', 4): GL.ProgramUniform4(program, location, count, words); break;
+            }
+        }
+
+        _ = Assert(count > 0);
+    }
+
     private static Watched Indexed(UniformMirror mirror, KeyValuePair<int, Slot>[] slots)
     {
         var top = -1;
@@ -130,6 +206,10 @@ internal static unsafe partial class GlTap
         return new Watched(mirror, near, far);
     }
 
+    // The record's answer where the engine asked the same since the link; OpenGL's (heard by the record too) otherwise
+    public static int UniformLocation(int program, string name) =>
+        Assert(program > 0) && NotNull(name) ? LocationOf(program, name) ?? GL.GetUniformLocation(program, name) : -1;
+
     public static void Unwatch(int program)
     {
         if (!Assert(program >= 0) || !Assert(Programs.Count <= MaxPrograms)) return;
@@ -142,24 +222,23 @@ internal static unsafe partial class GlTap
             ? ((int)UnitTextures[unit], (int)UnitSamplers[unit])
             : (0, 0);
 
-    private static void Note(int location, ReadOnlySpan<uint> words)
+    // Whether the mirror holds the value now
+    private static bool Note(int location, ReadOnlySpan<uint> words)
     {
-        if (_using is not { } w || words.IsEmpty) return;
+        if (_using is not { } w || words.IsEmpty) return false;
         var near = w.Near;
         var slot = (uint)location < (uint)near.Length ? near[location] : w.Far.GetValueOrDefault(location);
-        if (slot.Entry is not { } entry || !Assert(slot.Element >= 0) || !Assert(slot.Words >= 0)) return;
+        if (slot.Entry is not { } entry || !Assert(slot.Element >= 0) || !Assert(slot.Words > 0)) return false;
         w.Mirror.SetAt(entry, slot.Element * slot.Words, words);
+        return true;
     }
 
-    private static void Floats(int location, ReadOnlySpan<float> values)
-    {
-        if (Assert(values.Length <= 4096) && Assert(location >= -1))
-            Note(location, MemoryMarshal.Cast<float, uint>(values));
-    }
+    private static bool Floats(int location, ReadOnlySpan<float> values) =>
+        Assert(values.Length <= 4096) && Assert(location >= -1) && Note(location, MemoryMarshal.Cast<float, uint>(values));
 
-    private static void Ints(int location, ReadOnlySpan<int> values)
+    private static bool Ints(int location, ReadOnlySpan<int> values)
     {
-        if (!Assert(values.Length <= 4096) || !Assert(location >= -1)) return;
+        if (!Assert(values.Length <= 4096) || !Assert(location >= -1)) return false;
         if (_samplers is { } samplers)
             for (var i = 0; i < Math.Min(values.Length, MaxArray); i++)
             {
@@ -168,7 +247,7 @@ internal static unsafe partial class GlTap
                     (unit, TextureVersion, SamplerVersion) = (values[i], TextureVersion + 1, SamplerVersion + 1);
             }
 
-        Note(location, MemoryMarshal.Cast<int, uint>(values));
+        return Note(location, MemoryMarshal.Cast<int, uint>(values));
     }
 
     private static Dictionary<int, int> Units(uint program)
@@ -183,7 +262,7 @@ internal static unsafe partial class GlTap
             var array = name.EndsWith("[0]", StringComparison.Ordinal) ? name[..^3] : name;
             for (var e = 0; e < Math.Min(Math.Max(size, 1), MaxArray); e++)
             {
-                var location = GL.GetUniformLocation((int)program, size > 1 ? $"{array}[{e}]" : name);
+                var location = UniformLocation((int)program, size > 1 ? $"{array}[{e}]" : name);
                 if (location < 0) continue;
                 GL.GetUniform((int)program, location, out int unit);
                 units[location] = unit;
@@ -211,7 +290,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void UseProgram(uint program)
     {
-        Version++;
+        if (program != _current) Version++; // the same program again: the same state
         _current = program;
         _using = Programs.GetValueOrDefault(program);
         _samplers = program == 0 ? null : SamplerUnits.GetValueOrDefault(program) ?? Units(program);
@@ -222,7 +301,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void U1F(int l, float x)
     {
-        Floats(l, [x]);
+        if (Withheld(Floats(l, [x]))) return;
         if (!Assert(Original[U1FAt] != IntPtr.Zero) || !Index(U1FAt, _entries.Length)) return;
         ((delegate* unmanaged<int, float, void>)Original[U1FAt])(l, x);
     }
@@ -230,7 +309,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void U2F(int l, float x, float y)
     {
-        Floats(l, [x, y]);
+        if (Withheld(Floats(l, [x, y]))) return;
         if (!Assert(Original[U2FAt] != IntPtr.Zero) || !Index(U2FAt, _entries.Length)) return;
         ((delegate* unmanaged<int, float, float, void>)Original[U2FAt])(l, x, y);
     }
@@ -238,7 +317,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void U3F(int l, float x, float y, float z)
     {
-        Floats(l, [x, y, z]);
+        if (Withheld(Floats(l, [x, y, z]))) return;
         if (!Assert(Original[U3FAt] != IntPtr.Zero) || !Index(U3FAt, _entries.Length)) return;
         ((delegate* unmanaged<int, float, float, float, void>)Original[U3FAt])(l, x, y, z);
     }
@@ -246,7 +325,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void U4F(int l, float x, float y, float z, float w)
     {
-        Floats(l, [x, y, z, w]);
+        if (Withheld(Floats(l, [x, y, z, w]))) return;
         if (!Assert(Original[U4FAt] != IntPtr.Zero) || !Index(U4FAt, _entries.Length)) return;
         ((delegate* unmanaged<int, float, float, float, float, void>)Original[U4FAt])(l, x, y, z, w);
     }
@@ -254,7 +333,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void U1I(int l, int x)
     {
-        Ints(l, [x]);
+        if (Withheld(Ints(l, [x]))) return;
         if (!Assert(Original[U1IAt] != IntPtr.Zero) || !Index(U1IAt, _entries.Length)) return;
         ((delegate* unmanaged<int, int, void>)Original[U1IAt])(l, x);
     }
@@ -262,7 +341,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void U2I(int l, int x, int y)
     {
-        Ints(l, [x, y]);
+        if (Withheld(Ints(l, [x, y]))) return;
         if (!Assert(Original[U2IAt] != IntPtr.Zero) || !Index(U2IAt, _entries.Length)) return;
         ((delegate* unmanaged<int, int, int, void>)Original[U2IAt])(l, x, y);
     }
@@ -270,7 +349,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void U3I(int l, int x, int y, int z)
     {
-        Ints(l, [x, y, z]);
+        if (Withheld(Ints(l, [x, y, z]))) return;
         if (!Assert(Original[U3IAt] != IntPtr.Zero) || !Index(U3IAt, _entries.Length)) return;
         ((delegate* unmanaged<int, int, int, int, void>)Original[U3IAt])(l, x, y, z);
     }
@@ -278,7 +357,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void U4I(int l, int x, int y, int z, int w)
     {
-        Ints(l, [x, y, z, w]);
+        if (Withheld(Ints(l, [x, y, z, w]))) return;
         if (!Assert(Original[U4IAt] != IntPtr.Zero) || !Index(U4IAt, _entries.Length)) return;
         ((delegate* unmanaged<int, int, int, int, int, void>)Original[U4IAt])(l, x, y, z, w);
     }
@@ -286,14 +365,14 @@ internal static unsafe partial class GlTap
     private static void Vector(int l, int count, float* v, int size, int entry)
     {
         if (!Assert(size is > 0 and <= 4) || !Assert(Original[entry] != IntPtr.Zero)) return;
-        if (v != null && count > 0 && count <= 4096) Floats(l, new ReadOnlySpan<float>(v, count * size));
+        if (v != null && count > 0 && count <= 4096 && Withheld(Floats(l, new ReadOnlySpan<float>(v, count * size)))) return;
         ((delegate* unmanaged<int, int, float*, void>)Original[entry])(l, count, v);
     }
 
     private static void Vector(int l, int count, int* v, int size, int entry)
     {
         if (!Assert(size is > 0 and <= 4) || !Assert(Original[entry] != IntPtr.Zero)) return;
-        if (v != null && count > 0 && count <= 4096) Ints(l, new ReadOnlySpan<int>(v, count * size));
+        if (v != null && count > 0 && count <= 4096 && Withheld(Ints(l, new ReadOnlySpan<int>(v, count * size)))) return;
         ((delegate* unmanaged<int, int, int*, void>)Original[entry])(l, count, v);
     }
 
@@ -357,7 +436,8 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void M4Fv(int l, int count, byte transpose, float* v)
     {
-        if (v != null && count > 0 && count <= 256 && transpose == 0) Floats(l, new ReadOnlySpan<float>(v, count * 16));
+        if (v != null && count > 0 && count <= 256 && transpose == 0 && Withheld(Floats(l, new ReadOnlySpan<float>(v, count * 16))))
+            return;
         if (!Assert(Original[M4FvAt] != IntPtr.Zero) || !Index(M4FvAt, _entries.Length)) return;
         ((delegate* unmanaged<int, int, byte, float*, void>)Original[M4FvAt])(l, count, transpose, v);
     }
@@ -373,9 +453,8 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void BindTexture(uint target, uint texture)
     {
-        Version++;
-        if (texture > 0) Binding?.Invoke(texture);
-        if (_unit >= MaxUnits || Unit(_unit, target, texture)) TextureVersion++;
+        if (Recording && texture > 0) Heard(static s => TextureBound(s.texture, s.target), (texture, target));
+        if (_unit >= MaxUnits || Unit(_unit, target, texture)) (Version, TextureVersion) = (Version + 1, TextureVersion + 1);
         if (!Assert(Original[BindAt] != IntPtr.Zero) || !Index(BindAt, _entries.Length)) return;
         ((delegate* unmanaged<uint, uint, void>)Original[BindAt])(target, texture);
     }
@@ -383,9 +462,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void BindTextureUnit(uint unit, uint texture)
     {
-        Version++;
-        if (texture > 0) Binding?.Invoke(texture);
-        // DSA binds by the texture's own target (asked once for the scene; the terrain's are 2D); 0 unbinds every target
+        // DSA binds by the texture's own target (asked once for the scene; terrain's are 2D); 0 unbinds every target
         var changed = unit >= MaxUnits;
         if (unit < MaxUnits && texture == 0)
         {
@@ -394,7 +471,7 @@ internal static unsafe partial class GlTap
         }
         else if (unit < MaxUnits) changed = Unit(unit, Scene ? TargetOf(texture) : Texture2D, texture);
 
-        if (changed) TextureVersion++;
+        if (changed) (Version, TextureVersion) = (Version + 1, TextureVersion + 1);
         if (!Assert(Original[BindUnitAt] != IntPtr.Zero) || !Index(BindUnitAt, _entries.Length)) return;
         ((delegate* unmanaged<uint, uint, void>)Original[BindUnitAt])(unit, texture);
     }
@@ -402,8 +479,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void BindSampler(uint unit, uint sampler)
     {
-        Version++;
-        if (unit >= MaxUnits || UnitSamplers[unit] != sampler) TextureVersion++;
+        if (unit >= MaxUnits || UnitSamplers[unit] != sampler) (Version, TextureVersion) = (Version + 1, TextureVersion + 1);
         if (unit < MaxUnits) UnitSamplers[unit] = sampler;
         if (!Assert(Original[SamplerAt] != IntPtr.Zero) || !Index(SamplerAt, _entries.Length)) return;
         ((delegate* unmanaged<uint, uint, void>)Original[SamplerAt])(unit, sampler);

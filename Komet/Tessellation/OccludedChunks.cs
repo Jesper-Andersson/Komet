@@ -1,6 +1,8 @@
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet.Api;
+using Komet.Core;
 using Vintagestory.API.Client.Tesselation;
 using Vintagestory.Client.NoObf;
 using Vintagestory.Common;
@@ -8,14 +10,10 @@ using static Komet.Tessellation.TessSeams;
 
 namespace Komet.Tessellation;
 
-// Solid rock deep underground runs ChunkTesselator.NowProcessChunk's whole pipeline to end with zero vertices. For FaceCullMode
-// Default, CalculateVisibleFaces gives a block a face only where the neighbour's side toward it is not opaque (other modes,
-// JSONAndWater's 0x40 flag and the snow rule on the up side are excluded), so if every block of the chunk and every block touching it
-// across its six faces is opaque on that side, populateTesselatedChunkPart hands out the tesselator's shared empty part array for the
-// centre and the edge, with the start bounds. Ids at or past Blocks.Count are air, as ClearPaletteOutsideMaxValue makes them; indices
-// past the palette count are unknown; a missing or Empty neighbour fails because the engine substitutes air. What the skipped
-// pipeline leaves for later passes to read is reproduced (Leave); what else it would have done - unpacking, clearing pools, recycling
-// meshes, the extended arrays and face flags - the next pass redoes, and an edge-only one reads only the shell it writes itself.
+// Solid rock runs NowProcessChunk's whole pipeline for zero vertices. Under FaceCullMode Default (other modes,
+// JSONAndWater 0x40, up-side snow excluded) a face needs a neighbour side not opaque toward it: if the chunk and its
+// six touching slabs are all opaque that way, it gets the shared empty parts and start bounds. Ids >= Blocks.Count are
+// air, indices past paletteCount unknown, missing or Empty neighbours fail. Leave reproduces state later passes read.
 internal static class OccludedChunks
 {
     private const int Words = Size * Size, MaxBits = 15, MaxIndices = 1 << MaxBits, MaxBad = 32, AllSides = -1;
@@ -25,8 +23,7 @@ internal static class OccludedChunks
     // EngineShape of Shaped() in Vintage Story 1.22.7
     internal const ulong Shape = 0x1F5A2B6552C0CD27UL;
 
-    // The face neighbours in TileSideEnum order (north -z, east +x, south +z, west -x, up, down), and the slab of each that touches
-    // this chunk as bit-plane words: first word, step, count and the bits of a word that lie in the slab
+    // Face neighbours in TileSideEnum order (N -z, E +x, S +z, W -x, up, down); slab words: first, step, count, mask
     private static readonly (int Dx, int Dy, int Dz)[] Offsets =
         [(0, 0, -1), (1, 0, 0), (0, 0, 1), (-1, 0, 0), (0, 1, 0), (0, -1, 0)];
 
@@ -67,21 +64,20 @@ internal static class OccludedChunks
         Recheck();
     }
 
-    // The prefix replaces NowProcessChunk's body (a prefix or postfix there still runs) and the rest of Shaped(), which it reproduces
+    // The prefix replaces NowProcessChunk's body (its prefixes/postfixes still run) and the rest of Shaped()
     internal static void Recheck()
     {
         if (!Installed || !Assert(_skipped.Length > 1)) return;
-        // Komet's own: what they change of a chunk without faces is nothing (no part for FaceSorting, no block for TessBlockPos)
-        var foreign = EngineShape.Foreign(_skipped.AsSpan(0, 1), EngineShape.Kinds.Body, null) ||
-                      EngineShape.Foreign(_skipped.AsSpan(1), EngineShape.Kinds.All, null, typeof(ExtendedRows),
+        // Komet's own change nothing for a faceless chunk (no part for FaceSorting, no block for TessBlockPos)
+        var foreign = EngineShape.Foreign(_skipped.AsSpan(0, 1), PatchKinds.Body, null) ||
+                      EngineShape.Foreign(_skipped.AsSpan(1), PatchKinds.All, null, typeof(ExtendedRows),
                           typeof(VisibleFaces), typeof(TessSafety), typeof(TessBlockPos), typeof(Rendering.FaceSorting));
         StoodDown = EngineShape.Report(Logger, nameof(OccludedChunks), StoodDown, foreign);
     }
 
-    // NowProcessChunk first, then the bodies whose result it hands back: BeginProcessChunk (the state Leave reproduces), the extended
-    // copy with the palette clearing and the neighbour lookup, the face culling, the polygon walk and the part population, and the
-    // chunk readers whose output Fits reproduces (for blocks and fluids): ExtendedRows' rows and decoders, and GetOne with GetSolidBlock for the
-    // east and west slabs
+    // NowProcessChunk, then the bodies whose result it returns: BeginProcessChunk (Leave), extended copy with palette
+    // clearing and neighbour lookup, face culling, polygon walk, part population, and the readers Fits reproduces:
+    // ExtendedRows' rows and decoders, GetOne and GetSolidBlock (east/west slabs)
     internal static MethodBase?[] Shaped()
     {
         var (tesselator, i, @out) = (typeof(ChunkTesselator), typeof(int), typeof(int).MakeByRefType());
@@ -107,7 +103,6 @@ internal static class OccludedChunks
         return methods;
     }
 
-    // Harmony injects the instance, the arguments and the result by name
     private static bool Prefix(ChunkTesselator __instance, int chunkX, int chunkY, int chunkZ,
         TesselatedChunk tessChunk, bool skipChunkCenter, ref int __result)
     {
@@ -132,11 +127,9 @@ internal static class OccludedChunks
         return 0;
     }
 
-    // The engine's pass leaves three things in the tesselator that the next pass reads before it sets them itself. BeginProcessChunk
-    // fetches the climate map (and fills the map's lerped climate cache) and the ocean map corners, which it overwrites only for a
-    // region that has an ocean map, so a later chunk without one tessellates its sea-level water with these. NowProcessChunk sets
-    // tmpPos to the chunk's dimension only after BeginProcessChunk, so the next chunk's face culling (AllowSnowCoverage, SideIsSolid)
-    // runs with this chunk's dimension.
+    // Next pass reads state this one leaves: BeginProcessChunk's climate map (filling the lerped cache) and ocean
+    // corners, overwritten only where an ocean map exists (a later chunk without one uses them for sea-level water),
+    // and tmpPos's dimension, set after BeginProcessChunk and read by the next face culling.
     private static void Leave(ChunkTesselator tesselator, int x, int y, int z)
     {
         var map = Game(tesselator)?.WorldMap;
@@ -181,9 +174,7 @@ internal static class OccludedChunks
         lock (decors) return decors.Count == 0; // the engine reads them under this lock
     }
 
-    // True when no position of the layer (side AllSides) or of the slab touching this chunk (side 0-5, the neighbour across it) holds
-    // a palette index whose block fails Good; for the fluid layer (fluids), when no position holds a fluid: every index in use maps to
-    // the air block, as CalculateVisibleFaces_Fluids compares. Without a layer or bits every position reads 0, air.
+    // No index failing Good in the layer (AllSides) or touching slab (0-5); fluids: no used index maps to non-air
     internal static bool Fits(ChunkDataLayer? layer, Block[] blocks, int count, int side, bool fluids = false)
     {
         if (layer?.palette is not { } palette || !Assert(side is >= AllSides and < Faces)) return fluids;
@@ -204,7 +195,7 @@ internal static class OccludedChunks
         }
     }
 
-    // The palette indices whose block fails Good (or, of fluids, is not air), or -1 when there are more than the scan takes
+    // Palette indices failing Good (fluids: not air), or -1 when more than the scan takes
     private static int Bad(int[] palette, int used, int bits, Block[] blocks, int count, int side, bool fluids,
         Span<int> bad)
     {
@@ -223,8 +214,7 @@ internal static class OccludedChunks
         return n;
     }
 
-    // The block a palette value stands for in the extended arrays: ClearPaletteOutsideMaxValue makes a value at or past the block
-    // count 0, and blocksFast maps it
+    // A palette value's block in the extended arrays: values >= block count become 0 (ClearPaletteOutsideMaxValue)
     private static Block? Lookup(Block[] blocks, int value, int count)
     {
         if (!Assert(blocks.Length > 0)) return null;
@@ -232,9 +222,7 @@ internal static class OccludedChunks
         return Index(value, blocks.Length) ? blocks[value] : null;
     }
 
-    // AllSides: a block of this chunk, which neither draws a face nor lets a neighbour draw one toward it. A side: a block of the
-    // neighbour across that side, whose side toward this chunk hides the face; above, not a snow layer block (the engine's
-    // AllowSnowCoverage rule on the up side)
+    // AllSides: neither draws a face nor lets one be drawn toward it. Side: hides the face; on up, no snow layer
     internal static bool Good(Block? block, int side)
     {
         if (block is null || !Assert(side is >= AllSides and < Faces)) return false;
@@ -253,7 +241,7 @@ internal static class OccludedChunks
         return true;
     }
 
-    // Whether any word of the set holds, at a bit of the mask, one of the bad palette indices; Planes checked every plane
+    // Whether any word holds a bad palette index at a mask bit; Planes checked every plane
     private static bool Uses(int[]?[] planes, int bits, ReadOnlySpan<int> bad, int first, int step, int words, int mask)
     {
         if (!Assert(first + (words - 1) * step < Words) || !Assert(bits is > 0 and <= MaxBits)) return true;

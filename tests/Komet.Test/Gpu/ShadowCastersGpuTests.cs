@@ -1,4 +1,5 @@
 using Komet.Gpu;
+using Komet.Rendering;
 using OpenTK.Graphics.OpenGL;
 using Plane = Vintagestory.API.Client.Plane;
 

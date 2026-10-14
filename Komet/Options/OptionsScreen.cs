@@ -1,20 +1,21 @@
+using Komet.Api;
+using Komet.Core;
+using Komet.Hud;
 using Vintagestory.Client;
 using Vintagestory.Client.NoObf;
 
 namespace Komet.Options;
 
-// Komet's options screen, laid out like Sodium's: a search bar, a sidebar of sections (Vintage Story, Komet, then every mod that
-// registered pages with KometOptions), the chosen page in a scrolling column, the hovered option's description beside it, and
-// Undo / Apply / Done at the bottom right. Changes are staged until Apply or Done (the game's settings in one batch: one shader
-// reload, one framebuffer rebuild); Escape drops them. Buttons (a benchmark, a reset) and keys act at once. Stands in for the
-// game's settings (GraphicsMenu, Embed) or opens on its own (.komet).
+// Sodium-style options: search, section sidebar (Vintage Story, Komet, KometOptions mods), scrolling page, hover
+// description, Undo/Apply/Done. Changes stage until Apply/Done (one batch); Escape drops them; buttons and keys act at
+// once.
 internal sealed partial class OptionsScreen : GuiDialog
 {
     private const int MaxPages = 48, MaxStaged = 256, MaxQuery = 64, MaxHits = 4096;
 
     private readonly KometPages _komet;
     private readonly Dictionary<OptionRow, double> _staged = [];
-    private readonly HashSet<OptionRow> _failed = []; // rows whose failure was logged
+    private readonly HashSet<OptionRow> _failed = [];
     private readonly HudCanvas _canvas;
     private readonly Backdrop _backdrop;
     private readonly HudFonts _fonts = new();
@@ -33,7 +34,7 @@ internal sealed partial class OptionsScreen : GuiDialog
     private OptionRow? _hover;
     private Hit? _drag;
     private (IGameSettingsHandler Handler, Action<string> Tab)? _embedded;
-    private OptionRow? _binding; // the key row waiting for its key
+    private OptionRow? _binding;
 
     public OptionsScreen(ICoreClientAPI capi, HudSettings settings, Action dump, Action<float> bench, Action verify, Action window,
         Action debug) : base(capi)
@@ -53,7 +54,7 @@ internal sealed partial class OptionsScreen : GuiDialog
             };
         if (!NotNull(capi.ChatCommands)) return;
         _ = capi.ChatCommands.GetOrCreate("komet").WithDescription(HudText.Translate("cmd-hud"))
-            .HandleWith(_ => Open(KometPages.Hud)
+            .HandleWith(_ => Open(KometPages.Overview)
                 ? TextCommandResult.Success()
                 : TextCommandResult.Error(HudText.Translate("cmd-hud-open-failed")));
     }
@@ -61,23 +62,21 @@ internal sealed partial class OptionsScreen : GuiDialog
     public override string? ToggleKeyCombinationCode => null;
     public override double DrawOrder => 0.95; // over the escape menu (0.89)
     public override double InputOrder => -1; // before it (0), so typing into the search reaches the search
-    public override bool CaptureAllInputs() => _binding is not null || (_searching && Assert(_query.Length <= MaxQuery));
+    // a focused slider takes the arrows and Tab before any hotkey
+    public override bool CaptureAllInputs() =>
+        _binding is not null || _focus is not null || _picker is not null || (_searching && Assert(_query.Length <= MaxQuery));
 
-    // Raised by every composition (a Cairo pass and a texture upload), which the HUD keeps out of its steady frames
+    // Raised per composition, which the HUD keeps out of steady frames
     public event Action? Composing;
 
-    public bool Contains(double x, double y) => IsOpened() && Finite(x) && Finite(y); // the screen covers everything
-
-    // On its own, at a page (the Komet section's first when null)
     public bool Open(string? page = null)
     {
         if (!Assert(page is null || page.Length > 0) || !NotNull(_komet)) return false;
         if (IsOpened() && _embedded is not null) Leave();
-        Fresh(page ?? KometPages.Hud);
+        Fresh(page ?? KometPages.Overview);
         return IsOpened() || TryOpen();
     }
 
-    // In place of the game's settings; tab opens one of the game's own screens by handler name (original graphics tab, macro editor)
     public void Embed(IGameSettingsHandler handler, Action<string> tab)
     {
         if (!NotNull(handler) || !NotNull(tab)) return;
@@ -87,7 +86,7 @@ internal sealed partial class OptionsScreen : GuiDialog
         _ = IsOpened() || TryOpen();
     }
 
-    // The game left its settings (the escape menu closed, or one of its own tabs is shown): the screen goes, without going back
+    // Game left its settings (menu closed or own tab shown): the screen goes
     public void Leave()
     {
         if (_embedded is not { } embedded || !NotNull(embedded.Handler)) return;
@@ -95,13 +94,22 @@ internal sealed partial class OptionsScreen : GuiDialog
         _ = !IsOpened() || TryClose();
     }
 
+    // Only with nothing to step back from: GuiManager treats true as "removed", closing a still-open screen on the
+    // second ask
     public override bool OnEscapePressed()
     {
         if (_binding is not null) Unbound();
-        else if (_picker is not null) (_picker, _dirty) = (null, true);
-        else if (_query.Length > 0 || _searching) (_query, _searching, _dirty) = ("", false, true);
-        else return Close();
-        return true;
+        return !Back() && Close();
+    }
+
+    private bool Back()
+    {
+        var back = _picker is not null || _focus is not null || _query.Length > 0 || _searching;
+        if (_picker is not null) _picker = null;
+        else if (_focus is not null) _focus = null;
+        else (_query, _searching) = ("", false);
+        _dirty |= back;
+        return NotNull(_query) && Assert(_query.Length <= MaxQuery) && back;
     }
 
     public override void OnGuiOpened()
@@ -114,7 +122,8 @@ internal sealed partial class OptionsScreen : GuiDialog
     public override void OnGuiClosed()
     {
         Unbound();
-        (_drag, _hover, _searching, _picker) = (null, null, false, null);
+        (_drag, _hover, _searching, _picker, _focus) = (null, null, false, null, null);
+        _motions.Clear();
         (_glow, _target) = (default, default);
         _staged.Clear();
         if (_embedded is not { } embedded || !NotNull(embedded.Handler)) return;
@@ -122,16 +131,17 @@ internal sealed partial class OptionsScreen : GuiDialog
         _ = embedded.Handler.OnBackPressed(); // back to the escape menu, as the game's Back button
     }
 
-    // The pages as they are now, the section of the one asked for, the list scrolled to it
     private void Fresh(string page)
     {
         if (!NotNull(page)) return;
         _pages = Pages();
         _advanced = _komet?.Advanced ?? false;
         if (!Assert(_pages.Length > 0)) return;
-        (_page, _scroll, _query, _dirty) = ((Array.Find(_pages, p => p.Id == page) ?? _pages[0]).Id, 0, "", true);
+        (_page, _scroll, _query, _dirty, _sideFollow) = ((Array.Find(_pages, p => p.Id == page) ?? _pages[0]).Id, 0, "", true, true);
         _staged.Clear();
         _widest.Clear();
+        _motions.Clear(); // the rows are made anew
+        _focus = null;
     }
 
     private OptionPage[] Pages()
@@ -143,7 +153,6 @@ internal sealed partial class OptionsScreen : GuiDialog
         return Assert(pages.Count is > 0 and <= MaxPages) ? [.. pages] : [.. pages.Take(MaxPages)];
     }
 
-    // One of the game's own tabs, over this screen's place in the escape menu
     private void OpenTab(string handler)
     {
         if (_embedded is not { } embedded || !NotNull(handler)) return;
@@ -163,7 +172,6 @@ internal sealed partial class OptionsScreen : GuiDialog
         _dirty = true;
     }
 
-    // Every staged change, in the order it was made; the game's reloads once at the end
     private void Apply()
     {
         var changes = _staged.ToArray();
@@ -196,6 +204,7 @@ internal sealed partial class OptionsScreen : GuiDialog
             return;
         }
 
+        _focus = null; // a slider's click takes it again
         if (hit is null || !Assert(hit.W > 0)) return;
         hit.Click((x - hit.X) / hit.W, args.Button == EnumMouseButton.Right);
         _drag = hit.Drag ? hit : null;
@@ -220,7 +229,6 @@ internal sealed partial class OptionsScreen : GuiDialog
         (_hover, _dirty) = (hover, true);
     }
 
-    // The box under the point: the screen's own first, then the list's inside its view; row: the boxes that mark a hovered option
     private Hit? At(double x, double y, bool row)
     {
         if (!Finite(x) || !Finite(y)) return null;
@@ -230,7 +238,7 @@ internal sealed partial class OptionsScreen : GuiDialog
         return x >= vx && x < vx + vw && y >= vy && y < vy + vh ? Under(_rows, x, y, row) : null;
     }
 
-    // The first box at the point, of either kind with row null; on every mouse move, so a loop rather than a capturing Find
+    // Per mouse move, so a loop, not a capturing Find
     private static Hit? Under(List<Hit> hits, double x, double y, bool? row)
     {
         if (!NotNull(hits) || !Assert(hits.Count <= MaxHits)) return null;
@@ -251,11 +259,13 @@ internal sealed partial class OptionsScreen : GuiDialog
         if (!NotNull(args) || !IsOpened() || !Finite(args.deltaPrecise)) return;
         args.SetHandled();
         if (ScrollNames(args.deltaPrecise)) return; // the names move under their scissor: nothing to compose
-        _scroll -= args.deltaPrecise * _fonts.BadgeRow * 3;
+        var (sx, sy, sw, sh) = _sideView;
+        var (mx, my) = _mouse;
+        if (mx >= sx && mx < sx + sw && my >= sy && my < sy + sh) _sideScroll -= args.deltaPrecise * _fonts.BadgeRow * 3;
+        else _scroll -= args.deltaPrecise * _fonts.BadgeRow * 3;
         _dirty = true;
     }
 
-    // Typing goes to the search while it has the focus
     public override void OnKeyPress(KeyEvent args)
     {
         if (NotNull(args) && _binding is not null) args.Handled = true;
@@ -269,6 +279,18 @@ internal sealed partial class OptionsScreen : GuiDialog
         if (NotNull(args) && _binding is not null)
         {
             if (_capturer.OnKeyDown(args) && !_capturer.IsCapturing()) Unbound(); // Escape
+            (args.Handled, _dirty) = (true, true);
+            return;
+        }
+
+        if (args.KeyCode == (int)GlKeys.Escape && Back())
+        {
+            args.Handled = true;
+            return;
+        }
+
+        if (Keyed(args))
+        {
             (args.Handled, _dirty) = (true, true);
             return;
         }
@@ -287,14 +309,14 @@ internal sealed partial class OptionsScreen : GuiDialog
         args.Handled = true;
     }
 
-    // A key row waits for its key; the next key, key combination or mouse button binds it, Escape leaves it as it was
+    // Next key, combination or mouse button binds the row; Escape keeps it
     private void Binding(OptionRow row)
     {
         if (!NotNull(row) || _binding is not null || !_capturer.BeginCapture()) return;
         (_binding, _picker, _searching) = (row, null, false);
     }
 
-    // The capture ended with a key (the capturer calls it, sometimes a few frames after the key went up)
+    // Sometimes a few frames after key up
     private void Bound()
     {
         if (_binding is { } row && !_capturer.WasCancelled && NotNull(_capturer.CapturedKeyComb))
@@ -319,8 +341,8 @@ internal sealed partial class OptionsScreen : GuiDialog
         _backdrop?.Dispose();
     }
 
-    // Click gets the x fraction and whether it was the right button; a Row box only marks its option as hovered. Glow: the
-    // highlight's brightness while hovered (0: none); Group: its column, within which the highlight glides from box to box
+    // Click gets x fraction and right-button; Row boxes only mark hover. Glow: highlight brightness; Group: its glide
+    // column
     private sealed record Hit(double X, double Y, double W, double H, Action<double, bool> Click, bool Drag = false,
         OptionRow? Option = null, bool Row = false, double Glow = 0, int Group = 0)
     {

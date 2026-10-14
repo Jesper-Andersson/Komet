@@ -1,13 +1,14 @@
 using System.Globalization;
 using HarmonyLib;
+using Komet.Api;
 using Vintagestory.Client;
 using Vintagestory.Client.NoObf;
 using static Komet.Options.KometPages;
 
 namespace Komet.Options;
 
-// Each control does what the engine's own handler (GuiCompositeSettings, Vintage Story 1.22.7) does besides setting the property,
-// the watchers the engine registers on ClientSettings do the rest, and ClientSettings saves itself.
+// Each control mirrors its GuiCompositeSettings handler (1.22.7); ClientSettings watchers do the rest and it saves
+// itself.
 internal static partial class EngineOptions
 {
     private const string Custom = "preset-custom";
@@ -25,7 +26,7 @@ internal static partial class EngineOptions
     private static Effect? _batched; // while Batch runs: the reloads and rebuilds asked for so far, done once at its end
     private static ICoreClientAPI? _capi;
 
-    // tab opens one of the game's own screens by handler name; without it (screen opened on its own) the buttons leading there are left out
+    // Without tab the buttons to the game's screens are left out
     public static OptionPage[] Pages(ICoreClientAPI capi, Action<string>? tab = null)
     {
         if (!NotNull(capi)) return [];
@@ -63,8 +64,7 @@ internal static partial class EngineOptions
         return Appearance(capi, page);
     }
 
-    // The presets as the scale they are, from the least to the most: a slider over them. "Custom" is no step of it but what the
-    // slider shows once a single setting departs from the preset (Effect.Custom)
+    // "Custom" is no step: shown once a setting departs from the preset.
     private static OptionPage Presets(ICoreClientAPI capi, OptionPage page)
     {
         GraphicsPreset[] steps = [.. GraphicsPreset.Presets.Where(p => p.Langcode != Custom).Take(OptionPage.MaxOptions)];
@@ -73,11 +73,10 @@ internal static partial class EngineOptions
         return page.Slider(Name("preset"), 0, steps.Length - 1, 1,
                 () => Array.FindIndex(steps, p => p.PresetId == ClientSettings.GraphicsPresetId),
                 v => Preset(capi, steps[Math.Clamp((int)Math.Round(v), 0, steps.Length - 1)].PresetId), "", T("preset-hint"))
-            // -1 (no preset matches: the player's own settings) is a normal state, not a failed assertion
+            // -1 (no preset matches) is normal, not a failed assertion
             .Format(v => (int)Math.Round(v) is var i && (uint)i < (uint)steps.Length ? Lang.Get(steps[i].Langcode) : custom);
     }
 
-    // Sepia and contrast follow the day while the dynamic grading is on
     private static OptionPage Appearance(ICoreClientAPI capi, OptionPage page)
     {
         if (!NotNull(capi) || !NotNull(page) || !Assert(page.Count > 0)) return page;
@@ -135,7 +134,7 @@ internal static partial class EngineOptions
             .Setting("dynalight", 0, 100, 1, () => ClientSettings.MaxDynamicLights,
                 v => Apply(() => ClientSettings.MaxDynamicLights = (int)v, Effect.Reload | Effect.Custom))
             .Format(v => v <= 0 ? Lang.Get("disabled") : ((int)v).ToString(CultureInfo.InvariantCulture))
-            .Setting("resolution", 25, 100, 25, () => Math.Round(ClientSettings.SSAA * 100),
+            .Setting("resolution", 25, 100, 5, () => Math.Round(ClientSettings.SSAA * 100),
                 v => Apply(() => ClientSettings.SSAA = (float)(v / 100), Effect.Rebuild | Effect.Custom), "%");
     }
 
@@ -159,7 +158,7 @@ internal static partial class EngineOptions
         Run(_capi, effect);
     }
 
-    // Several settings applied at once (the options window's Apply): one rebuild and one shader reload for all of them
+    // Several at once (Apply): one rebuild and one shader reload
     internal static void Batch(Action apply)
     {
         if (!NotNull(apply) || !Assert(_batched is null)) return;
@@ -176,6 +175,8 @@ internal static partial class EngineOptions
         }
     }
 
+    internal static void ReloadShaders(ICoreClientAPI capi) => Run(capi, Effect.Reload);
+
     private static void Run(ICoreClientAPI? capi, Effect effect)
     {
         if (_batched is { } batched)
@@ -188,7 +189,6 @@ internal static partial class EngineOptions
         if ((effect & Effect.Reload) != 0 && NotNull(capi)) _ = capi.Shader.ReloadShaders();
     }
 
-    // onPresetChanged: every value of the preset under one suppressed reload, then one rebuild and one reload
     internal static void Preset(ICoreClientAPI capi, int index)
     {
         var presets = GraphicsPreset.Presets;
@@ -222,7 +222,6 @@ internal static partial class EngineOptions
         return custom is not null && Assert(custom.PresetId >= 0) ? custom.PresetId : null;
     }
 
-    // OnWindowBorderChanged: a border other than hidden ends the borderless mode
     private static void Border(int border)
     {
         if (!Index(border, 3)) return;
@@ -231,7 +230,6 @@ internal static partial class EngineOptions
         _ = Assert(ClientSettings.GameWindowMode != 2 || border == 2);
     }
 
-    // onDynamicGradingToggled: switched off, the shaders take the player's own sepia and contrast again
     private static void Grading(ICoreClientAPI capi, bool on)
     {
         if (!NotNull(capi)) return;

@@ -1,10 +1,11 @@
 using Komet.Gpu;
+using Komet.Rendering;
 using OpenTK.Graphics.OpenGL;
 
 namespace Komet.Test.Gpu;
 
 // The GPU culling leaving out what faces away (FaceSorting, rows.comp) on TerrainWorld's sections sorted as the tessellator's
-// faces are: whole directions, then also each direction's part past its split. Every face that faces the eye, of every row the
+// faces are: whole directions and each direction's part past its split. Every face that faces the eye, of every row the
 // culling draws, is still in the commands, each step leaves out more, and the picture with back faces culled (as RenderOpaque
 // draws opaque and topsoil) is the same pixel for pixel.
 [NonParallelizable]
@@ -15,8 +16,8 @@ public sealed class FaceSplitsGpuTests
 
     private static readonly (double Yaw, double Pitch)[] Views = [(0.3, -0.15), (2.4, -0.5), (4.2, 0.1), (1.1, -1.2)];
 
-    // Whole, directions left out, directions and their splits
-    internal static readonly (bool BackFaces, bool Splitting)[] Variants = [(false, false), (true, false), (true, true)];
+    // Whole; directions and their splits left out
+    internal static readonly bool[] Variants = [false, true];
 
     [TestCase(GpuRig.Gl)]
     [TestCase(GpuRig.Vulkan)]
@@ -29,13 +30,11 @@ public sealed class FaceSplitsGpuTests
             var drawn = Variants.Select(v => Culled(world, view, v)).ToArray();
             var triangles = drawn.Select(d => d.Sum(pool => pool.Sum(c => c.Count)) / 3).ToArray();
             TestContext.Out.WriteLine($"yaw {yaw}, pitch {pitch}: {triangles[0]} triangles whole, {triangles[1]} with the " +
-                                      $"directions facing away left out, {triangles[2]} with their parts past the splits too");
+                                      "directions facing away and their parts past the splits left out");
             Assert.Multiple(() =>
             {
-                Assert.That(Missing(world, view, drawn[0], drawn[1]), Is.Zero, $"yaw {yaw}: directions");
-                Assert.That(Missing(world, view, drawn[0], drawn[2]), Is.Zero, $"yaw {yaw}: splits");
+                Assert.That(Missing(world, view, drawn[0], drawn[1]), Is.Zero, $"yaw {yaw}: directions and splits");
                 Assert.That(triangles[1], Is.LessThan(triangles[0] * 9 / 10), $"yaw {yaw}: directions left out");
-                Assert.That(triangles[2], Is.LessThan(triangles[1]), $"yaw {yaw}: parts past the splits left out");
             });
         }
     }, sorted: true);
@@ -71,14 +70,14 @@ public sealed class FaceSplitsGpuTests
     }, sorted: true);
 
     // Each pool's commands (first index, index count) after one culled call
-    internal static List<(uint First, uint Count)>[] Culled(TerrainWorld world, TerrainView view, (bool BackFaces, bool Splitting) how)
+    internal static List<(uint First, uint Count)>[] Culled(TerrainWorld world, TerrainView view, bool backFaces)
     {
-        Run(world, view, how);
+        Run(world, view, backFaces);
         var gpu = CullingGpu(null);
         var counters = new uint[StatUints + OcclusionCulling.MaxDraws];
         var buffers = CounterBuffers(null);
         gpu.Read(buffers[(FrameCount(null) - 1) % buffers.Length], 0, counters);
-        var (region, factor) = (0, how.BackFaces ? Runs : 1);
+        var (region, factor) = (0, backFaces ? Runs : 1);
         var pools = new List<(uint, uint)>[world.Pools.Count];
         for (var p = 0; p < world.Pools.Count; p++)
         {
@@ -92,20 +91,9 @@ public sealed class FaceSplitsGpuTests
         return pools;
     }
 
-    internal static void Run(TerrainWorld world, TerrainView view, (bool BackFaces, bool Splitting) how)
-    {
-        var splitting = FaceSorting.Splitting;
-        FaceSorting.Splitting = how.Splitting;
-        try
-        {
-            Assert.That(OcclusionCulling.RunRows(world.Pools, ShadowCastersGpuTests.Culler(view), view.Camera, view.CameraMvp,
-                how.BackFaces), Is.True);
-        }
-        finally
-        {
-            FaceSorting.Splitting = splitting;
-        }
-    }
+    internal static void Run(TerrainWorld world, TerrainView view, bool backFaces) =>
+        Assert.That(OcclusionCulling.RunRows(world.Pools, ShadowCastersGpuTests.Culler(view), view.Camera, view.CameraMvp,
+            backFaces), Is.True);
 
     private static List<ModelDataPoolLocation> Listed(TerrainWorld world, int pool) =>
         (List<ModelDataPoolLocation>)AccessTools.Field(typeof(MeshDataPool), "poolLocations").GetValue(world.Pools[pool])!;
@@ -141,13 +129,13 @@ public sealed class FaceSplitsGpuTests
         return n[0] * (eye[0] - xyz[v]) + n[1] * (eye[1] - xyz[v + 1]) + n[2] * (eye[2] - xyz[v + 2]) > 0;
     }
 
-    private static (float[] Depth, float[] Color) Drawn(TerrainWorld world, TerrainView view, (bool BackFaces, bool Splitting) how,
+    private static (float[] Depth, float[] Color) Drawn(TerrainWorld world, TerrainView view, bool backFaces,
         (int Program, DepthTarget Target) into)
     {
-        Run(world, view, how);
+        Run(world, view, backFaces);
         into.Target.Begin();
         BackCulled();
-        world.DrawCulled(into.Program, view.CameraMvp, view.Camera, false, false, how.BackFaces ? Runs : 1);
+        world.DrawCulled(into.Program, view.CameraMvp, view.Camera, false, false, backFaces ? Runs : 1);
         GL.Disable(EnableCap.CullFace);
         var color = new float[4 * Width * Height];
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, into.Target.Framebuffer);

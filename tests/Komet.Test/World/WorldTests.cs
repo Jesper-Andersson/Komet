@@ -1,3 +1,6 @@
+using Komet.Core;
+using Komet.World;
+
 namespace Komet.Test.World;
 
 // The engine caches one interpolated climate map per region, ten deep, and evicts in insertion order. Past ten regions every lookup

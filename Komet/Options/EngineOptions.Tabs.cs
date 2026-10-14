@@ -1,12 +1,12 @@
 using System.Globalization;
+using Komet.Api;
 using Vintagestory.Client;
 using Vintagestory.Client.NoObf;
 using static Komet.Options.KometPages;
 
 namespace Komet.Options;
 
-// The game's other tabs (Vintage Story 1.22.7), each control with its handler's conversions and side effects; the engine's watchers on
-// ClientSettings (volume, audio device, GUI scale, GL debug) do the rest.
+// The game's other tabs (1.22.7) with each handler's conversions and side effects; ClientSettings watchers do the rest.
 internal static partial class EngineOptions
 {
     private static OptionPage Mouse(string section)
@@ -68,7 +68,6 @@ internal static partial class EngineOptions
         return Devices(page);
     }
 
-    // "Default" (no device named, the system's) and the devices OpenAL lists
     private static OptionPage Devices(OptionPage page)
     {
         var listed = ScreenManager.Platform?.AvailableAudioDevices?.Take(OptionPage.MaxOptions - 1).ToArray() ?? [];
@@ -102,7 +101,6 @@ internal static partial class EngineOptions
             .Button(T("original"), T("open"), () => tab("OnGraphicsOptions"), T("original-hint"));
     }
 
-    // The minimap row only where the world allows a map, as the game's
     private static OptionPage Minimap(ICoreClientAPI capi, OptionPage page)
     {
         if (!NotNull(capi) || !NotNull(page) || capi.World?.Config?.GetBool("allowMap", true) == false) return page;
@@ -122,7 +120,6 @@ internal static partial class EngineOptions
             .Setting("developermode", () => ClientSettings.DeveloperMode, DeveloperMode);
     }
 
-    // Only while developer mode is on, as the game's tab
     private static OptionPage? Developer(string section)
     {
         if (!NotNull(section) || !ClientSettings.DeveloperMode || !Assert(section.Length > 0)) return null;
@@ -155,8 +152,8 @@ internal static partial class EngineOptions
             i => Language(Index(i, codes.Length) ? codes[i] : ClientSettings.Language), Hover("language") + "\n\n" + restart);
     }
 
-    // "Deutsch / German (100% complete)" as "Deutsch", a tab, "German": the name the language gives itself where the game's font can
-    // draw its script (Latin, Greek, Cyrillic), the English one otherwise; the other name after the tab, no completeness
+    // "Deutsch / German (100% complete)" -> "Deutsch\tGerman": native name if the game's font draws it, else English
+    // first
     internal static string Readable(string name)
     {
         if (!NotNull(name)) return "";
@@ -170,11 +167,10 @@ internal static partial class EngineOptions
         return Assert(main.Length > 0) && Drawable(aside) && aside.Length > 0 && aside != main ? main + "\t" + aside : main;
     }
 
-    // Below Hebrew: the scripts the game's font has glyphs for
+    // Below Hebrew: scripts the game's font has glyphs for
     private static bool Drawable(string text) => NotNull(text) && text.All(c => c < '\u0590');
 
-    // What the game's language handler does, less its notice text: the language and the fonts it needs, saved at once. Windows
-    // takes the system's fonts for Chinese, Japanese, Korean and Thai; other systems keep sans-serif for them.
+    // Language and fonts, saved at once. Windows takes system fonts for CJK and Thai; others keep sans-serif.
     private static void Language(string lang)
     {
         var startup = Lang.CurrentLocale ?? "en"; // the language the game runs in, the one it started with
@@ -213,7 +209,7 @@ internal static partial class EngineOptions
         };
     }
 
-    // onDirectMouseModeToggled: the platform switches raw mouse input itself, no watcher does
+    // The platform switches raw input itself, no watcher does
     private static void DirectMouse(bool on)
     {
         ClientSettings.DirectMouseMode = on;
@@ -221,7 +217,7 @@ internal static partial class EngineOptions
         if (NotNull(ScreenManager.Platform)) ScreenManager.Platform.SetDirectMouseMode(on);
     }
 
-    // onDeveloperModeChanged: switched off, every debug setting goes with it (the game asks before switching on; here Apply does)
+    // Off drops every debug setting (the game asks before on; here Apply does)
     private static void DeveloperMode(bool on)
     {
         ClientSettings.DeveloperMode = on;

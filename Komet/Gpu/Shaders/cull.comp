@@ -9,7 +9,7 @@
 //   1  test again only what pass 0 hid, against this frame's pyramid: the ranges it finds visible are drawn late, still in the frame
 //   2  keep every range (no pyramid yet)
 //   3  as 1, but keep what pass 0 hid (no depth to build this frame's pyramid from)
-// The test is occlusion.comp's: hidden when the box's nearest point lies behind the farthest depth under its screen rectangle, and
+// The test: hidden when the box's nearest point lies behind the farthest depth under its screen rectangle, and
 // visible through the near plane, off screen when the pyramid is another frame's, or without a level small enough.
 // Written for OpenGL and Vulkan alike: explicit bindings no two resources share, no loose uniforms.
 layout(local_size_x = 64) in;

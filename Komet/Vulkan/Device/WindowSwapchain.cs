@@ -1,8 +1,7 @@
 namespace Komet.Vulkan;
 
-// A Wayland surface only when GLFW runs on Wayland itself (OPENTK_4_USE_WAYLAND=1), else the X11 window (through XWayland on a
-// Wayland desktop). An image is acquired with a fence the engine's thread waits for, as it waited in SwapBuffers, so the GPU
-// never waits in the middle of a segment. Where Vulkan cannot present, OpenGL presents as before.
+// Wayland surface only when GLFW runs on Wayland (OPENTK_4_USE_WAYLAND=1), else X11 (XWayland). Acquire uses a fence
+// the engine thread waits on as in SwapBuffers, so the GPU never waits mid-segment. If Vulkan cannot present, GL does.
 internal sealed unsafe class WindowSwapchain : IDisposable
 {
     private const int MaxImages = 8, MaxFormats = 64, MaxModes = 16;
@@ -18,6 +17,12 @@ internal sealed unsafe class WindowSwapchain : IDisposable
     private volatile bool _stale; // set by a present on the recording thread too
     private volatile bool _unpresented; // an image acquired that no present has shown yet
     private int _held = -1; // that image: an acquired image must be presented, so the next acquire gives it again
+
+    // Acquires, presents and the swapchain's making against FrameBridge's thread; never held while waiting for another thread
+    private readonly Lock _raw = new();
+
+    // The engine's presents so far: a bridged frame is shown only while none came after the frame it bridges from
+    public long Presents { get; private set; }
 
     private WindowSwapchain(VulkanDevice device, ulong surface, ulong fence)
     {
@@ -116,13 +121,12 @@ internal sealed unsafe class WindowSwapchain : IDisposable
         return Assert(_modes[at] == mode) ? mode : Vk.PresentFifo;
     }
 
-    // An image the last acquire gave and no present showed since (the frame went to OpenGL, its submission failed) is
-    // given again, never acquiring past what the presentation engine hands out; a swapchain made anew lets go of it
+    // An acquired but unpresented image (frame went to GL, submit failed) is reused; a new swapchain lets go of it
     public int Acquire(int width, int height, int vsync, out string why)
     {
         why = "";
         if (!Assert(width > 0 && height > 0)) return -1;
-        if (_unpresented) _device.CatchUp?.Invoke(); // the swapchain is used by one thread at a time: the last present made
+        if (_unpresented) _device.CatchUp?.Invoke(); // one thread at a time: the recording thread's last present first
         var mode = Mode(vsync);
         var anew = _swapchain == 0 || _stale || _made != (width, height, mode);
         if (_unpresented && !anew && Index(_held, _images.Length)) return _held;
@@ -142,14 +146,13 @@ internal sealed unsafe class WindowSwapchain : IDisposable
         _ = Assert(_swapchain != 0) && Assert(_fence != 0);
         uint index;
         var fence = _fence;
-        result = VkApi.AcquireNextImage(_device.Handle, _swapchain, AcquireNanoseconds, 0, fence, &index);
+        lock (_raw) result = VkApi.AcquireNextImage(_device.Handle, _swapchain, AcquireNanoseconds, 0, fence, &index);
         if (result is not (Vk.Success or Vk.Suboptimal)) return -1;
         var waited = VkApi.WaitForFences(_device.Handle, 1, &fence, 1, AcquireNanoseconds) == Vk.Success;
         _ = VkApi.ResetFences(_device.Handle, 1, &fence);
         return Assert(waited) && index < _images.Length ? (int)index : -1;
     }
 
-    // The image and the semaphore the frame's last submission signals for it
     public (ulong Image, ulong Rendered) Image(int index) =>
         Index(index, _images.Length) && Assert(_rendered.Length == _images.Length)
             ? (_images[index], _rendered[index])
@@ -165,7 +168,13 @@ internal sealed unsafe class WindowSwapchain : IDisposable
             SType = Vk.PresentInfoType, WaitCount = 1, Waits = &rendered, SwapchainCount = 1, Swapchains = &swapchain,
             Indices = &at
         };
-        var result = _device.Present(&info);
+        int result;
+        lock (_raw)
+        {
+            result = _device.Present(&info);
+            Presents++;
+        }
+
         if (result is Vk.OutOfDate or Vk.Suboptimal) _stale = true;
         _unpresented = false; // last: what it set is seen by the next acquire
         return result is Vk.Success or Vk.Suboptimal;
@@ -199,13 +208,16 @@ internal sealed unsafe class WindowSwapchain : IDisposable
             OldSwapchain = _swapchain
         };
         ulong made;
-        var result = VkApi.CreateSwapchain(_device.Handle, &info, null, &made);
-        if (_swapchain != 0) VkApi.DestroySwapchain(_device.Handle, _swapchain, null);
-        _swapchain = 0;
-        if (result != Vk.Success) return Failed(out why, $"vkCreateSwapchainKHR returned {result}");
-        (_swapchain, _made, _stale, Width, Height, Format) =
-            (made, wanted, false, (int)width, (int)height, format.Value.Format);
-        return Images(out why);
+        lock (_raw)
+        {
+            var result = VkApi.CreateSwapchain(_device.Handle, &info, null, &made);
+            if (_swapchain != 0) VkApi.DestroySwapchain(_device.Handle, _swapchain, null);
+            _swapchain = 0;
+            if (result != Vk.Success) return Failed(out why, $"vkCreateSwapchainKHR returned {result}");
+            (_swapchain, _made, _stale, Width, Height, Format) =
+                (made, wanted, false, (int)width, (int)height, format.Value.Format);
+            return Images(out why);
+        }
     }
 
     private bool Failed(out string why, string reason)
@@ -252,6 +264,37 @@ internal sealed unsafe class WindowSwapchain : IDisposable
             if ((_rendered[i] = _device.Semaphore()) == 0)
                 return Failed(out why, "no semaphore for a swapchain image");
         return Assert(_rendered.Length == _images.Length);
+    }
+
+    // FrameBridge's thread: an image acquired at once (none free: false), filled by submit (which signals the image's
+    // semaphore) and presented, all while no engine frame is between its acquire and present and none came after the
+    // frame bridged from (presents, the engine's count when it was published)
+    public bool Bridge(ulong fence, long presents, System.Func<(ulong Image, int Width, int Height, ulong Rendered), bool> submit)
+    {
+        if (!NotNull(submit) || !Assert(fence != 0)) return false;
+        lock (_raw)
+        {
+            if (_swapchain == 0 || _stale || _unpresented || Presents != presents) return false;
+            uint index;
+            var result = VkApi.AcquireNextImage(_device.Handle, _swapchain, 0, 0, fence, &index);
+            if (result is not (Vk.Success or Vk.Suboptimal)) return false; // none free before the next refresh
+            if (!_device.Wait(fence, AcquireNanoseconds) || index >= _images.Length || !submit((_images[index], Width, Height,
+                    _rendered[index])))
+            {
+                _stale = true; // an acquired image nothing will present: the engine makes the swapchain anew
+                return false;
+            }
+
+            var (swapchain, rendered, at) = (_swapchain, _rendered[index], index);
+            var info = new Vk.PresentInfo
+            {
+                SType = Vk.PresentInfoType, WaitCount = 1, Waits = &rendered, SwapchainCount = 1, Swapchains = &swapchain,
+                Indices = &at
+            };
+            result = _device.PresentAlone(&info);
+            if (result is Vk.OutOfDate or Vk.Suboptimal) _stale = true;
+            return Assert(Presents == presents) && result is Vk.Success or Vk.Suboptimal;
+        }
     }
 
     public void Dispose()

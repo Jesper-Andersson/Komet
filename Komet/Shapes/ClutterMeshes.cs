@@ -1,52 +1,46 @@
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet.Core;
+using Komet.Rendering;
 
 namespace Komet.Shapes;
 
-// Every clutter block entity (BEBehaviorShapeFromAttributes, survival mod: the pots, crates, books, bones and ruins decor the world
-// generator scatters, rock rubble too) builds its mesh on its first tesselation - a copy of its block's mesh, rotated and scaled for
-// the position - hands it to the chunk's pools (AddMeshData copies it) and keeps it for the rest of its life. In the world-join traces
-// those copies were the largest block of memory the GC promoted that is not chunk data (2026-10-08: ~77 MB of 718 MB in 40 s, every
-// one promoted twice), and promoted bytes set the pause length. Sharing equal copies does not work: most clutter types randomise their
-// height by position, so hardly two are equal.
-//
-// The copy is only read while the block entity is tesselated. Where the engine built it during this tesselation (its
-// loadMeshDuringTesselation path: no textures to upload, which needs the main thread), the block entity hands it back afterwards: an
-// empty mesh in its place and the flag set again, so its next tesselation builds it anew, exactly as the first did. The copy dies
-// young. The placeholder is not null, so FromTreeAttributes does not take it for a missing mesh (that would relight the block and
-// redraw the chunk). A block entity whose mesh the main thread built keeps it.
-//
-// Built anew each time, the copies would only trade promotion for allocation (chunks are tesselated again and again while their
-// neighbours arrive): inside such a tesselation createMesh's Clone writes into the thread's own scratch mesh instead, the arrays kept
-// from one block entity to the next (MeshRecycle reuses the extra ones). The block entity holds the scratch only until the pools have
-// copied it; it holds the placeholder afterwards, also when the call threw.
+// Clutter block entities (BEBehaviorShapeFromAttributes) keep their mesh copy for life after the pools copied it:
+// ~77 MB of 718 MB promoted in 40 s of a join (2026-10-08). Heights are random, so copies cannot be shared.
+// Where the mesh was built during this tesselation (loadMeshDuringTesselation), it is handed back afterwards: a
+// non-null empty placeholder (so FromTreeAttributes does not relight) and the flag set again. Its Clone writes into the
+// thread's scratch (one per mesh: LOD2 too), held only until the pools copied it.
 internal static class ClutterMeshes
 {
     private const string Behavior = "Vintagestory.GameContent.BEBehaviorShapeFromAttributes";
     private const string Props = "Vintagestory.GameContent.IShapeTypeProps";
+    private const string Shelf = "Vintagestory.GameContent.BEBehaviorClutterBookshelf"; // overrides createMesh without calling it
 
     private static readonly MeshData Placeholder = new(4, 6);
 
     public static bool Enabled { get; set; } = true;
     public static bool Patched { get; private set; }
 
-    private const int MaxInstructions = 1024;
+    private const int MaxInstructions = 1024, Scratches = 2; // mesh and lod2mesh
 
     [ThreadStatic] private static bool _building; // inside a tesselation that builds the mesh, on this thread
-    [ThreadStatic] private static MeshData? _scratch;
+    [ThreadStatic] private static MeshData?[]? _scratch;
+    [ThreadStatic] private static int _taken; // scratches handed out in this tesselation
 
     public static void Install(Harmony harmony)
     {
         Patched = false;
         if (!NotNull(harmony) || !Assert(Placeholder.VerticesCount == 0) || Target() is not { } target) return;
         Patched = NotNull(harmony.Patch(target, new HarmonyMethod(Built), finalizer: new HarmonyMethod(Drawn)));
-        if (Patched && Create() is { } create) _ = NotNull(harmony.Patch(create, transpiler: new HarmonyMethod(Rewrite)));
+        var rewrite = new HarmonyMethod(Rewrite);
+        foreach (var behavior in (string[])[Behavior, Shelf])
+            if (Patched && Create(behavior) is { } create) _ = NotNull(harmony.Patch(create, transpiler: rewrite));
     }
 
-    internal static MethodInfo? Create()
+    internal static MethodInfo? Create(string behavior)
     {
-        var method = AccessTools.TypeByName(Behavior) is { } type && AccessTools.TypeByName(Props) is { } props
+        var method = AccessTools.TypeByName(behavior) is { } type && AccessTools.TypeByName(Props) is { } props
             ? AccessTools.DeclaredMethod(type, "createMesh", [props, typeof(bool)])
             : null;
         return method is null || Assert(method.ReturnType == typeof(MeshData)) ? method : null;
@@ -64,14 +58,14 @@ internal static class ClutterMeshes
         return code;
     }
 
-    // source.Clone(), into the thread's scratch inside a tesselation that builds the mesh. The basic arrays may exceed the counts
-    // (the engine sizes them exactly; Rotate, Scale, Translate and AddMeshData read the counts); the extra data goes through
-    // CloneExtraData, which MeshRecycle points at the scratch's own arrays and nulls where the source has none.
+    // source.Clone() into the thread's scratch; arrays may exceed the counts, extra data via CloneExtraData
+    // (MeshRecycle)
     internal static MeshData Copy(MeshData source)
     {
-        if (!_building || !Enabled || !MeshRecycle.Enabled || !MeshRecycle.Patched || !NotNull(source) || source.xyz is null || source.Indices is null)
+        if (!_building || _taken >= Scratches || !Enabled || !MeshRecycle.Enabled || !MeshRecycle.Patched || !NotNull(source) ||
+            source.xyz is null || source.Indices is null)
             return source.Clone();
-        var mesh = _scratch ??= new MeshData(initialiseArrays: false) { Recyclable = true };
+        var mesh = (_scratch ??= new MeshData?[Scratches])[_taken++] ??= new MeshData(initialiseArrays: false) { Recyclable = true };
         (mesh.VerticesPerFace, mesh.IndicesPerFace) = (source.VerticesPerFace, source.IndicesPerFace);
         mesh.SetVerticesCount(source.VerticesCount);
         mesh.xyz = Into(mesh.xyz, source.xyz, source.XyzCount);
@@ -99,8 +93,7 @@ internal static class ClutterMeshes
     [UnsafeAccessor(UnsafeAccessorKind.Method, Name = "CloneExtraData")]
     private static extern void Extra(MeshData source, MeshData dest);
 
-    // OnTesselation as BEBehaviorShapeFromAttributes declares it (the subclasses that override it call it), with the three fields
-    // the patches touch
+    // OnTesselation as BEBehaviorShapeFromAttributes declares it, with the three fields the patches touch
     internal static MethodInfo? Target()
     {
         var type = AccessTools.TypeByName(Behavior);
@@ -117,11 +110,10 @@ internal static class ClutterMeshes
     {
         _ = NotNull(Placeholder); // the flag as the engine left it: set where loadMesh runs during this tesselation
         __state = Enabled && ___loadMeshDuringTesselation;
-        _building = __state;
+        (_building, _taken) = (__state, 0);
     }
 
-    // The mesh built for this tesselation handed back once the pools have their copy (a finalizer: also when the call threw, so no
-    // block entity keeps the scratch)
+    // Hands the mesh back once the pools have their copy; a finalizer, so a throw leaves no scratch on a block entity
     private static Exception? Drawn(Exception? __exception, ref MeshData? ___mesh, ref MeshData? ___lod2mesh,
         ref bool ___loadMeshDuringTesselation, bool __state)
     {

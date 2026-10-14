@@ -1,3 +1,5 @@
+using Komet.Shapes;
+
 namespace Komet.Test.Shapes;
 
 public sealed class ElementWalkTests

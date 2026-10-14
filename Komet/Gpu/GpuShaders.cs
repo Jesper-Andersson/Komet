@@ -1,14 +1,13 @@
 namespace Komet.Gpu;
 
-// Written for OpenGL and Vulkan alike: #version 460, every resource at an explicit binding no other resource of the shader
-// shares (Vulkan has one binding namespace per descriptor set, OpenGL one per kind), parameters in a std140 block.
+// GL and Vulkan: #version 460, unique explicit bindings (Vulkan shares one namespace per set), std140 parameters.
 internal static class GpuShaders
 {
-    public const string HiZ = "hiz.comp", Occlusion = "occlusion.comp", Cull = "cull.comp", Rows = "rows.comp";
+    public const string HiZ = "hiz.comp", Cull = "cull.comp", Rows = "rows.comp";
     public const string Sort = "sort.comp";
     private const string Prefix = "Komet.Gpu.Shaders.";
 
-    public static readonly string[] All = [HiZ, Occlusion, Cull, Rows, Sort];
+    public static readonly string[] All = [HiZ, Cull, Rows, Sort];
 
     public static string? Source(string name)
     {

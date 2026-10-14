@@ -1,8 +1,7 @@
 namespace Komet.Vulkan;
 
-// The engine sizes its sun's glare by the samples its occlusion query's quad passes, so each Vulkan draw inside an open GL
-// query gets a Vulkan query of its own and the GL query's answer is their sum, resolved before the frame slot comes round
-// again. A query no Vulkan draw was in is OpenGL's to answer.
+// Sun glare is sized by occlusion query samples, so each Vulkan draw in an open GL query gets its own Vulkan query, the
+// GL answer their sum (resolved before the frame slot recurs). Queries without Vulkan draws stay OpenGL's.
 internal sealed unsafe partial class SceneRenderer
 {
     private const uint SamplesPassed = 0x8914, AnySamples = 0x8C2F, QueryResult = 0x8866, QueryAvailable = 0x8867;
@@ -13,9 +12,9 @@ internal sealed unsafe partial class SceneRenderer
     private uint _query; // the GL query open now, 0 for none
     private (long Frame, int Used) _slotQueries = (-1, 0);
 
-    private sealed class Occlusion(bool any)
+    private sealed class Occlusion
     {
-        public bool Any { get; } = any;
+        public bool Any { get; set; }
         public List<(long Frame, uint Slot)> Slots { get; } = [];
         public long Resolved { get; set; }
         public bool Taken { get; set; } // a Vulkan draw was in it
@@ -27,8 +26,11 @@ internal sealed unsafe partial class SceneRenderer
         _ = Assert(id == 0 || _query == 0); // OpenGL has one query of a target open at a time
         _query = id;
         if (id == 0) return;
-        if (_occlusions.Count >= MaxOcclusions) _occlusions.Clear();
-        _occlusions[id] = new Occlusion(target == AnySamples);
+        if (_occlusions.Count >= MaxOcclusions && !_occlusions.ContainsKey(id)) _occlusions.Clear();
+        ref var occlusion = ref System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrAddDefault(_occlusions, id, out _);
+        occlusion ??= new Occlusion(); // begun anew each frame: what it counted before goes
+        occlusion.Slots.Clear();
+        (occlusion.Any, occlusion.Resolved, occlusion.Taken) = (target == AnySamples, 0, false);
     }
 
     private long QueryBegin()

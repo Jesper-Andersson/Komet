@@ -18,19 +18,10 @@ internal enum PreJitState
     Cancelled
 }
 
-// None of the game's assemblies is ReadyToRun (all ILOnly, empty ManagedNativeHeader), so the first call of every engine method runs
-// the tier-0 JIT on the thread that makes it, and for renderers, entity behaviors and dialogs that is the main thread: the first
-// creature, the character dialog (IconUtil's SVG painters take 3-11 ms each to compile) or the handbook pay their JIT inside one frame.
-// Every new tier-0 method also restarts the runtime's call-counting delay (TC_CallCountingDelayMs, 100 ms), and while first calls keep
-// trickling in, no hot method anywhere in the process is promoted to tier 1.
-//
-// RuntimeHelpers.PrepareMethod compiles without executing: no static constructor runs, the code is the tier-0 code a first call would
-// have produced, and tiering promotes it as usual later. Methods come from the metadata tables rather than reflection, so the walk does
-// not build 40k MethodInfo objects. Left out are methods without IL (abstract, extern, runtime-implemented), generic code (it only
-// compiles for an instantiation) and everything Harmony has patched by then, whose code MonoMod owns. A method patched later is patched over compiled code, which is Harmony's normal case. The
-// exception is inlining: tier-0 inlines nothing, but the JIT compiles a few methods fully optimized at once (9 of ~42k in 1.22.7 by
-// their MethodLoad tier), and those can keep an inlined copy of a callee that a mod patches only after the walk compiled them.
-// The game does the same when it calls them before the patch; the walk only makes it earlier.
+// No game assembly is ReadyToRun: first calls JIT on the main thread (character dialog SVG painters 3-11 ms each), and
+// each new tier-0 method restarts the 100 ms call-counting delay, blocking tier 1. PrepareMethod compiles tier-0 ahead
+// without cctors, from metadata tables (no 40k MethodInfos); skipped: no IL, generic, already patched. 9 of ~42k
+// methods compile optimized and may inline a callee patched later, as the game would anyway.
 internal static partial class PreJit
 {
     public const int CheckEvery = 256, Niceness = 10;
@@ -38,7 +29,7 @@ internal static partial class PreJit
     private const int MaxAssemblies = 8, MaxLoaded = 4096, MaxMethods = 1 << 17, MaxPatched = 1 << 16, MaxNesting = 16;
     private const int MethodDefTable = 0x06, PrioProcess = 0;
 
-    // Behaviours and renderers first, they are what the join and the first minutes call for the first time
+    // What the join and first minutes call first
     private static readonly string[] Targets =
         ["VSEssentials", "VintagestoryAPI", "VintagestoryLib", "VSSurvivalMod", "VSCreativeMod"];
 
@@ -47,11 +38,10 @@ internal static partial class PreJit
     private static int _skipped;
     private static bool _niced;
 
-    // Read at every checkpoint, so switching it off stops a running walk; switching it on takes effect at the next world join
+    // Checked at every checkpoint; on applies from the next world join
     public static bool Enabled { get; set; } = true;
     public static PreJitState State { get; private set; }
 
-    // Totals of the last walk, not per interval: the HUD never resets them
     public static int Prepared { get; private set; }
     public static int Failed { get; private set; }
     public static double JitMs { get; private set; } // compile time on the walking thread only
@@ -59,18 +49,16 @@ internal static partial class PreJit
 
     internal static void Reset()
     {
-        // the walk owns them
         if (!Assert(_thread is not { IsAlive: true }) || !Assert(State != PreJitState.Running)) return;
         (_cancel, State, Prepared, Failed, _skipped, JitMs, WallMs, _niced) =
             (false, PreJitState.Idle, 0, 0, 0, 0, 0, false);
     }
 
-    // Called last in StartClientSide: every Install has run, so Komet's own patches are in the skip set. Leaving the world stops the
-    // walk through Stop in KometModSystem.Dispose.
+    // The last Install: Komet's patches are in the skip set.
     public static void Start(ILogger logger)
     {
         if (!NotNull(logger) || !Enabled) return;
-        // compiled code outlives the world, and a cancelled walk is still winding down
+        // compiled code outlives the world
         if (State == PreJitState.Done || _thread is { IsAlive: true }) return;
         Reset();
         var patched = PatchedSet(); // Harmony's registry is read here, on the thread that patches
@@ -90,8 +78,7 @@ internal static partial class PreJit
         State = PreJitState.Running;
         try
         {
-            // inside the catch-all too: a libc that binds but misbehaves must not take the game down with this thread
-            Lower();
+            Lower(); // in the catch-all: a misbehaving libc must not take the game down
             var wall = Stopwatch.StartNew();
             var jit = JitInfo.GetCompilationTime(true);
             foreach (var name in Targets.Bounded(MaxAssemblies))
@@ -115,8 +102,8 @@ internal static partial class PreJit
         }
     }
 
-    // Thread.Priority is a no-op on Linux .NET; setpriority on the thread id is not. It is one-way without CAP_SYS_NICE, which is fine
-    // for a thread that ends, but it must never hit another thread. nice 10 and not 19: at 19 the GC's time-to-suspend grew to 9 ms.
+    // Thread.Priority is a no-op on Linux; setpriority on the tid works. nice 10: at 19 GC time-to-suspend grew to 9
+    // ms.
     private static void Lower()
     {
         if (!OperatingSystem.IsLinux() || !Assert(Thread.CurrentThread.Name == ThreadName)) return;
@@ -141,7 +128,7 @@ internal static partial class PreJit
         return null; // VSCreativeMod is absent when the mod is disabled
     }
 
-    // The mods' assemblies come from Assembly.UnsafeLoadFrom (ModAssemblyLoader), so each one has a file to read the tables from
+    // UnsafeLoadFrom assemblies each have a file to read tables from
     internal static void Walk(Assembly assembly, IReadOnlySet<(Guid, int)> patched)
     {
         if (!NotNull(assembly) || !NotNull(patched) ||
@@ -198,7 +185,6 @@ internal static partial class PreJit
         return !Assert(type.IsNil); // nested deeper than any compiler emits: leave it alone
     }
 
-    // The exceptions a method the runtime cannot load or compile throws; the game would have hit them on the first call instead
     internal static bool Prepare(Module module, int token)
     {
         if (!NotNull(module) || !Assert(token >> 24 == MethodDefTable)) return false;
@@ -215,7 +201,7 @@ internal static partial class PreJit
         }
     }
 
-    // Keyed by module version id and token: the metadata walk never materialises a MethodBase to compare against
+    // Keyed by module version id and token: no MethodBase materialised
     internal static HashSet<(Guid, int)> PatchedSet()
     {
         HashSet<(Guid, int)> set = [];

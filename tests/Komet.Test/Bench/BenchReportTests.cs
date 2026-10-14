@@ -1,5 +1,9 @@
 using System.Text;
 using System.Text.Json;
+using Komet.Bench;
+using Komet.Core;
+using Komet.Diagnostics;
+using Komet.Tessellation;
 
 namespace Komet.Test.Bench;
 

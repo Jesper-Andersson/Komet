@@ -2,36 +2,23 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet.Core;
 using Vintagestory.API.MathTools;
 using ColumnNoise = Vintagestory.API.MathTools.NewNormalizedSimplexFractalNoise.ColumnNoise;
 
 namespace Komet.World;
 
-// World generation fills every new chunk column in GenTerra.generate (VSEssentials): a Parallel.For over its 1024 block columns whose
-// body asks terrainNoise.ForColumn for a NewNormalizedSimplexFractalNoise.ColumnNoise. The constructor allocates four arrays per column
-// - double[] and int[] of the octave count, OctaveEntry[] and PastEvaluation[] of the octaves that contribute, 928 bytes at the default
-// world height - that are garbage once the column is filled: 24.6 of the 132 MB/s flying into new terrain allocates, on the server's
-// generation threads, which in singleplayer share the heap and the pauses with the client. Every computation stays the engine's IL,
-// only where the four arrays come from changes, and the constructor reads no element of them it has not written first.
-// - Rent hands the constructor the thread's array of exactly the length its newarr asks, since NoiseSign and Noise loop to
-//   orderedOctaveEntries.Length, zeroed as a new one is. OctaveEntry and PastEvaluation hold only numbers, so the arrays a thread
-//   keeps keep nothing of a world alive.
-// - Only a constructor that starts while Column has armed its thread gets them, and the first one disarms it. Column replaces the
-//   body's one ForColumn call; ForColumn is its arguments and newobj ColumnNoise (checked on its IL), and in the game's assemblies
-//   (API, Lib, Essentials, Survival, Creative) nothing else builds this ColumnNoise or calls ForColumn. Any other column - a mod may keep
-//   several - is built as shipped.
-// - The constructor's arrays never leave it but through its two array fields: it loads, computes, stores into locals, numbers into
-//   arrays and fields, and calls only what takes and returns numbers (Math, NoiseValueCurve, the bound setters). Checked on the IL.
-// - The body keeps its column in one local, addressed only for ColumnNoise's own double-returning members (BoundMin, BoundMax,
-//   NoiseSign), which read the arrays and store no reference; the local is dead when the body returns. Checked on the IL.
-// - A thread runs Parallel.For bodies one after another, and the body waits on nothing (noise, lerps, BitArray, its ThreadLocal), so
-//   no second body starts on a thread while a column is live there. The engine relies on the same: the body reads the thread's
-//   landformWeights from tempDataThreadLocal through the whole y loop, the lifetime of its column. So the next Column on a thread takes
-//   arrays whose previous column is dead.
-// - Another mod's patch on ForColumn, the constructor, the body or the members could keep a column or build a second one while armed:
-//   one found at Install leaves the engine alone, and one added later to ForColumn, the constructor or the body reruns the transpilers
-//   here, which stands the arm down for good. The members are checked only at Install: watching them later would mean patching
-//   NoiseSign, the y loop's own call, for every column. A patch added there after Install that keeps a copy of a column goes unseen.
+// GenTerra.generate (VSEssentials) calls terrainNoise.ForColumn per block column in a Parallel.For; each ColumnNoise
+// allocates four arrays (928 B at default height): 24.6 of 132 MB/s flying into new terrain, on server threads sharing
+// the client's heap. The IL stays the engine's; the arrays come from Rent, read only after being written.
+// - Rent gives the thread's zeroed array of exactly the newarr length; the element types hold only numbers.
+// - Only a constructor run while Column (the body's one ForColumn call, the only one in the game) armed the thread gets
+//   them; the first disarms.
+// - Checked on the IL: the arrays leave the constructor only via its two array fields, and the body's column local is
+//   only `this` of BoundMin, BoundMax, NoiseSign and dead on return.
+// - Parallel.For bodies run one after another per thread and never wait, so one column is live per thread.
+// - A foreign patch on ForColumn, constructor, body or members at Install leaves the engine alone; a later one on the
+//   first three stands the arm down for good; later ones on members go unseen.
 internal static class ColumnNoiseScratch
 {
     private const string Terra = "Vintagestory.ServerMods.GenTerra", Body = "<generate>";
@@ -55,7 +42,7 @@ internal static class ColumnNoiseScratch
 
     public static long Saved => Interlocked.Read(ref _saved);
 
-    // ForColumn and the constructor first, the body last: an arm nobody listens for is only cleared again
+    // ForColumn and constructor first, body last: an arm nobody listens for is only cleared again
     public static void Install(Harmony harmony, ILogger? logger = null)
     {
         (_rewritten, _installed, _foreign, _logger) = (0, false, false, logger);
@@ -68,8 +55,7 @@ internal static class ColumnNoiseScratch
         if ((_rewritten & 5) != 5) return;
         _ = NotNull(harmony.Patch(body, transpiler: new HarmonyMethod(RewriteBody)));
         Volatile.Write(ref _installed, true);
-        // A patch another thread added between the check above and here reran the transpilers before _installed said so, but it is
-        // on record now: Harmony holds its lock from the transpilers to the record, and GetPatchInfo takes the same lock
+        // A patch added meanwhile reran the transpilers early; GetPatchInfo shares Harmony's lock, so it shows here
         if (!Volatile.Read(ref _foreign) && Foreign(seams, harmony.Id, logger)) Volatile.Write(ref _foreign, true);
     }
 
@@ -114,8 +100,7 @@ internal static class ColumnNoiseScratch
         return Assert(members[0] is null || members[0]!.DeclaringType == typeof(ColumnNoise)) ? members : [null];
     }
 
-    // The lambda generate() hands to Parallel.For, found by what it calls rather than by its compiler-given name
-    // (<>c__DisplayClass34_0.<generate>b__0 in 1.22.7); GenTerra lives in VSEssentials, which Komet does not reference
+    // generate()'s Parallel.For lambda, found by its callees (<>c__DisplayClass34_0.<generate>b__0 in 1.22.7)
     internal static MethodInfo? ColumnBody()
     {
         var terra = AccessTools.TypeByName(Terra);
@@ -144,9 +129,7 @@ internal static class ColumnNoiseScratch
         return false;
     }
 
-    // Harmony reruns every transpiler of a method whenever a patch is added to or taken from it, so a run after Install means another
-    // mod patched it, and what that patch does with a column is not verified here. Harmony runs transpilers under its global lock, so
-    // only one run sees _foreign turn true and logs it.
+    // A transpiler rerun after Install is another mod's patch; Harmony's global lock lets one run log it
     private static void Rerun(int bit)
     {
         _rewritten &= ~bit;
@@ -161,8 +144,7 @@ internal static class ColumnNoiseScratch
             });
     }
 
-    // ForColumn is its arguments and newobj ColumnNoise: nothing runs between the arm and the constructor that takes it. Patched only
-    // to hear of other patches; the IL goes back unchanged.
+    // Patched only to hear of other patches; the IL goes back unchanged
     internal static List<CodeInstruction> WatchForColumn(IEnumerable<CodeInstruction> instructions)
     {
         Rerun(4);
@@ -174,9 +156,7 @@ internal static class ColumnNoiseScratch
         return code;
     }
 
-    // Four newarr - double, int, OctaveEntry, PastEvaluation in this order - the first two stored to locals, the others to their fields
-    // on `this`, and nothing else the constructor does can hand a reference on (Allowed). The constructor takes the arm first thing into
-    // a local of its own, and each newarr becomes Rent with that and its number. Anything else returns the engine's IL untouched.
+    // Four newarr, two to locals, two to fields on `this`, nothing else leaking a reference; each becomes Rent
     internal static List<CodeInstruction> RewriteConstructor(IEnumerable<CodeInstruction> instructions,
         ILGenerator generator)
     {
@@ -229,7 +209,7 @@ internal static class ColumnNoiseScratch
         return code;
     }
 
-    // The locals' arrays go straight to stloc, the fields' straight to stfld of exactly their field on `this`: ldarg.0; ldloc; newarr; stfld
+    // Locals: newarr; stloc. Fields: ldarg.0; ldloc; newarr; stfld of exactly their field on `this`
     private static bool Held(List<CodeInstruction> code, int at, int array, FieldInfo entries, FieldInfo past)
     {
         if (!Index(at + 1, code.Count) || !Index(array, Arrays) || at < 2) return false;
@@ -242,10 +222,7 @@ internal static class ColumnNoiseScratch
         };
     }
 
-    // What the constructor may do besides its four arrays and their stores: load and compute, keep values in locals, write numbers into
-    // arrays and fields, and call what takes and returns numbers. No address of a static, field or element, no store through an
-    // address, no store of a reference into an array, field or static, no call that could be handed a reference: nothing through which
-    // an array could outlive it.
+    // Besides the arrays' stores: no address taken, no reference stored, no call that could take one
     private static bool Allowed(CodeInstruction code)
     {
         if (!NotNull(code) || !Assert(code.opcode.Size > 0)) return false;
@@ -280,9 +257,8 @@ internal static class ColumnNoiseScratch
         return parameters.Length <= MaxParameters;
     }
 
-    // An instance method gets `this`, and with it the arrays once they are stored, so it is taken only when its own IL is an
-    // auto-property setter of ColumnNoise: ldarg.0; ldarg.1; stfld of a number of ColumnNoise's; ret. RewriteConstructor also takes one
-    // only before the arrays go into `this`, so even a patch another mod puts on a setter sees none of them.
+    // Only ColumnNoise's auto-property setters (ldarg.0; ldarg.1; stfld number; ret), called before the arrays reach
+    // `this`
     private static bool Setter(MethodInfo method)
     {
         if (!NotNull(method) || !Assert(!method.IsStatic) || method.DeclaringType != typeof(ColumnNoise) ||
@@ -305,8 +281,6 @@ internal static class ColumnNoiseScratch
         return Assert(fields.Count <= MaxFields);
     }
 
-    // Exactly one ForColumn, its column stored to a local that is only ever addressed for ColumnNoise's own members (Member), and no
-    // column built any other way; anything else returns the engine's IL untouched
     internal static List<CodeInstruction> RewriteBody(IEnumerable<CodeInstruction> instructions)
     {
         Rerun(2);
@@ -323,15 +297,13 @@ internal static class ColumnNoiseScratch
         return code;
     }
 
-    // A call of one of ColumnNoise's own double-returning members with the column's address as `this`: the column itself is never
-    // copied, stored again or handed on
+    // The column's address only ever as `this` of ColumnNoise's own double-returning members
     private static bool Member(CodeInstruction code, int operand) =>
         NotNull(code) && Assert(operand >= 0) && operand == 0 && code.opcode == OpCodes.Call &&
         code.operand is MethodInfo { IsStatic: false } member && member.DeclaringType == typeof(ColumnNoise) &&
         member.ReturnType == typeof(double);
 
-    // Stands in for the body's terrainNoise.ForColumn(...): the same call, with this thread armed for the one constructor it runs.
-    // A null noise throws in ForColumn as the engine's callvirt would, and the finally disarms the thread whatever throws.
+    // Replaces terrainNoise.ForColumn(...) with the thread armed for its one constructor; finally disarms on any throw
     internal static ColumnNoise Column(NewNormalizedSimplexFractalNoise noise, double relativeYFrequency,
         double[] amplitudes, double[] thresholds, double noiseX, double noiseZ)
     {
@@ -348,8 +320,7 @@ internal static class ColumnNoiseScratch
         }
     }
 
-    // First thing in every ColumnNoise constructor: the thread's arrays if this constructor builds from them, else null. Not null at
-    // most once per arming.
+    // First thing in every ColumnNoise constructor: the thread's arrays if armed, else null; non-null once per arming
     private static Array?[]? Take()
     {
         if (!_armed) return null;
@@ -358,14 +329,13 @@ internal static class ColumnNoiseScratch
         return Assert(arrays.Length == Arrays * MaxLength) ? arrays : null;
     }
 
-    // Stands in for the constructor's newarr T, the slot-th of its four: with the thread's arrays, the one of exactly this length for
-    // that slot, zeroed as a new one would be; else, and for a length past the table, a new one. A negative length throws as newarr's.
+    // Replaces newarr T, the slot-th of four: the thread's zeroed array when armed and in range, else a new one
     internal static T[] Rent<T>(int length, Array?[]? arrays, int slot)
     {
         if (arrays is null || (uint)length >= MaxLength || !Index(slot, Arrays)) return new T[length];
         var at = slot * MaxLength + length;
         var cached = arrays[at];
-        // exactly T[], one compare: a cast to int[] would also take a uint[], in a helper call
+        // exactly T[] in one compare; a cast to int[] would also take uint[], via a helper call
         if (cached?.GetType() != typeof(T[]))
         {
             var fresh = new T[length];

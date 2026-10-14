@@ -1,3 +1,7 @@
+using Komet.Chunks;
+using Komet.Core;
+using Komet.Tessellation;
+using Komet.World;
 using Vintagestory.ServerMods;
 using ColumnNoise = Vintagestory.API.MathTools.NewNormalizedSimplexFractalNoise.ColumnNoise;
 

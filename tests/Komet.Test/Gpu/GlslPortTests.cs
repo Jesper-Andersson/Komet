@@ -15,6 +15,7 @@ public sealed class GlslPortTests
     private static readonly int[] TwoOutputs = [0, 1];
     private static readonly string[] Unconditional = ["mvp", "lights"];
     private static readonly GlslPort.Attribute[] Xyz = [new("xyz", "vec3", 0)], BoundXyz = [new("xyz", "vec3", 5)];
+    private static readonly (string, int)[] Columns = [("vec4", 4), ("vec4", 5), ("vec4", 6), ("vec4", 7), ("vec4", 8)];
     private static readonly GlslPort.BlockBinding[] Faces = [new("faces", true, 3, GlslPort.FirstStorage + 3)];
 
     private const string Vertex = """
@@ -48,6 +49,22 @@ public sealed class GlslPortTests
     public void RequireShaderc()
     {
         if (!Shaderc.Load()) Assert.Ignore("libshaderc is not installed");
+    }
+
+    [Test]
+    public void VulkanOnlysVertexStageWritesOpenGLsPointSize()
+    {
+        GlslPort.PointSized = true;
+        try
+        {
+            Assert.That(Port(Vertex, Fragment).VertexSource, Does.Contain("komet_main(); gl_PointSize = 1.0;"));
+            var sized = Vertex.Replace("gl_Position = mvp", "gl_PointSize = 4.0; gl_Position = mvp", StringComparison.Ordinal);
+            Assert.That(Port(sized, Fragment).VertexSource, Does.Not.Contain("komet_main"), "the shader's own size stays");
+        }
+        finally
+        {
+            GlslPort.PointSized = false;
+        }
     }
 
     private static GlslPort.Ported Port(string vertex, string fragment, Dictionary<string, int>? attributes = null)
@@ -88,6 +105,15 @@ public sealed class GlslPortTests
         Assert.That(Location(ported.FragmentSource, "in", "a"), Is.EqualTo(0));
         Assert.That(ported.Outputs, Is.EqualTo(TwoOutputs));
         Assert.That(ported.Attributes, Is.EqualTo(Xyz));
+    }
+
+    [Test]
+    public void AMatrixInputTakesALocationPerColumn()
+    {
+        GlslPort.Attribute[] inputs = [new("light", "vec4", 4), new("transform", "mat4", 5)];
+        Assert.That(GlslPort.Columns(inputs).Select(a => (a.Type, a.Location)),
+            Is.EqualTo(Columns));
+        Assert.That(GlslPort.Columns(Xyz), Is.SameAs(Xyz));
     }
 
     [Test]

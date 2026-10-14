@@ -2,6 +2,8 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet.Api;
+using Komet.Core;
 using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
@@ -9,31 +11,21 @@ using static Komet.Tessellation.TessSeams;
 
 namespace Komet.Tessellation;
 
-// The garbage of tessellation is per chunk part, not per block (pipeline survey, 2026-10-07), and in a world-join trace the
-// tessellation threads spent 65 % of their sampled time parked in GC polls. Four sources go, each without changing a result:
-// - Small parts. populateTesselatedChunkPart calls MeshData.CloneUsingRecycler for every LOD mesh of every part. That takes a mesh of
-//   121 vertices or more (VerticesCount * 34 >= 4096) from the engine's MeshDataRecycler, but Clone()s a smaller one into exactly
-//   sized arrays, which become garbage when the upload disposes the part. Clone runs CloneUsingRecycler's own recycler branch
-//   (GetOrCreateMesh, CopyBasicData, CloneExtraData) for those too, behind the same checks. The values and counts are those Clone()
-//   writes; the arrays have room to spare, as a large part's have. The mesh is Recyclable, so the part's Dispose after its upload hands
-//   it back (Recycle, then DoRecycling at the next populate, whose drain FacePacking ends with a wait for the packs that read it, as
-//   it does for a large part's mesh, so none is handed out while Vulkan still packs from its arrays). The recycler keeps
-//   four meshes per capacity in quads (TryAdd) and drops a fifth as a Clone()d one was dropped. Only the chunk parts change: a mod's
-//   own CloneUsingRecycler call still clones. A player who disabled the recycler gets Clone() as shipped.
-// - Decors. CullVisibleFacesWithDecor fills NowProcessChunk's dictionary with indexer writes, and BuildDecorPolygons walks it, both
-//   before the pass returns. The thread's own dictionary, cleared, hands out its entries in insertion order just as a new one does.
-// - Ocean corners. BeginProcessChunk copies the four into fields and drops the array. The one float[4] that LoadOceanityCorners makes
-//   while BeginProcessChunk calls it is the thread's own; every other caller gets a new one.
-// - Upload. AddCenterToPools and AddEdgeToPools hand their list only to TesselatedChunkPart.AddToPools and to its ToArray. The array
-//   stays new: the chunk keeps it as its pool locations until its next upload or unload.
-// The IL is checked to show that each object leaves its method only through those calls; any other shape keeps the engine's IL. When
-// another mod patches a method that would see a shared object, or a body Clone stands in for, that group allocates as shipped.
+// Tessellation garbage is per chunk part (survey 2026-10-07); a world-join trace had its threads 65 % in GC polls. Four
+// sources go, results unchanged. Small parts: CloneUsingRecycler Clone()s meshes under 121 vertices (VerticesCount * 34
+// < 4096) into exact arrays, garbage after upload; Clone takes its recycler branch for them too, same checks, values
+// and counts. Dispose returns the mesh (Recycle, then DoRecycling at the next populate, whose FacePacking drain waits
+// for packs reading it); the recycler keeps four per quad capacity. Only chunk parts change; a disabled recycler gets
+// Clone(). Decors: NowProcessChunk's dictionary lives within the pass; the thread's cleared one keeps insertion order.
+// Ocean corners: LoadOceanityCorners' float[4] is the thread's while BeginProcessChunk calls it. Upload: the
+// AddCenter/EdgeToPools list goes only to AddToPools and ToArray. IL checks prove each object leaves only that way,
+// else engine IL; a foreign patch on a method seeing a shared object makes its group allocate.
 internal static class PartRecycling
 {
     // EngineShape of Shaped() in Vintage Story 1.22.7
     internal const ulong Shape = 0x4F02F432D94CEABDUL;
 
-    // The vertex count from which CloneUsingRecycler recycles: VerticesCount * BaseSizeInBytes >= MinimumSizeForRecycling
+    // First recycled vertex count: VerticesCount * BaseSizeInBytes >= MinimumSizeForRecycling
     private const int SmallParts = (MeshDataRecycler.MinimumSizeForRecycling + MeshData.BaseSizeInBytes - 1) /
                                    MeshData.BaseSizeInBytes;
 
@@ -94,7 +86,7 @@ internal static class PartRecycling
     private static extern void CloneExtraData(MeshData source, MeshData dest);
 
     [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "disposed")]
-    private static extern ref bool Disposed(MeshDataRecycler recycler);
+    internal static extern ref bool Disposed(MeshDataRecycler recycler);
 
     // The populate transpiler only for the bodies Clone was written against; the others check the IL they rewrite
     public static void Install(Harmony harmony, ILogger? logger = null, ulong shape = Shape)
@@ -129,15 +121,14 @@ internal static class PartRecycling
         if (!Assert(_seams.Length == Groups)) return;
         var foreign = 0;
         for (var g = 0; g < Groups; g++)
-            if (EngineShape.Foreign(_seams[g].Bodies, EngineShape.Kinds.Body, null) ||
-                EngineShape.Foreign(_seams[g].Receivers, EngineShape.Kinds.All, null))
+            if (EngineShape.Foreign(_seams[g].Bodies, PatchKinds.Body, null) ||
+                EngineShape.Foreign(_seams[g].Receivers, PatchKinds.All, null))
                 foreign |= 1 << g;
         _ = EngineShape.Report(_logger, nameof(PartRecycling), _foreign != 0, foreign != 0);
         _foreign = foreign;
     }
 
-    // The bodies Clone stands in for when a part is small: CloneUsingRecycler's checks, the Clone() it calls, and the copy that Clone()
-    // makes, which is CopyBasicData's
+    // Bodies Clone replaces for small parts: CloneUsingRecycler's checks, Clone(), its copy (CopyBasicData)
     internal static MethodBase?[] Shaped()
     {
         var mesh = typeof(MeshData);
@@ -150,8 +141,7 @@ internal static class PartRecycling
         return methods;
     }
 
-    // Per group: the bodies rewritten (another transpiler there may keep the object) and the methods that are skipped or are handed
-    // the object (any patch there may keep it)
+    // Per group: rewritten bodies (a transpiler there may keep the object), methods skipped or handed it (any patch)
     private static (MethodBase?[] Bodies, MethodBase?[] Receivers)[] Seams()
     {
         var (tesselator, chunk, i) = (typeof(ChunkTesselator), typeof(TesselatedChunk), typeof(int));
@@ -174,11 +164,9 @@ internal static class PartRecycling
         return seams;
     }
 
-    // The switch is on and no other mod patches a body of the group
     private static bool On(int group) => Enabled && Index(group, 31) && (_foreign & (1 << group)) == 0;
 
-    // One transpiler for the six methods. Harmony runs it again whenever another patch lands on one: a body that has lost its shape
-    // keeps its IL and clears its bit
+    // One transpiler for six methods, rerun on each new patch: a reshaped body keeps its IL and clears its bit
     private static List<CodeInstruction> Rewrite(IEnumerable<CodeInstruction> instructions, MethodBase original)
     {
         if (!Assert(Il.Take(instructions, Il.MaxInstructions, out var code)) || !NotNull(original)) return code;
@@ -208,8 +196,7 @@ internal static class PartRecycling
         return Assert(sites == CloneSites);
     }
 
-    // new Dictionary<int, Block>(), stored in the local that only CullVisibleFacesWithDecor (to fill) and BuildDecorPolygons (to
-    // walk) are handed, besides its null test
+    // new Dictionary<int, Block>(): its local only null-tested and passed to the decor cull and polygon build
     private static bool RewriteDecors(List<CodeInstruction> code)
     {
         var (made, cull, build) = (DecorNew, Cull, Build);
@@ -279,8 +266,8 @@ internal static class PartRecycling
         return true;
     }
 
-    // From its newarr to the ret the array is only duplicated and stored into: in between, every instruction loads a local, an
-    // argument or a constant, reads a lerped corner (floats in, a float out), is dup or stelem.r4, and none is jumped to
+    // From newarr to ret the array is only dup'd and stored into: between, each instruction loads a local, argument or
+    // constant, reads a lerped corner (floats in, float out), or is dup or stelem.r4; no jump targets
     private static bool Returned(List<CodeInstruction> code, int made, MethodInfo lerp)
     {
         if (!Index(made, code.Count) || !NotNull(lerp)) return false;
@@ -296,8 +283,7 @@ internal static class PartRecycling
         return false;
     }
 
-    // In place of mesh.CloneUsingRecycler() in populateTesselatedChunkPart (a null mesh throws as the callvirt did): a part the engine
-    // would Clone() for its size alone takes CloneUsingRecycler's recycler branch, after the same checks
+    // Replaces CloneUsingRecycler() (null throws alike): a part Clone()d for its size alone takes the recycler branch
     private static MeshData Clone(MeshData mesh)
     {
         if (!_shaped || !On(PartsGroup) || mesh.VerticesCount is <= 0 or >= SmallParts ||
@@ -317,7 +303,7 @@ internal static class PartRecycling
         return copy;
     }
 
-    // In place of NowProcessChunk's new Dictionary<int, Block>(): the thread's own, emptied (Clear also lets go of the blocks)
+    // Replaces NowProcessChunk's new Dictionary<int, Block>(): the thread's own, emptied (Clear drops the blocks)
     private static Dictionary<int, Block> Drawn()
     {
         if (!On(DecorGroup)) return [];
@@ -343,7 +329,7 @@ internal static class PartRecycling
         }
     }
 
-    // In place of LoadOceanityCorners' newarr float32: the thread's array once while armed, which the method fills whole
+    // Replaces LoadOceanityCorners' newarr float32: the thread's array, once while armed (the method fills it whole)
     private static float[] Corners(int length)
     {
         if (!Assert(length >= 0) || !_armed || length != CornerCount) return new float[length];
@@ -352,8 +338,7 @@ internal static class PartRecycling
         return Assert(corners.Length == CornerCount) ? corners : new float[length];
     }
 
-    // In place of new List<ModelDataPoolLocation>(capacity): the thread's list, lent until Drain gives it back, so an upload that throws
-    // or runs inside another gets a new one
+    // Replaces new List<ModelDataPoolLocation>(capacity): the thread's list, lent until Drain (else a new one)
     private static List<ModelDataPoolLocation> Rent(int capacity)
     {
         var list = On(ListGroup) ? _locations : null;
@@ -362,7 +347,7 @@ internal static class PartRecycling
         return list ?? new List<ModelDataPoolLocation>(capacity);
     }
 
-    // In place of list.ToArray() (a null list throws as the callvirt did): the same new array; the list, emptied, is kept
+    // Replaces list.ToArray() (null throws as the callvirt did): the same new array; the emptied list is kept
     private static ModelDataPoolLocation[] Drain(List<ModelDataPoolLocation> list)
     {
         var locations = list.ToArray();

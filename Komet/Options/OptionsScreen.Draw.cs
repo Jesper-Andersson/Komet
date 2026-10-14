@@ -1,18 +1,19 @@
+using Komet.Api;
+using Komet.Hud;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
 using static Komet.Options.KometPages;
 
 namespace Komet.Options;
 
-// One canvas, recomposed only when something it shows changed. The highlight under the cursor is one translucent rectangle over the
-// canvas, so hovering never recomposes.
+// Recomposed only on change; the hover highlight is a translucent rectangle on top.
 internal sealed partial class OptionsScreen
 {
-    // Sizes before the GUI scale
+    // Sizes before GUI scale
     private const double TextScale = 1.4, Margin = 28, Space = 10, SideWidth = 300, MinSide = 220, ContentWidth = 700,
         MinContent = 420, DescWidth = 360, MinDesc = 240, SideShare = 0.2, DescShare = 0.24, SearchHeight = 44,
-        SectionHeight = 58, PageHeight = 44, GroupHeight = 32, RowHeight = 42, Spacer = 8, Pad = 18, Box = 18,
-        TrackWidth = 180, ButtonWidth = 200, ButtonHeight = 42, Track = 6, KnobSize = 14, AccentBar = 4;
+        SectionHeight = 52, PageHeight = 44, GroupHeight = 32, RowHeight = 42, SideRow = 34, Spacer = 8, Pad = 18, Box = 18,
+        TrackWidth = 220, ButtonWidth = 200, ButtonHeight = 42, AccentBar = 4;
 
     private const int MaxItems = 512, MaxLines = 12, MaxWords = 256, MaxSteps = 64, MaxDialogs = 256;
     private const double GearSize = 85, GearShown = 0.55, MinShare = 0.5; // the hotbar's temporal gear: its size, the part above
@@ -24,6 +25,9 @@ internal sealed partial class OptionsScreen
     private const int TopGroup = 1, SideGroup = 2, ListGroup = 3, ButtonGroup = 4;
     private const float GlowDepth = ScreenDepth + 1;
     private double _fade; // how far the blur and the dim have come in since the screen opened, 0 to 1
+    private (double X, double Y, double W, double H) _sideView;
+    private double _sideScroll;
+    private bool _sideFollow = true; // the chosen page is brought into the sidebar's view at the next composition
     private (double X, double Y) _mouse = (-1, -1); // in canvas pixels
     private Light _glow, _target;
     private double _flash;
@@ -43,7 +47,6 @@ internal sealed partial class OptionsScreen
 
     private sealed record Item(ItemKind Kind, double Height, OptionPage Page, OptionRow? Row = null, string Text = "");
 
-    // The columns in canvas pixels: the canvas is Width wide and Height high, the columns start at Top below the search bar
     private sealed record Columns(double Width, double Height, double Side, double Content, double Desc, double Top, double Gap);
 
     private readonly record struct Light(double X, double Y, double W, double H, double Alpha, int Group);
@@ -61,10 +64,9 @@ internal sealed partial class OptionsScreen
         if (!Assert(w > 0 && h > 0)) return;
         _fonts.Update(TextScale);
         var bottom = Math.Round(Bottom(h));
+        Animate(deltaTime);
         if (_dirty || _epoch != _fonts.Epoch || _frame != (w, h) || Math.Abs(bottom - _bottom) >= 1) Compose(w, h, bottom);
-        // The HUD drew before the screen (a lower draw order) and left its depth behind, near enough that the hotbar, its item
-        // stacks, the chat and the minimap won against the screen wherever they overlap it. Without the depth test the screen paints
-        // over whatever is there, and writes no depth for the dialogs drawn after it (tooltips).
+        // HUD depth left behind would let hotbar, chat and minimap beat the screen; no depth test, no depth written.
         capi.Render.GLDisableDepthTest();
         try
         {
@@ -106,8 +108,8 @@ internal sealed partial class OptionsScreen
         Retarget(); // the boxes moved (a scroll, another page): the highlight follows what is under the cursor now
     }
 
-    // Where the screen ends, in frame pixels: a gap above the hotbar, the bars over it and its temporal gear, so none of them shows
-    // through; the frame's margin without them (spectator mode) or when what is left would be less than half the frame
+    // Above the hotbar, its bars and gear; the frame margin without them (spectator) or when less than half would be
+    // left
     private double Bottom(int height)
     {
         var (bottom, top) = (height - scaled(Margin), (double)height);
@@ -124,8 +126,7 @@ internal sealed partial class OptionsScreen
             };
             if (bounds is null || !Finite(bounds.renderY) || bounds.renderY <= 0) continue;
             top = Math.Min(top, bounds.renderY);
-            // renderGear: the gear's texture (85 scaled, 5 around it) reaches 0.55 of itself above a line 30 under the composer's
-            // top (the composer is 20 taller than the hotbar, which sits 5 low, and the line is 15 under the hotbar's)
+            // renderGear: gear (85 scaled, 5 around) reaches 0.55 of itself above a line 30 under the composer top
             if (dialog is HudHotbar && capi.World?.Config?.GetBool("temporalStability", true) != false)
                 top = Math.Min(top, bounds.renderY + scaled(30) - (Math.Ceiling(scaled(GearSize)) + 10) * GearShown);
         }
@@ -134,8 +135,8 @@ internal sealed partial class OptionsScreen
         return above - scaled(Margin) >= height * MinShare ? Math.Min(bottom, above) : bottom;
     }
 
-    // The columns share the frame down to bottom: sidebar and description take their part of it within bounds, the list the rest up
-    // to its most; on a narrow frame the description goes first, the buttons then under the sidebar
+    // Sidebar and description within bounds, the list the rest; narrow: description goes, then buttons go under the
+    // sidebar
     private static Columns Measure(double width, double bottom)
     {
         double gap = S(Space), room = width - 2 * S(Margin);
@@ -195,7 +196,6 @@ internal sealed partial class OptionsScreen
         (row.Label.Contains(_query, StringComparison.CurrentCultureIgnoreCase) ||
          (row.Hint ?? "").Contains(_query, StringComparison.CurrentCultureIgnoreCase));
 
-    // Returns the page the sidebar lights (none while searching)
     private string Scroll(List<Item> items, Columns c)
     {
         double total = 0;
@@ -212,24 +212,7 @@ internal sealed partial class OptionsScreen
     {
         List<string> lines = [];
         if (!NotNull(text) || !Assert(width > 0)) return lines;
-        foreach (var paragraph in text.Split('\n').Bounded(MaxLines))
-        {
-            var line = "";
-            foreach (var word in paragraph.Split(' ').Bounded(MaxWords))
-            {
-                var next = line.Length == 0 ? word : line + " " + word;
-                if (line.Length > 0 && _canvas.TextWidth(font, next) > width)
-                {
-                    lines.Add(line);
-                    next = word;
-                }
-
-                line = next;
-            }
-
-            lines.Add(line);
-        }
-
+        foreach (var paragraph in text.Split('\n').Bounded(MaxLines)) _canvas.Wrap(font, paragraph, width, MaxWords, lines);
         return lines;
     }
 
@@ -245,7 +228,7 @@ internal sealed partial class OptionsScreen
             return;
         }
 
-        // a row half scrolled out of the list is lit only where it shows
+        // a half-scrolled row is lit only where it shows
         var (top, bottom) = hit.Group == ListGroup ? (Math.Max(hit.Y, vy), Math.Min(hit.Y + hit.H, vy + vh)) : (hit.Y, hit.Y + hit.H);
         _target = new Light(hit.X, top, hit.W, Math.Max(0, bottom - top), hit.Glow, hit.Group);
     }

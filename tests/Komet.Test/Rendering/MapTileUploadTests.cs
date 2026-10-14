@@ -1,3 +1,6 @@
+using Komet.Core;
+using Komet.Rendering;
+
 namespace Komet.Test.Rendering;
 
 // MultiChunkMapComponent.FinishSetChunks is taken over only for pieces the engine's draw copies texel for texel: 32x32 and every

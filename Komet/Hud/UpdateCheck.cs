@@ -12,11 +12,11 @@ internal enum UpdateState
     Outdated,
     Unverified,
     Failed,
-    // GitHub answered, with no release of this build and none of its channel: nothing to compare with, and nothing failed
+    // Nothing to compare, nothing failed
     NoRelease
 }
 
-// Replaced as a whole so readers on the render thread never see a half-written result. "" in a field means unknown.
+// Replaced whole so render-thread readers never see half a result. "" = unknown.
 internal sealed record UpdateReport(UpdateState State, string Detail = "", string Tag = "", string Newest = "",
     string Installed = "", string Published = "", string Released = "")
 {
@@ -35,7 +35,6 @@ internal sealed record UpdateReport(UpdateState State, string Detail = "", strin
         _ => ("hud-update-norelease", null)
     };
 
-    // The lang key of what the comparison of the checksums found
     public string Verdict() => State switch
     {
         UpdateState.Checking => "verify-checking",
@@ -79,7 +78,6 @@ internal sealed class UpdateCheck : IDisposable
     }
 
     public UpdateReport Report => _report;
-    public string FileName => Path.GetFileName(_sourcePath);
     public string BuildTag { get; }
 
     public void Dispose() => _http.Dispose();
@@ -97,11 +95,11 @@ internal sealed class UpdateCheck : IDisposable
     {
         try
         {
-            // GitHub orders the feed by the tagged commit's date, which rebases and cherry-picks scramble; the newest build is the one
-            // published last.
+            // GitHub orders by tagged commit date (rebases scramble it): newest = published last. The stamp's DateTime
+            // string is MM/dd/yyyy, so text comparison is wrong.
             var releases = JArray.Parse(await _http.GetStringAsync(Feed).ConfigureAwait(false)).Take(MaxReleases)
                 .OfType<JObject>()
-                .OrderByDescending(r => (string?)r["published_at"] ?? "", StringComparer.Ordinal).ToList();
+                .OrderByDescending(static r => (DateTime?)r["published_at"] ?? DateTime.MinValue).ToList();
             if (!Assert(releases.Count <= MaxReleases) || !Assert(BuildTag.Length > 1))
             {
                 _report = new UpdateReport(UpdateState.Failed, "bad feed");
@@ -119,7 +117,7 @@ internal sealed class UpdateCheck : IDisposable
             _report = Judge(BuildTag, same is not null, newest is null ? "" : Tag(newest), installed, published,
                 released);
         }
-        // Newtonsoft's explicit casts throw ArgumentException on an unexpected token, new Uri a FormatException
+        // Newtonsoft casts throw ArgumentException, new Uri FormatException
         catch (Exception e) when (e is HttpRequestException or OperationCanceledException or IOException
                                       or JsonException or InvalidOperationException or InvalidCastException
                                       or ArgumentException or FormatException or UnauthorizedAccessException
@@ -136,8 +134,7 @@ internal sealed class UpdateCheck : IDisposable
         }
     }
 
-    // A build GitHub does not list (a local or CI build ahead of every release, or a fork) is NoRelease, not a failed check, and so
-    // is one ahead of the newest release.
+    // Unlisted (local/CI, fork) or ahead of the newest: NoRelease, not a failure.
     internal static UpdateReport Judge(string tag, bool listed, string newest, string installed, string published,
         string released)
     {
@@ -146,7 +143,6 @@ internal sealed class UpdateCheck : IDisposable
         var report = new UpdateReport(UpdateState.Unverified, tag, listed ? tag : "", newest, installed, published,
             released);
         var behind = Behind(tag, newest);
-        // Detail is the build's tag, which the notice names
         if (!listed && !behind) report = report with { State = UpdateState.NoRelease };
         else if (installed.Length > 0 && published.Length > 0)
             report = report with
@@ -159,8 +155,8 @@ internal sealed class UpdateCheck : IDisposable
         return report;
     }
 
-    // Whether the channel's newest tag is a later build than this one. Release tags compare as versions, a pre-release before its
-    // release: v2.0.1-pre is ahead of v2.0.0 and behind v2.0.1. Preview tags name commits, which have no order: any other is newer.
+    // Release tags compare as versions (v2.0.0 < v2.0.1-pre < v2.0.1); preview tags name unordered commits: any other
+    // is newer.
     internal static bool Behind(string tag, string newest)
     {
         if (!Assert(tag.Length > 1) || !NotNull(newest) || newest.Length == 0 || newest == tag) return false;

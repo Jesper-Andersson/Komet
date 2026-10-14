@@ -1,12 +1,12 @@
 using System.Runtime.InteropServices;
+using Komet.Diagnostics;
 using OpenTK.Graphics.OpenGL;
 using Vintagestory.Client.NoObf;
 
 namespace Komet.Gpu;
 
-// IGpuBackend on OpenGL, the one place that talks GL for Komet's compute work. The engine's own state is left as found: the program
-// in use comes back after every dispatch (ShaderUseCache trusts ShaderProgramBase.CurrentShaderProgram), and the bindings used lie
-// above the engine's (SSBO 3, the low texture units and UBO points).
+// IGpuBackend on OpenGL. Leaves engine state as found: program in use restored after each dispatch (ShaderUseCache
+// trusts CurrentShaderProgram); bindings above the engine's (SSBO 3, low texture units, UBO points).
 internal sealed class GlBackend : IGpuBackend
 {
     public static readonly GlBackend Instance = new();
@@ -15,12 +15,8 @@ internal sealed class GlBackend : IGpuBackend
     {
     }
 
-    // GL 4.3 has compute shaders and storage buffers, 4.5 the direct state access used here, 4.6 the indirect draws with a count
-    public bool Supported()
-    {
-        var (major, minor) = (GL.GetInteger(GetPName.MajorVersion), GL.GetInteger(GetPName.MinorVersion));
-        return Assert(major > 0) && Assert(minor >= 0) && (major > 4 || (major == 4 && minor >= 6));
-    }
+    // 4.3 compute and SSBOs, 4.5 DSA, 4.6 indirect count draws
+    public bool Supported() => Assert(GpuStats.GlVersion > 0) && GpuStats.GlVersion >= 46;
 
     public int Program(string shader, ILogger logger)
     {
@@ -57,8 +53,7 @@ internal sealed class GlBackend : IGpuBackend
         GL.UseProgram(ShaderProgramBase.CurrentShaderProgram?.ProgramId ?? 0);
     }
 
-    // glMemoryBarrier's bits (OpenTK leaves MemoryBarrierFlags without [Flags]): texture fetch 0x8, image access 0x20, command 0x40,
-    // buffer update 0x200, storage 0x2000; draws into an attachment then fetches of it are glTextureBarrier's
+    // MemoryBarrierFlags lacks [Flags]: fetch 0x8, image 0x20, command 0x40, update 0x200, storage 0x2000
     public void Barrier(GpuBarrier wait)
     {
         if (!Assert(wait != GpuBarrier.None) || !Assert((int)wait < 64)) return;
@@ -76,7 +71,7 @@ internal sealed class GlBackend : IGpuBackend
         return buffer;
     }
 
-    // A fresh store with the data: the old one may still be read by the GPU and is orphaned, not waited for
+    // Orphans the old store
     public void Upload<T>(int buffer, ReadOnlySpan<T> data, int minBytes = 0) where T : unmanaged
     {
         if (!Assert(buffer != 0) || !Assert(minBytes >= 0)) return;
@@ -106,7 +101,7 @@ internal sealed class GlBackend : IGpuBackend
             PixelType.UnsignedInt, ref zero);
     }
 
-    // A read back, which waits for Mesa's glthread and for the GPU's writes: only for results frames old
+    // Also waits for Mesa's glthread
     public void Read(int buffer, int firstUint, Span<uint> into)
     {
         if (!Assert(buffer != 0) || !Assert(firstUint >= 0) || into.IsEmpty) return;
@@ -128,7 +123,6 @@ internal sealed class GlBackend : IGpuBackend
         GL.CopyNamedBufferSubData(from, to, 4 * firstUint, 4 * firstUint, 4 * uints);
     }
 
-    // Above the engine's storage binding 3
     public void Storage(int binding, int buffer)
     {
         if (!Assert(binding > 3) || !Assert(buffer > 0)) return;

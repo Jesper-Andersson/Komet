@@ -1,3 +1,5 @@
+using Komet.Rendering;
+using Komet.Shapes;
 using Vintagestory.GameContent;
 
 namespace Komet.Test.Shapes;
@@ -15,6 +17,9 @@ public sealed class ClutterMeshesTests
             MeshRecycle.Install(harmony);
             ClutterMeshes.Install(harmony);
             Assert.That((ClutterMeshes.Patched, MeshRecycle.Patched), Is.EqualTo((true, true)));
+            // the bookshelf's override builds its copy without calling the base createMesh
+            Assert.That(Harmony.GetPatchInfo(AccessTools.DeclaredMethod(typeof(BEBehaviorClutterBookshelf), "createMesh"))
+                ?.Transpilers, Has.Count.EqualTo(1));
             var drawn = new List<float[]>();
             var pool = Answers.Of<ITerrainMeshPool>(new()
             {

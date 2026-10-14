@@ -1,19 +1,14 @@
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet.Core;
 using Vintagestory.API.Common.Entities;
 
 namespace Komet.World;
 
-// EntityPartitioning.PartitionEntities rebuilds every chunk, cell list and array 31 times a second on client and server alike: 7 MB/s
-// of garbage on the bench world's server, a quarter of it still referenced at each collection and promoted to gen 1. Only those
-// allocations are pooled; the partitioning, the entity order and every value written stay the engine's.
-//
-// Reuse is safe because nothing outside the partitioning keeps a chunk or list across calls: WalkEntities and the lookups built on it
-// read the dictionary in place on the partitioning thread, and EntityPlayer.entityListForPartitioning is replaced on every call and
-// only ever has its own player removed (RePartitionPlayer, which partitions right after). Chunks are recycled one call late, so a
-// reader on another thread still has a whole tick. A pooled object looks new: Entities all null, InanimateEntities null, lists empty
-// (a larger capacity is never read). The pools belong to the dictionary (client and server each own one, on their own threads).
+// PartitionEntities rebuilds every chunk, list and array 31 times a second (7 MB/s on the bench server, a quarter to
+// gen 1); pooled here. Nothing outside keeps one across calls (WalkEntities reads in place; entityListForPartitioning
+// is replaced) and chunks recycle one call late. Pools are per dictionary.
 internal static class PartitionReuse
 {
     private const string Partitioning = "Vintagestory.GameContent.EntityPartitioning";
@@ -70,8 +65,8 @@ internal static class PartitionReuse
     {
         _rewritten &= ~AddBit;
         if (!Assert(Il.Take(instructions, MaxInstructions, out var code))) return code;
-        var at = Il.Single(code, c => c.opcode == OpCodes.Newarr && Equals(c.operand, typeof(List<Entity>)));
-        if (Assert(at >= 0) && Il.Substitute(code, at, AccessTools.Method(typeof(PartitionReuse), nameof(TakeArray))))
+        if (Assert(Il.SubstituteSingle(code, c => c.opcode == OpCodes.Newarr && Equals(c.operand, typeof(List<Entity>)),
+                AccessTools.Method(typeof(PartitionReuse), nameof(TakeArray)))))
             _rewritten |= AddBit;
         return code;
     }
@@ -81,8 +76,7 @@ internal static class PartitionReuse
         _rewritten &= ~FetchBit;
         var ctor = AccessTools.DeclaredConstructor(typeof(List<Entity>), [typeof(int)]);
         if (!Assert(Il.Take(instructions, MaxInstructions, out var code)) || !NotNull(ctor)) return code;
-        var at = Il.Single(code, c => c.Is(OpCodes.Newobj, ctor));
-        if (Assert(at >= 0) && Il.Substitute(code, at, AccessTools.Method(typeof(PartitionReuse), nameof(TakeList))))
+        if (Assert(Il.SubstituteSingle(code, c => c.Is(OpCodes.Newobj, ctor), AccessTools.Method(typeof(PartitionReuse), nameof(TakeList)))))
             _rewritten |= FetchBit;
         return code;
     }
@@ -105,15 +99,14 @@ internal static class PartitionReuse
         _ = Assert(partitions.Count == 0);
     }
 
-    // Harmony's finalizer on PartitionEntities: nothing is taken from the pool outside it, and a void finalizer rethrows the original
-    // exception untouched
+    // Finalizer on PartitionEntities: nothing is pooled outside it; a void finalizer rethrows untouched
     internal static void Close() => Spares.Current = null;
 
     internal static TChunk Take<TChunk>() where TChunk : class, new()
     {
         if (!Enabled || Spares.Current is not Pool<TChunk> pool || !pool.Free.TryPop(out var chunk))
             return new TChunk();
-        Counted();
+        if (Counting.Hud) _ = Interlocked.Increment(ref _reused);
         return chunk;
     }
 
@@ -121,7 +114,7 @@ internal static class PartitionReuse
     {
         if (!Enabled || Spares.Current is not { } spares || !spares.Arrays.TryPeek(out var array) ||
             array.Length != length) return new List<Entity>[length];
-        Counted();
+        if (Counting.Hud) _ = Interlocked.Increment(ref _reused);
         return spares.Arrays.Pop();
     }
 
@@ -129,13 +122,8 @@ internal static class PartitionReuse
     {
         if (!Enabled || Spares.Current is not { } spares || !spares.Lists.TryPop(out var list))
             return new List<Entity>(capacity);
-        Counted();
-        return list;
-    }
-
-    private static void Counted()
-    {
         if (Counting.Hud) _ = Interlocked.Increment(ref _reused);
+        return list;
     }
 
     private class Spares
@@ -171,8 +159,7 @@ internal static class PartitionReuse
 
         private readonly HashSet<TChunk> _last = new(ReferenceEqualityComparer.Instance);
 
-        // The chunks of the call before last are no longer in the dictionary nor in anyone's hands: emptied, they are free. A chunk
-        // keeps its Entities array (its constructor's); InanimateEntities goes to the pool.
+        // The call before last's chunks are out of the dictionary and all hands; InanimateEntities goes to the pool
         public void Recycle()
         {
             using var chunks = _last.GetEnumerator();
@@ -215,7 +202,6 @@ internal static class PartitionReuse
         }
     }
 
-    // The two fields of the chunk type, which Komet only knows by name
     private static class Access<TChunk> where TChunk : class
     {
         public static readonly AccessTools.FieldRef<TChunk, List<Entity>[]> Entities =

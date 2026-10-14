@@ -1,3 +1,6 @@
+using Komet.Core;
+using Komet.Tessellation;
+
 namespace Komet.Test.Tessellation;
 
 // Golden tests against the engine's own tesselator: for every chunk the fast path would answer, ChunkTesselator.BeginProcessChunk

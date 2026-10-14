@@ -29,26 +29,21 @@ internal sealed class GpuRig : IDisposable
         why = "";
         if (backend == Gl) return new GpuRig(null, null);
         Span<byte> uuid = stackalloc byte[VulkanDevice.UuidBytes];
-        if (!GlInterop.Load() || !GlInterop.Uuid(uuid))
-        {
-            why = "OpenGL here cannot name its device";
-            return null;
-        }
-
+        ReadOnlySpan<byte> named = GlInterop.Uuid(uuid) ? uuid : default; // else picked by OpenGL's renderer name
         if (!Shaderc.Load())
         {
             why = "no shaderc";
             return null;
         }
 
-        var device = VulkanDevice.Create(uuid, out why);
+        var device = VulkanDevice.Create(named, (GL.GetString(StringName.Vendor), GL.GetString(StringName.Renderer)), out why);
         return device is null ? null : new GpuRig(device, new VulkanBackend(device, null, null));
     }
 
     public static GpuRig Open(string backend)
     {
-        var window = OcclusionGpuTests.Context();
-        if (window is null) Assert.Ignore("no OpenGL 4.6 context here: " + OcclusionGpuTests.Why);
+        var window = GlContext.Context();
+        if (window is null) Assert.Ignore("no OpenGL 4.6 context here: " + GlContext.Why);
         var rig = Start(backend, out var why);
         if (rig is null)
         {
@@ -65,24 +60,7 @@ internal sealed class GpuRig : IDisposable
     public VulkanBackend? Backend => _backend;
 
     public int Depth(float depth, int size) =>
-        _backend is null ? OcclusionGpuTests.Wall(depth) : _backend.Filled(size, size, depth);
-
-    public uint[] Read(SharedBuffer buffer, ulong offset, int words)
-    {
-        using var ready = SharedSemaphore.Create(Device!);
-        GlInterop.Signal(ready!.Gl, [(uint)buffer.Gl], [], []);
-        GL.Flush();
-        var backend = Backend!;
-        var readback = backend.Buffer();
-        backend.Upload<uint>(readback, [], 4 * words);
-        backend.Flush(); // the device has one command buffer, which the backend may be recording into
-        var (target, at) = backend.Native(readback);
-        Assert.That(Device!.Run(c => buffer.Copy(c, offset, target, at, 4UL * (ulong)words), [ready.Vulkan], []), Is.True);
-        var read = new uint[words];
-        backend.Read(readback, 0, read);
-        backend.DeleteBuffer(ref readback);
-        return read;
-    }
+        _backend is null ? GlContext.Wall(depth) : _backend.Filled(size, size, depth);
 
     public void Dispose()
     {
@@ -92,23 +70,5 @@ internal sealed class GpuRig : IDisposable
         Window?.Dispose();
         Window = null;
         Builds.Waited = _waited;
-    }
-}
-
-// The commands the GPU tests record on a shared buffer
-internal static unsafe class SharedBufferCommands
-{
-    public static void Copy(this SharedBuffer buffer, IntPtr commands, ulong offset, ulong target, ulong targetOffset,
-        ulong size)
-    {
-        Assert.That(offset + size, Is.LessThanOrEqualTo(buffer.Size));
-        var copy = new Vk.BufferCopy { SourceOffset = offset, TargetOffset = targetOffset, Size = size };
-        VkApi.CmdCopyBuffer(commands, buffer.Buffer, target, 1, &copy);
-    }
-
-    public static void Fill(this SharedBuffer buffer, IntPtr commands, ulong offset, ulong size, uint value)
-    {
-        Assert.That(offset + size, Is.LessThanOrEqualTo(buffer.Size));
-        VkApi.CmdFillBuffer(commands, buffer.Buffer, offset, size, value);
     }
 }

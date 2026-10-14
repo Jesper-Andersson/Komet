@@ -3,10 +3,8 @@ using System.Text;
 
 namespace Komet.Vulkan;
 
-// Taken as function pointers so a system without shaderc loads Komet as before and only Vulkan stays off. The engine's
-// ported shaders compile strictly: a leftover loose uniform must fail, not land in a block nobody fills. Ports compile on
-// the builders' threads (Builds): loading is guarded by Loading, and a compile only reads the compiler, which shaderc lets
-// threads share.
+// Function pointers: without shaderc Komet loads, only Vulkan stays off. Strict compile: leftover loose uniforms must
+// fail. Loading guarded by Loading; compiles share the compiler across threads, which shaderc allows.
 internal static unsafe class Shaderc
 {
     public const int Vertex = 0, Fragment = 1, Compute = 2; // shaderc_shader_kind
@@ -85,7 +83,7 @@ internal static unsafe class Shaderc
         }
     }
 
-    // The source with its macros expanded, its conditionals resolved and its comments gone, lines kept; null on an error
+    // Macros expanded, conditionals resolved, comments gone, lines kept; null on an error
     public static string? Preprocess(string source, int kind, string name, out string error)
     {
         var result = Run(source, kind, name, false, true, out error);

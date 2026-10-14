@@ -1,7 +1,8 @@
+using Komet.Diagnostics;
+
 namespace Komet.Vulkan;
 
-// How often each kind of event came, its total and its longest time, for the log's report (Hitches, Builds). Not thread-safe: an
-// owner on several threads locks around it.
+// Per kind: count, total, longest, for the log report (Hitches, Builds). Not thread-safe: owners lock.
 internal sealed class Tally(string[] names)
 {
     private const int MaxKinds = 8;

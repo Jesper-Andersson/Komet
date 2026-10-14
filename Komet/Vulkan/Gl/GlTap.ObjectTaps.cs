@@ -34,11 +34,10 @@ using unsafe LogicOpFn = delegate* unmanaged<uint, void>;
 
 namespace Komet.Vulkan;
 
-// Entries that make names note them after the driver's call. A texture parameter changes how its copy is sampled: Writes
-// hears of it.
+// Name-making entries note names after the driver's call. Texture parameters change copy sampling: Writes hears them.
 internal static unsafe partial class GlTap
 {
-    private const int ObjectsAt = TouchAt + TouchCount, MaxNames = 4096, MaxDeleted = 1 << 20;
+    private const int ObjectsAt = TouchAt + TouchCount, ObjectCount = 36, MaxNames = 4096, MaxDeleted = 1 << 20;
 
     private static Entry[] ObjectEntries() =>
     [
@@ -87,8 +86,9 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void BindBuffer(uint target, uint buffer)
     {
-        if (target != PackBuffer) Version++; // where reads go changes no draw
+        var was = Bound(target);
         BindTo(target, buffer);
+        if (target != PackBuffer && Bound(target) != was) Version++; // where reads go changes no draw, nor the same buffer
         if (Live(0) && Assert(Scene) && Assert(Version > 0)) ((BindBufferFn)Original[ObjectsAt])(target, buffer);
     }
 
@@ -124,10 +124,20 @@ internal static unsafe partial class GlTap
     private static void BuffersDeleted(ReadOnlySpan<uint> gone)
     {
         if (!Assert(gone.Length <= MaxNames)) return;
-        Writes?.BuffersGone(gone);
+        if (Writes is { } writes)
+            try
+            {
+                writes.BuffersGone(gone); // a span: no state to hand Heard
+            }
+            catch (Exception e) when (e is not OutOfMemoryException)
+            {
+                _ = Faulted(e);
+            }
         foreach (var buffer in gone.Bounded(MaxNames))
         {
             if (buffer == 0) continue;
+            if (Recording) _ = BufferSizes.Remove(buffer);
+            LeanGone(buffer, false);
             for (var i = 0; i < MaxBindings; i++)
             {
                 if (Uniforms[i].Buffer == buffer) Uniforms[i] = default;
@@ -135,6 +145,7 @@ internal static unsafe partial class GlTap
             }
 
             if (_arrayBuffer == buffer) _arrayBuffer = 0;
+            if (_looseElements == buffer) _looseElements = 0;
         }
 
         _ = Assert(Storages.Length == MaxBindings);
@@ -144,23 +155,25 @@ internal static unsafe partial class GlTap
     private static void NamedBufferStorage(uint buffer, nint size, nint data, uint flags)
     {
         Version++;
+        var small = BufferLean(buffer, size, flags, UsageOf(flags)) == Leaning.Small;
         DataWritten(buffer, size, data, (flags & PersistentStorage) != 0);
-        if (Live(4) && Assert(Scene) && Assert(size >= 0))
+        if (small && Assert(Original[TouchAt + 33] != IntPtr.Zero) && Index(TouchAt + 33, _entries.Length))
+            ((delegate* unmanaged<uint, nint, nint, uint, void>)Original[TouchAt + 33])(buffer, LeanBufferKept, 0,
+                UsageOf(flags)); // glNamedBufferData: mutable, its size can come back
+        else if (!small && Live(4) && Assert(Scene) && Assert(size >= 0))
             ((NamedBufferStorageFn)Original[ObjectsAt + 4])(buffer, size, data, flags);
     }
 
     [UnmanagedCallersOnly]
     private static void BindVertexArray(uint array)
     {
-        Version++;
-        (_vao, _array) = (array, null);
+        if (array != _vao) (_vao, _array, Version) = (array, null, Version + 1);
         if (Live(5) && Assert(Scene) && Assert(Version > 0)) ((BindVertexArrayFn)Original[ObjectsAt + 5])(array);
     }
 
     [UnmanagedCallersOnly]
     private static void AttribPointer(uint index, int size, uint type, byte normalized, int stride, nint pointer)
     {
-        Version++;
         Pointer(index, (size, type, normalized != 0, false), stride, pointer);
         if (Live(6) && Assert(Scene) && Assert(stride >= 0))
             ((AttribPointerFn)Original[ObjectsAt + 6])(index, size, type, normalized, stride, pointer);
@@ -169,7 +182,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void AttribIPointer(uint index, int size, uint type, int stride, nint pointer)
     {
-        Version++;
         Pointer(index, (size, type, false, true), stride, pointer);
         if (Live(7) && Assert(Scene) && Assert(stride >= 0))
             ((AttribIPointerFn)Original[ObjectsAt + 7])(index, size, type, stride, pointer);
@@ -178,7 +190,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void EnableAttrib(uint index)
     {
-        Version++;
         Switched(BoundArray, index, true);
         if (Live(8) && Assert(Scene) && Assert(Version > 0)) ((AttribIndexFn)Original[ObjectsAt + 8])(index);
     }
@@ -186,7 +197,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void DisableAttrib(uint index)
     {
-        Version++;
         Switched(BoundArray, index, false);
         if (Live(9) && Assert(Scene) && Assert(Version > 0)) ((AttribIndexFn)Original[ObjectsAt + 9])(index);
     }
@@ -194,11 +204,11 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void AttribDivisor(uint index, uint divisor)
     {
-        Version++;
-        if (BoundArray is { } array && index < MaxAttributes && Assert(array.Attributes.Length == MaxAttributes))
+        if (BoundArray is { } array && index < MaxAttributes && Assert(array.Attributes.Length == MaxAttributes) &&
+            array.Attributes[index].Divisor != divisor)
         {
             array.Attributes[index] = array.Attributes[index] with { Divisor = divisor };
-            array.Changes++;
+            (array.Changes, Version) = (array.Changes + 1, Version + 1);
             _ = Assert(array.Attributes[index].Divisor == divisor);
         }
 
@@ -228,7 +238,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void ArrayVertexBuffer(uint array, uint binding, uint buffer, nint offset, int stride)
     {
-        Version++;
         if (ArrayOf(array) is { } vertices && binding < MaxAttributes && Assert(stride >= 0))
         {
             // binding i for attribute i, as Komet's own pool rebinding uses it
@@ -237,8 +246,8 @@ internal static unsafe partial class GlTap
             {
                 Buffer = buffer, Offset = offset, Stride = Effective(stride, was.Size, was.Type)
             };
-            vertices.Changes++;
-            _ = Assert(vertices.Changes > 0);
+            if (vertices.Attributes[binding] != was) (vertices.Changes, Version) = (vertices.Changes + 1, Version + 1);
+            _ = Assert(vertices.Changes >= 0);
         }
 
         if (Live(12) && Assert(Scene) && Assert(stride >= 0))
@@ -263,7 +272,7 @@ internal static unsafe partial class GlTap
     private static void TexParameteri(uint target, uint name, int value)
     {
         Version++;
-        Tuned(BoundName(target), name, value);
+        Tuned(BoundName(target), name, value, Tracked(target));
         if (Live(14) && Assert(Scene) && Assert(name > 0))
             ((TexParameteriFn)Original[ObjectsAt + 14])(target, name, value);
     }
@@ -272,7 +281,7 @@ internal static unsafe partial class GlTap
     private static void TexParameterf(uint target, uint name, float value)
     {
         Version++;
-        Tuned(BoundName(target), name, value);
+        Tuned(BoundName(target), name, value, Tracked(target));
         if (Live(15) && Assert(Scene) && Assert(name > 0))
             ((TexParameterfFn)Original[ObjectsAt + 15])(target, name, value);
     }
@@ -282,7 +291,8 @@ internal static unsafe partial class GlTap
     {
         Version++;
         // an integer border colour is normalized: int.MaxValue is 1
-        if (values != null) Tuned(BoundName(target), name, name == 0x1004 ? values[0] / (float)int.MaxValue : values[0]);
+        if (values != null) Tuned(BoundName(target), name, name == 0x1004 ? values[0] / (float)int.MaxValue : values[0], Tracked(target));
+        if (Recording && values != null && Tracked(target)) BorderInts(BoundName(target), name, values);
         if (Live(16) && Assert(Scene) && Assert(name > 0))
             ((TexParameterivFn)Original[ObjectsAt + 16])(target, name, values);
     }
@@ -291,7 +301,8 @@ internal static unsafe partial class GlTap
     private static void TexParameterfv(uint target, uint name, float* values)
     {
         Version++;
-        if (values != null) Tuned(BoundName(target), name, values[0]);
+        if (values != null) Tuned(BoundName(target), name, values[0], Tracked(target));
+        if (Recording && values != null && Tracked(target)) BorderFloats(BoundName(target), name, values);
         if (Live(17) && Assert(Scene) && Assert(name > 0))
             ((TexParameterfvFn)Original[ObjectsAt + 17])(target, name, values);
     }
@@ -310,6 +321,7 @@ internal static unsafe partial class GlTap
     {
         Version++;
         if (values != null) Tuned(texture, name, values[0]);
+        if (Recording && values != null) BorderFloats(texture, name, values);
         if (Live(19) && Assert(Scene) && Assert(name > 0))
             ((TexParameterfvFn)Original[ObjectsAt + 19])(texture, name, values);
     }
@@ -428,7 +440,7 @@ internal static unsafe partial class GlTap
     private static void BeginQuery(uint target, uint id)
     {
         Version++;
-        if (_quiet == 0) Querying?.Invoke(target, id);
+        if (_quiet == 0) Queried(target, id);
         if (Live(26) && Assert(Scene) && Assert(id > 0)) ((BeginQueryFn)Original[ObjectsAt + 26])(target, id);
     }
 
@@ -436,14 +448,14 @@ internal static unsafe partial class GlTap
     private static void EndQuery(uint target)
     {
         Version++;
-        if (_quiet == 0) Querying?.Invoke(target, 0);
+        if (_quiet == 0) Queried(target, 0);
         if (Live(27) && Assert(Scene) && Assert(target > 0)) ((EndQueryFn)Original[ObjectsAt + 27])(target);
     }
 
     [UnmanagedCallersOnly]
     private static void QueryObjectiv(uint id, uint name, int* value)
     {
-        if (value != null && Answering?.Invoke(id, name) is { } answer && Assert(answer >= 0))
+        if (value != null && Answered(id, name) is { } answer && Assert(answer >= 0))
         {
             *value = (int)Math.Min(answer, int.MaxValue);
             return;
@@ -455,7 +467,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void QueryObjectuiv(uint id, uint name, uint* value)
     {
-        if (value != null && Answering?.Invoke(id, name) is { } answer && Assert(answer >= 0))
+        if (value != null && Answered(id, name) is { } answer && Assert(answer >= 0))
         {
             *value = (uint)Math.Min(answer, uint.MaxValue);
             return;
@@ -481,15 +493,16 @@ internal static unsafe partial class GlTap
         var was = array.Attributes[index];
         array.Attributes[index] = new Attribute(was.Enabled, _arrayBuffer, format.Size, format.Type, format.Normalized,
             format.Integer, Effective(stride, format.Size, format.Type), pointer, was.Divisor);
-        array.Changes++;
-        _ = Assert(array.Changes > 0);
+        if (array.Attributes[index] != was) (array.Changes, Version) = (array.Changes + 1, Version + 1);
+        _ = Assert(array.Changes >= 0);
     }
 
     private static void Switched(VertexArray? array, uint index, bool on)
     {
         if (array is null || index >= MaxAttributes || !Assert(array.Attributes.Length == MaxAttributes)) return;
+        if (array.Attributes[index].Enabled == on) return; // the same again: no layout change
         array.Attributes[index] = array.Attributes[index] with { Enabled = on };
-        array.Changes++;
+        (array.Changes, Version) = (array.Changes + 1, Version + 1);
         _ = Assert(array.Attributes[index].Enabled == on);
     }
 

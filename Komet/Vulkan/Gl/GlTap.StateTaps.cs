@@ -7,7 +7,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void Enable(uint cap)
     {
-        Version++;
         Toggle(cap, true);
         if (Assert(Original[EnableAt] != IntPtr.Zero) && Index(EnableAt, _entries.Length))
             ((delegate* unmanaged<uint, void>)Original[EnableAt])(cap);
@@ -16,7 +15,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void Disable(uint cap)
     {
-        Version++;
         Toggle(cap, false);
         if (Assert(Original[DisableAt] != IntPtr.Zero) && Index(DisableAt, _entries.Length))
             ((delegate* unmanaged<uint, void>)Original[DisableAt])(cap);
@@ -25,7 +23,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void Enablei(uint cap, uint index)
     {
-        Version++;
         if (cap == GlBlend) SetBlending((int)index, true);
         if (Assert(Original[EnableiAt] != IntPtr.Zero) && Index(EnableiAt, _entries.Length))
             ((delegate* unmanaged<uint, uint, void>)Original[EnableiAt])(cap, index);
@@ -34,7 +31,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void Disablei(uint cap, uint index)
     {
-        Version++;
         if (cap == GlBlend) SetBlending((int)index, false);
         if (Assert(Original[DisableiAt] != IntPtr.Zero) && Index(DisableiAt, _entries.Length))
             ((delegate* unmanaged<uint, uint, void>)Original[DisableiAt])(cap, index);
@@ -43,7 +39,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void BlendFunc(uint source, uint target)
     {
-        Version++;
         SetFunc(AllBuffers, (source, target, source, target));
         if (Assert(Original[FuncAt] != IntPtr.Zero) && Index(FuncAt, _entries.Length))
             ((delegate* unmanaged<uint, uint, void>)Original[FuncAt])(source, target);
@@ -52,7 +47,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void BlendFuncSeparate(uint sc, uint dc, uint sa, uint da)
     {
-        Version++;
         SetFunc(AllBuffers, (sc, dc, sa, da));
         if (Assert(Original[FuncSeparateAt] != IntPtr.Zero) && Index(FuncSeparateAt, _entries.Length))
             ((delegate* unmanaged<uint, uint, uint, uint, void>)Original[FuncSeparateAt])(sc, dc, sa, da);
@@ -61,7 +55,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void BlendFunci(uint buffer, uint source, uint target)
     {
-        Version++;
         SetFunc((int)buffer, (source, target, source, target));
         if (Assert(Original[FunciAt] != IntPtr.Zero) && Index(FunciAt, _entries.Length))
             ((delegate* unmanaged<uint, uint, uint, void>)Original[FunciAt])(buffer, source, target);
@@ -70,7 +63,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void BlendFuncSeparatei(uint buffer, uint sc, uint dc, uint sa, uint da)
     {
-        Version++;
         SetFunc((int)buffer, (sc, dc, sa, da));
         if (Assert(Original[FuncSeparateiAt] != IntPtr.Zero) && Index(FuncSeparateiAt, _entries.Length))
             ((delegate* unmanaged<uint, uint, uint, uint, uint, void>)Original[FuncSeparateiAt])(buffer, sc, dc, sa,
@@ -80,7 +72,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void BlendEquation(uint mode)
     {
-        Version++;
         SetEquation(AllBuffers, mode, mode);
         if (Assert(Original[EquationAt] != IntPtr.Zero) && Index(EquationAt, _entries.Length))
             ((delegate* unmanaged<uint, void>)Original[EquationAt])(mode);
@@ -89,7 +80,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void BlendEquationSeparate(uint color, uint alpha)
     {
-        Version++;
         SetEquation(AllBuffers, color, alpha);
         if (Assert(Original[EquationSeparateAt] != IntPtr.Zero) && Index(EquationSeparateAt, _entries.Length))
             ((delegate* unmanaged<uint, uint, void>)Original[EquationSeparateAt])(color, alpha);
@@ -98,7 +88,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void BlendEquationi(uint buffer, uint mode)
     {
-        Version++;
         SetEquation((int)buffer, mode, mode);
         if (Assert(Original[EquationiAt] != IntPtr.Zero) && Index(EquationiAt, _entries.Length))
             ((delegate* unmanaged<uint, uint, void>)Original[EquationiAt])(buffer, mode);
@@ -107,7 +96,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void BlendEquationSeparatei(uint buffer, uint color, uint alpha)
     {
-        Version++;
         SetEquation((int)buffer, color, alpha);
         if (Assert(Original[EquationSeparateiAt] != IntPtr.Zero) && Index(EquationSeparateiAt, _entries.Length))
             ((delegate* unmanaged<uint, uint, uint, void>)Original[EquationSeparateiAt])(buffer, color, alpha);
@@ -116,8 +104,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void DepthFunc(uint function)
     {
-        Version++;
-        if (function is >= 0x200 and <= 0x207) _depthFunc = function;
+        if (function is >= 0x200 and <= 0x207 && function != _depthFunc) (_depthFunc, Version) = (function, Version + 1);
         if (Assert(Original[DepthFuncAt] != IntPtr.Zero) && Index(DepthFuncAt, _entries.Length))
             ((delegate* unmanaged<uint, void>)Original[DepthFuncAt])(function);
     }
@@ -125,8 +112,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void DepthMask(byte on)
     {
-        Version++;
-        _depthMask = on != 0;
+        if (_depthMask != (on != 0)) (_depthMask, Version) = (on != 0, Version + 1);
         if (Assert(Original[DepthMaskAt] != IntPtr.Zero) && Index(DepthMaskAt, _entries.Length))
             ((delegate* unmanaged<byte, void>)Original[DepthMaskAt])(on);
     }
@@ -134,7 +120,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void ColorMask(byte r, byte g, byte b, byte a)
     {
-        Version++;
         SetMask(AllBuffers, r != 0, g != 0, b != 0, a != 0);
         if (Assert(Original[ColorMaskAt] != IntPtr.Zero) && Index(ColorMaskAt, _entries.Length))
             ((delegate* unmanaged<byte, byte, byte, byte, void>)Original[ColorMaskAt])(r, g, b, a);
@@ -143,7 +128,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void ColorMaski(uint buffer, byte r, byte g, byte b, byte a)
     {
-        Version++;
         SetMask((int)buffer, r != 0, g != 0, b != 0, a != 0);
         if (Assert(Original[ColorMaskiAt] != IntPtr.Zero) && Index(ColorMaskiAt, _entries.Length))
             ((delegate* unmanaged<uint, byte, byte, byte, byte, void>)Original[ColorMaskiAt])(buffer, r, g, b, a);
@@ -152,8 +136,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void CullFace(uint face)
     {
-        Version++;
-        _cullFace = face;
+        if (_cullFace != face) (_cullFace, Version) = (face, Version + 1);
         if (Assert(Original[CullFaceAt] != IntPtr.Zero) && Index(CullFaceAt, _entries.Length))
             ((delegate* unmanaged<uint, void>)Original[CullFaceAt])(face);
     }
@@ -161,8 +144,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void FrontFace(uint face)
     {
-        Version++;
-        _frontFace = face;
+        if (_frontFace != face) (_frontFace, Version) = (face, Version + 1);
         if (Assert(Original[FrontFaceAt] != IntPtr.Zero) && Index(FrontFaceAt, _entries.Length))
             ((delegate* unmanaged<uint, void>)Original[FrontFaceAt])(face);
     }
@@ -170,8 +152,7 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void SetViewport(int x, int y, int width, int height)
     {
-        Version++;
-        _viewport = (x, y, width, height);
+        if (_viewport != (x, y, width, height)) (_viewport, Version) = ((x, y, width, height), Version + 1);
         if (Assert(Original[ViewportAt] != IntPtr.Zero) && Index(ViewportAt, _entries.Length))
             ((delegate* unmanaged<int, int, int, int, void>)Original[ViewportAt])(x, y, width, height);
     }
@@ -190,8 +171,8 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void PolygonOffset(float factor, float units)
     {
-        Version++;
-        (_offsetFactor, _offsetUnits) = (factor, units);
+        if ((_offsetFactor, _offsetUnits) != (factor, units))
+            (_offsetFactor, _offsetUnits, Version) = (factor, units, Version + 1);
         if (Assert(Original[OffsetAt] != IntPtr.Zero) && Index(OffsetAt, _entries.Length))
             ((delegate* unmanaged<float, float, void>)Original[OffsetAt])(factor, units);
     }
@@ -199,7 +180,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void DrawBuffers(int count, uint* buffers)
     {
-        Version++;
         var windowed = stackalloc uint[16];
         if (_framebuffer != 0 && _framebuffer == Window && buffers != null && count is > 0 and <= 16)
         {
@@ -216,7 +196,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void DrawBuffer(uint buffer)
     {
-        Version++;
         if (_framebuffer != 0 && _framebuffer == Window) buffer = Windowed(buffer);
         if (_framebuffer > 0) SetBuffers(_framebuffer, [buffer]);
         if (Assert(Original[DrawBufferAt] != IntPtr.Zero) && Index(DrawBufferAt, _entries.Length))
@@ -226,7 +205,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void NamedDrawBuffers(uint framebuffer, int count, uint* buffers)
     {
-        Version++;
         var windowed = stackalloc uint[16];
         if (framebuffer == 0 && Window != 0 && buffers != null && count is > 0 and <= 16)
         {
@@ -244,7 +222,6 @@ internal static unsafe partial class GlTap
     [UnmanagedCallersOnly]
     private static void NamedDrawBuffer(uint framebuffer, uint buffer)
     {
-        Version++;
         if (framebuffer == 0 && Window != 0) (framebuffer, buffer) = (Window, Windowed(buffer));
         if (framebuffer > 0) SetBuffers(framebuffer, [buffer]);
         if (Assert(Original[NamedDrawBufferAt] != IntPtr.Zero) && Index(NamedDrawBufferAt, _entries.Length))
@@ -255,7 +232,8 @@ internal static unsafe partial class GlTap
     private static void DeleteProgram(uint program)
     {
         Version++;
-        if (program != 0) ProgramGone?.Invoke(program);
+        if (program != 0 && ProgramGone is { } gone) Heard(gone, program);
+        if (Recording) _ = ProgramRecords.Remove(program);
         _ = SamplerUnits.Remove(program);
         _ = Programs.Remove(program);
         if (program == _current) (_using, _samplers) = (null, null);
@@ -272,7 +250,8 @@ internal static unsafe partial class GlTap
             _ = Buffers.Remove(framebuffers[i]);
             _ = Outputs.Remove(framebuffers[i]);
             _ = Reads.Remove(framebuffers[i]);
-            if (framebuffers[i] != 0) FramebufferGone?.Invoke(framebuffers[i]);
+            if (Recording) _ = FramebufferRecords.Remove(framebuffers[i]);
+            if (framebuffers[i] != 0 && FramebufferGone is { } gone) Heard(gone, framebuffers[i]);
         }
         if (Assert(Original[DeleteFramebuffersAt] != IntPtr.Zero) && Index(DeleteFramebuffersAt, _entries.Length))
             ((delegate* unmanaged<int, uint*, void>)Original[DeleteFramebuffersAt])(count, framebuffers);
@@ -286,8 +265,10 @@ internal static unsafe partial class GlTap
         _ = Assert(count >= 0);
         for (var i = 0; textures != null && Deleting is { } deleting && i < Math.Min(count, MaxDeleted); i++)
             if (textures[i] != 0)
-                deleting(textures[i]);
+                Heard(deleting, textures[i]);
         for (var i = 0; textures != null && Scene && i < Math.Min(count, MaxDeleted); i++) Unbound(textures[i]);
+        for (var i = 0; textures != null && Leaned > 0 && i < Math.Min(count, MaxDeleted); i++) LeanGone(textures[i], true);
+        for (var i = 0; textures != null && GlBehind.Count > 0 && i < Math.Min(count, MaxDeleted); i++) _ = GlBehind.Remove(textures[i]);
         if (Assert(Original[DeleteTexturesAt] != IntPtr.Zero) && Index(DeleteTexturesAt, _entries.Length))
             ((delegate* unmanaged<int, uint*, void>)Original[DeleteTexturesAt])(count, textures);
     }
@@ -297,6 +278,7 @@ internal static unsafe partial class GlTap
     {
         if (texture == 0 || !Assert(UnitArrays.Length == MaxUnits)) return;
         _ = TextureTargets.Remove(texture);
+        if (Recording) _ = TextureRecords.Remove(texture);
         for (var unit = 0; unit < MaxUnits; unit++)
         {
             if (UnitTextures[unit] == texture) UnitTextures[unit] = 0;

@@ -1,5 +1,5 @@
 using Komet.Gpu;
-using Komet.Vulkan;
+using Komet.Rendering;
 using OpenTK.Graphics.OpenGL;
 
 namespace Komet.Test.Gpu;
@@ -40,9 +40,9 @@ public sealed class OcclusionCullingGpuTests
     private static void Run(string backend, bool wall, Action<GpuRig, FrameBufferRef, float[]> test)
     {
         using var rig = GpuRig.Open(backend);
-        var projection = OcclusionGpuTests.Projection();
-        var size = OcclusionGpuTests.Size;
-        var depth = wall ? OcclusionGpuTests.Depth(projection, OcclusionGpuTests.WallDistance) : 1;
+        var projection = GlContext.Projection();
+        var size = GlContext.Size;
+        var depth = wall ? GlContext.Depth(projection, GlContext.WallDistance) : 1;
         var framebuffer = new FrameBufferRef { DepthTextureId = rig.Depth(depth, size), Width = size, Height = size };
         using var harmony = new TestHarmony("komet-test-culling-gpu");
         OcclusionCulling.Install(harmony, Client(framebuffer), new CapturingLogger());
@@ -66,7 +66,7 @@ public sealed class OcclusionCullingGpuTests
             var second = Frame(projection); // the wall hides the far range, in pass 0 and again in pass 1
             GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
             // the wall is gone: pass 0 still hides it, pass 1 draws it
-            wall.DepthTextureId = rig.Depth(1, OcclusionGpuTests.Size);
+            wall.DepthTextureId = rig.Depth(1, GlContext.Size);
             var opened = Frame(projection);
             Assert.Multiple(() =>
             {
@@ -109,86 +109,6 @@ public sealed class OcclusionCullingGpuTests
         var read = Enumerable.Range(0, 8).Select(i => (uint)OcclusionCulling.Stat(i)).ToArray();
         Assert.That(read, Is.EqualTo(frames[2]));
     });
-
-    // The passes on the Vulkan frame (VulkanBackend recording into its segments, the depth the frame's shared image of the
-    // engine's texture) count as they do on OpenGL and on Vulkan alone
-    [Test]
-    public void OnTheVulkanFrameTheWallHidesTheRangeBehindIt()
-    {
-        using var rig = GpuRig.Open(GpuRig.Vulkan);
-        var device = rig.Device!;
-        var (texture, framebuffer) = SharedDepth();
-        const uint usage = Komet.Vulkan.Vk.Sampled | Komet.Vulkan.Vk.DepthAttachment | Komet.Vulkan.Vk.TransferDst;
-        var size = OcclusionGpuTests.Size;
-        using var depth = SharedImage.Adopt(device, texture, (size, size, 1, 1), SharedFormat.Depth32F, usage, out var why);
-        Assert.That(depth, Is.Not.Null, why);
-        var projection = OcclusionGpuTests.Projection();
-        Clear(framebuffer, OcclusionGpuTests.Depth(projection, OcclusionGpuTests.WallDistance));
-        using var frame = VulkanFrame.Create(device, out why);
-        Assert.That(frame, Is.Not.Null, why);
-        frame!.Images = () => [new VulkanFrame.Shared(depth!, Komet.Vulkan.Vk.LayoutDepthAttachment,
-            GlInterop.LayoutDepthAttachment)];
-        using var backend = new VulkanBackend(device, frame, t => t == texture ? depth : null);
-        GpuBackends.Current = backend;
-        var wall = new FrameBufferRef { DepthTextureId = texture, Width = size, Height = size };
-        using var harmony = new TestHarmony("komet-test-culling-frame");
-        OcclusionCulling.Install(harmony, Client(wall), new CapturingLogger());
-        try
-        {
-            var first = OnFrame(frame, device, projection);
-            var second = OnFrame(frame, device, projection);
-            Assert.Multiple(() =>
-            {
-                Assert.That(OcclusionCulling.Supported, Is.True, "cull.comp builds for the frame");
-                Assert.That((first.Count, first.Late), Is.EqualTo((2u, 0u)), "first frame");
-                Assert.That((second.Count, second.Late), Is.EqualTo((1u, 0u)), "second frame");
-                Assert.That(second.Counters, Is.EqualTo(new uint[] { 2, 1, 300, 100, 1, 1, 100, 100 }), "second frame");
-                Assert.That(backend.Refused, Is.Zero, "the frame took every pass");
-            });
-        }
-        finally
-        {
-            OcclusionCulling.Clear();
-            GpuBackends.Current = GlBackend.Instance;
-            GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
-            GL.DeleteFramebuffer(framebuffer);
-            GL.DeleteTexture(texture);
-        }
-    }
-
-    private static (uint[] Counters, uint Count, uint Late, uint[] First, uint[] Second) OnFrame(VulkanFrame frame,
-        VulkanDevice device, float[] projection)
-    {
-        frame.Next();
-        OcclusionCulling.RunFrame(Ranges, projection, (0, 0, 0));
-        frame.Close("the test's end");
-        Assert.That(device.WaitIdle(), Is.True);
-        return Read();
-    }
-
-    // A mutable 32-bit float depth texture, as the engine's, attached to a framebuffer of its own
-    internal static (int Texture, int Framebuffer) SharedDepth()
-    {
-        var size = OcclusionGpuTests.Size;
-        GL.GenTextures(1, out int texture);
-        GL.BindTexture(TextureTarget.Texture2D, texture);
-        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.DepthComponent32f, size, size, 0,
-            PixelFormat.DepthComponent, PixelType.Float, IntPtr.Zero);
-        GL.GenFramebuffers(1, out int framebuffer);
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, framebuffer);
-        GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.DepthAttachment,
-            TextureTarget.Texture2D, texture, 0);
-        GL.DrawBuffer(DrawBufferMode.None);
-        return (texture, framebuffer);
-    }
-
-    internal static void Clear(int framebuffer, float depth)
-    {
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, framebuffer);
-        GL.ClearDepth(depth);
-        GL.Clear(ClearBufferMask.DepthBufferBit);
-        GL.Finish();
-    }
 
     // The frame just run: its counters, and its first draw's commands of both passes (or the shadow first draw's, which
     // OcclusionCulling places after both camera passes')

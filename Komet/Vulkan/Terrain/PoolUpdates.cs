@@ -2,16 +2,16 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using HarmonyLib;
+using Komet.Core;
+using Komet.Rendering;
 using OpenTK.Graphics.OpenGL;
 using Vintagestory.Client.NoObf;
 
 namespace Komet.Vulkan;
 
-// The classic path's mesh updates (the liquid pools) taken like FacePacking's. The prefix stands in for UpdateMesh's body,
-// as the JIT inlines updateVAO into it (a patch on updateVAO alone missed every call): the same attributes in order through
-// the engine's updateVAO or Through, then the indices; the GL binds stay as the engine makes them, so OpenGL's state is the
-// engine's either way. An upload into memory mapped for good, an empty one, and every upload with GL error checking on are
-// the engine's own. The body is pinned (EngineShape).
+// Classic-path mesh updates (liquid pools) taken like FacePacking's. Prefixes UpdateMesh, as the JIT inlines updateVAO
+// (patching that alone missed every call). GL binds stay the engine's; mapped, empty and GL-error-checked uploads stay
+// the engine's. Body pinned (EngineShape).
 internal static class PoolUpdates
 {
     // EngineShape of Seams() in Vintage Story 1.22.7
@@ -21,7 +21,7 @@ internal static class PoolUpdates
 
     private static bool _shaped;
 
-    // Takes an upload instead of OpenGL (the lazy handoff's); null leaves every one to the engine
+    // null leaves every upload to the engine
     private static FacesThrough? Through => Rendering.FacePacking.Through;
 
     [UnsafeAccessor(UnsafeAccessorKind.Method, Name = "updateIndices")]
@@ -46,7 +46,7 @@ internal static class PoolUpdates
         return Assert(seams.Length == 1) ? seams : [];
     }
 
-    // Prefix on UpdateMesh: false when the update was made here
+    // false when the update was made here
     internal static bool Updating(ClientPlatformWindows __instance, MeshRef modelRef, MeshData data)
     {
         if (!_shaped || Through is null || modelRef is not VAO vao || data is null || !NotNull(__instance) ||
@@ -106,7 +106,7 @@ internal static class PoolUpdates
         _ = Assert(vao.IndicesCount == at.Count);
     }
 
-    // GL_ARRAY_BUFFER is left on the buffer, as the engine does
+    // GL_ARRAY_BUFFER stays on the buffer, as the engine does
     private static bool Taken(VAO vao, int buffer, int offset, ReadOnlySpan<byte> data)
     {
         if (!NotNull(vao) || vao.Persistent || data.IsEmpty || Through is not { } through || !Assert(offset >= 0) ||
@@ -115,7 +115,7 @@ internal static class PoolUpdates
         return Assert(buffer > 0);
     }
 
-    // Empty when the array is null or shorter: the engine's own call then fails
+    // Empty when null or short: the engine's own call then fails
     private static ReadOnlySpan<byte> Bytes<T>(T[]? data, int count) where T : unmanaged
     {
         if (data is null || !Assert(count >= 0) || count > data.Length) return [];

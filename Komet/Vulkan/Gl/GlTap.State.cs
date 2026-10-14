@@ -2,8 +2,7 @@ using OpenTK.Graphics.OpenGL;
 
 namespace Komet.Vulkan;
 
-// Read from OpenGL once when tapping begins. Blend factors and equations are held in Vulkan's numbering, Unsupported where it
-// has none.
+// Read from GL once when tapping begins. Blend factors/equations in Vulkan's numbering, Unsupported if none.
 internal static unsafe partial class GlTap
 {
     public const int MaxBuffers = 8;
@@ -34,8 +33,8 @@ internal static unsafe partial class GlTap
     private const int DrawBuffersAt = 43, DrawBufferAt = 44, NamedDrawBuffersAt = 45, NamedDrawBufferAt = 46;
     private const int DeleteFramebuffersAt = 47, DeleteProgramAt = 48, DeleteTexturesAt = 49;
 
-    // Per draw buffer: bits 0-3 source color factor, 4-7 destination color, 8-11 source alpha, 12-15 destination alpha,
-    // 16-18 color equation, 19-21 alpha equation, 22-25 write mask (r g b a), 26 blending on
+    // Per draw buffer: bits 0-3 src color factor, 4-7 dst color, 8-11 src alpha, 12-15 dst alpha, 16-18 color eq, 19-21
+    // alpha eq, 22-25 write mask (rgba), 26 blending on
     private static readonly uint[] Blends = new uint[MaxBuffers];
     private static readonly Dictionary<uint, uint[]> Buffers = [];
     private static readonly Dictionary<uint, int[]> Outputs = []; // DrawBuffersOf's answers, while Buffers holds
@@ -45,9 +44,10 @@ internal static unsafe partial class GlTap
     private static float _offsetFactor, _offsetUnits;
     private static (int X, int Y, int Width, int Height) _viewport;
 
-    // What a draw's pipeline depends on, cheap to compare and hash. Depth: bits 0-2 compare op (Vulkan's), 3 write, 4-5 cull mode
-    // (Vulkan's), 6 front face counter-clockwise (OpenGL's)
-    public readonly record struct Fixed(uint Caps, uint Depth, float OffsetFactor, float OffsetUnits, BlendState Blend)
+    // A draw pipeline's dependencies, cheap to compare and hash. Depth: bits 0-2 compare op (Vulkan), 3 write, 4-5 cull
+    // mode (Vulkan), 6 front face CCW (GL). Stencil: test ops (StencilWord), 0 when off or unrecorded
+    public readonly record struct Fixed(uint Caps, uint Depth, float OffsetFactor, float OffsetUnits, BlendState Blend,
+        uint Stencil = 0)
     {
         public bool DepthTest => (Caps & (uint)GlTap.Caps.DepthTest) != 0;
         public uint DepthCompare => Depth & 7;
@@ -66,7 +66,7 @@ internal static unsafe partial class GlTap
         public bool Blending(int buffer) => ((this[buffer] >> 26) & 1) != 0;
     }
 
-    // The state with the alpha writes of the given draw buffers masked off (RGB in OpenGL, RGBA in Vulkan: alpha stays 1)
+    // The state with the given draw buffers' alpha writes masked (RGB in GL, RGBA in Vulkan: alpha stays 1)
     public static Fixed WithoutAlpha(Fixed state, ReadOnlySpan<bool> buffers)
     {
         Span<uint> words = stackalloc uint[MaxBuffers];
@@ -78,7 +78,6 @@ internal static unsafe partial class GlTap
         };
     }
 
-    // The state now
     public static Fixed State
     {
         get
@@ -88,13 +87,14 @@ internal static unsafe partial class GlTap
                         (_frontFace == GlCcw ? 64u : 0);
             _ = Assert(_depthFunc is >= 0x200 and <= 0x207) && Assert(Blends.Length == MaxBuffers);
             return new Fixed((uint)_caps, depth, _offsetFactor, _offsetUnits,
-                new BlendState(Blends[0], Blends[1], Blends[2], Blends[3], Blends[4], Blends[5], Blends[6], Blends[7]));
+                new BlendState(Blends[0], Blends[1], Blends[2], Blends[3], Blends[4], Blends[5], Blends[6], Blends[7]),
+                Recording ? StencilWord() : 0);
         }
     }
 
     public static (int X, int Y, int Width, int Height) Viewport => _viewport;
 
-    // Bumps with every state, program, texture or sampler call: the same number means the same state
+    // Bumps with every change of the state, program, texture or sampler bindings: the same number means the same state
     public static long Version { get; private set; }
 
     public static int DrawFramebuffer => (int)_framebuffer;
@@ -105,18 +105,19 @@ internal static unsafe partial class GlTap
         return face switch { 0x404 => 1u, GlBack => 2u, 0x408 => 3u, _ => 0u };
     }
 
-    // Bumps whenever some framebuffer's draw buffers change
     public static long BufferChanges { get; private set; }
 
-    // The attachment each fragment output goes to (-1: none), as the draw buffers say; asked from OpenGL once when never set
-    // while tapped (the framebuffer must be the one bound for drawing then)
+    // Attachment per fragment output (-1: none) per draw buffers; asked once if unset while tapped (bound for drawing)
     public static int[] DrawBuffersOf(int framebuffer)
     {
         if (!Assert(framebuffer > 0) || !Assert(Buffers.Count < 256)) return [];
         if (!Buffers.TryGetValue((uint)framebuffer, out var buffers))
         {
             buffers = new uint[MaxBuffers];
-            for (var i = 0; i < MaxBuffers; i++) buffers[i] = (uint)GL.GetInteger((GetPName)(0x8825 + i));
+            if (Defaulted((uint)framebuffer)) buffers[0] = GlColor0; // the rest GL_NONE
+            else
+                for (var i = 0; i < MaxBuffers; i++)
+                    buffers[i] = (uint)GL.GetInteger((GetPName)(0x8825 + i));
             Buffers[(uint)framebuffer] = buffers;
         }
 
@@ -175,7 +176,15 @@ internal static unsafe partial class GlTap
     {
         if (buffer != AllBuffers && !Index(buffer, MaxBuffers)) return;
         var (from, to) = buffer == AllBuffers ? (0, MaxBuffers) : (buffer, buffer + 1);
-        for (var i = from; i < Math.Min(to, MaxBuffers); i++) Blends[i] = (Blends[i] & keep) | value;
+        var changed = false;
+        for (var i = from; i < Math.Min(to, MaxBuffers); i++)
+        {
+            var word = (Blends[i] & keep) | value;
+            changed |= word != Blends[i];
+            Blends[i] = word;
+        }
+
+        if (changed) Version++; // the same blend again leaves the terrain's recorded context valid
         _ = Assert((value & keep) == 0);
     }
 
@@ -195,8 +204,9 @@ internal static unsafe partial class GlTap
             return;
         }
 
-        var bit = Cap(cap);
+        var (bit, was) = (Cap(cap), _caps);
         _caps = on ? _caps | bit : _caps & ~bit;
+        if (_caps != was) Version++;
         _ = Assert(bit == Caps.None || ((_caps & bit) != 0) == on) && Assert(cap != GlBlend);
     }
 
@@ -212,7 +222,7 @@ internal static unsafe partial class GlTap
         asked.CopyTo(held);
         Buffers[framebuffer] = held;
         _ = Outputs.Remove(framebuffer);
-        BufferChanges++;
+        (BufferChanges, Version) = (BufferChanges + 1, Version + 1);
         _ = Assert(framebuffer > 0);
     }
 

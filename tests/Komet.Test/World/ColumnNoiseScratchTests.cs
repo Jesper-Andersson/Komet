@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using Komet.Core;
+using Komet.World;
 using Vintagestory.API.Server;
 using Vintagestory.ServerMods;
 using Vintagestory.ServerMods.NoObf;

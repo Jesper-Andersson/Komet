@@ -10,15 +10,14 @@ internal static unsafe partial class GlTap
     private const int MaxArrays = 1 << 16, MaxKnownTextures = 1 << 16;
     private const uint ArrayBuffer = 0x8892, ElementBuffer = 0x8893, UniformBuffer = 0x8A11, StorageBuffer = 0x90D2;
     private const uint CopyRead = 0x8F36, CopyWrite = 0x8F37, UnpackBuffer = 0x88EC, IndirectBuffer = 0x8F3F;
-    private const uint PackBuffer = 0x88EB;
+    private const uint PackBuffer = 0x88EB, ParameterBuffer = 0x80EE;
     private const uint CubeFirst = 0x8515, CubeLast = 0x851A;
 
     // One vertex attribute as glVertexAttrib(I)Pointer left it; Stride is what OpenGL steps by (never 0)
     public readonly record struct Attribute(bool Enabled, uint Buffer, int Size, uint Type, bool Normalized,
         bool Integer, int Stride, long Offset, uint Divisor);
 
-    // A vertex array's attributes by location and element buffer; Changes counts attribute changes (not the element buffer's,
-    // which the engine binds anew around every draw)
+    // A VAO's attributes by location and element buffer; Changes: attribute changes (element buffer rebinds per draw)
     public sealed class VertexArray
     {
         public Attribute[] Attributes { get; } = new Attribute[MaxAttributes];
@@ -32,7 +31,7 @@ internal static unsafe partial class GlTap
     private static readonly (uint Buffer, long Offset, long Size)[] Storages = new (uint, long, long)[MaxBindings];
     private static readonly uint[] UnitArrays = new uint[MaxUnits], UnitCubes = new uint[MaxUnits];
     private static uint _vao, _arrayBuffer, _uniformBuffer, _storageBuffer, _copyRead, _copyWrite, _unpackBuffer;
-    private static uint _indirect, _packBuffer, _polygonMode = Fill;
+    private static uint _indirect, _packBuffer, _parameters, _polygonMode = Fill;
     private static float _lineWidth = 1, _widest = 1;
     private static uint _logicOp = 0x1503; // GL_COPY
     private static (int RowLength, int SkipRows, int SkipPixels, int Alignment) _unpack = (0, 0, 0, 4), _pack = (0, 0, 0, 4);
@@ -44,7 +43,7 @@ internal static unsafe partial class GlTap
 
     public static IGlWrites? Writes { get; set; }
 
-    // What the tap keeps by GL name, for the report; Bytes: about, of the vertex arrays (16 attributes each) and texture targets
+    // What the tap keeps by GL name, for the report; Bytes: approx., of vertex arrays (16 attributes each) and targets
     public static (int Programs, int Arrays, int Textures, int Framebuffers, long Bytes) Held =>
         Assert(Arrays.Count <= MaxArrays) && Assert(TextureTargets.Count <= MaxKnownTextures)
             ? (Programs.Count, Arrays.Count, TextureTargets.Count, Buffers.Count,
@@ -91,6 +90,8 @@ internal static unsafe partial class GlTap
     {
         if (texture == 0 || !Assert(TextureTargets.Count <= MaxKnownTextures)) return Texture2D;
         if (TextureTargets.TryGetValue(texture, out var known)) return known;
+        if (Recording && TextureRecords.TryGetValue(texture, out var recorded) && recorded.Target != 0)
+            return recorded.Target;
         GL.GetTextureParameter((int)texture, (GetTextureParameter)0x1006, out int target); // GL_TEXTURE_TARGET
         var made = target == 0 ? Texture2D : (uint)target;
         if (TextureTargets.Count >= MaxKnownTextures) TextureTargets.Clear();
@@ -117,6 +118,10 @@ internal static unsafe partial class GlTap
     private static int[] _units = [];
     private static Dictionary<int, int>? _unitsOf;
     private static long _unitsAt = -1;
+
+    // A vertex array as the tap follows it, while the scene is tapped
+    public static VertexArray? ArrayAt(uint vao) =>
+        Scene && Assert(vao > 0) && Assert(Arrays.Count <= MaxArrays) ? ArrayOf(vao) : null;
 
     private static VertexArray? ArrayOf(uint vao)
     {
@@ -161,15 +166,20 @@ internal static unsafe partial class GlTap
         };
     }
 
-    // The element buffer is the bound vertex array's
+    // The element buffer is the bound vertex array's. Vulkan-only also follows VAO 0's (GL keeps one): the engine binds
+    // a pool's index buffer with none bound to fill it (updateIndices), which must reach Vulkan's copy
+    private static uint _looseElements;
+
     private static uint Bound(uint target)
     {
         _ = Assert(Uniforms.Length == MaxBindings) && Assert(Storages.Length == MaxBindings);
         return target switch
         {
-            ArrayBuffer => _arrayBuffer, ElementBuffer => BoundArray?.Elements ?? 0, UniformBuffer => _uniformBuffer,
+            ArrayBuffer => _arrayBuffer, ElementBuffer => BoundArray?.Elements ?? (Recording ? _looseElements : 0),
+            UniformBuffer => _uniformBuffer,
             StorageBuffer => _storageBuffer, CopyRead => _copyRead, CopyWrite => _copyWrite,
-            UnpackBuffer => _unpackBuffer, IndirectBuffer => _indirect, PackBuffer => _packBuffer, _ => 0
+            UnpackBuffer => _unpackBuffer, IndirectBuffer => _indirect, PackBuffer => _packBuffer,
+            ParameterBuffer => _parameters, _ => 0
         };
     }
 
@@ -179,6 +189,7 @@ internal static unsafe partial class GlTap
         {
             case ArrayBuffer: _arrayBuffer = buffer; break;
             case ElementBuffer when BoundArray is { } array: array.Elements = buffer; break;
+            case ElementBuffer when _vao == 0: _looseElements = buffer; break;
             case UniformBuffer: _uniformBuffer = buffer; break;
             case StorageBuffer: _storageBuffer = buffer; break;
             case CopyRead: _copyRead = buffer; break;
@@ -186,6 +197,7 @@ internal static unsafe partial class GlTap
             case UnpackBuffer: _unpackBuffer = buffer; break;
             case IndirectBuffer: _indirect = buffer; break;
             case PackBuffer: _packBuffer = buffer; break;
+            case ParameterBuffer: _parameters = buffer; break;
         }
 
         _ = Assert(Bound(target) == buffer || target is not (ArrayBuffer or UniformBuffer)) && Assert(Version >= 0);
@@ -215,6 +227,7 @@ internal static unsafe partial class GlTap
     {
         (_vao, _array) = ((uint)GL.GetInteger(GetPName.VertexArrayBinding), null);
         _arrayBuffer = (uint)GL.GetInteger(GetPName.ArrayBufferBinding);
+        _looseElements = _vao == 0 ? (uint)GL.GetInteger(GetPName.ElementArrayBufferBinding) : 0;
         _uniformBuffer = (uint)GL.GetInteger(GetPName.UniformBufferBinding);
         _storageBuffer = (uint)GL.GetInteger((GetPName)0x90D3);
         (_copyRead, _copyWrite) = ((uint)GL.GetInteger((GetPName)0x8F36), (uint)GL.GetInteger((GetPName)0x8F37));
@@ -266,8 +279,7 @@ internal static unsafe partial class GlTap
 // Told of every write into a buffer or a texture, before the driver runs it; data points at client memory (or is null)
 internal interface IGlWrites
 {
-    // glBufferData, glBufferStorage and their named variants: the buffer (re)specified, with its first contents; persistent:
-    // mapped for good (its writes go through the mapping, unseen)
+    // glBufferData/glBufferStorage (and named): respecified with first contents; persistent: mapped for good, unseen
     void BufferData(uint buffer, long size, IntPtr data, bool persistent);
 
     void BufferSubData(uint buffer, long offset, long size, IntPtr data);
@@ -282,18 +294,27 @@ internal interface IGlWrites
     // A texture's contents changed (an upload, a copy into it, its mipmaps made)
     void TextureChanged(uint texture);
 
-    // A level of a 2D texture specified anew (glTexImage2D): internal format and size, the data (pixels 0: none, or from a pixel
-    // unpack buffer)
-    void TextureSpecified(uint texture, int level, (int Format, int Width, int Height) spec, (uint Format, uint Type) data,
-        IntPtr pixels);
-
-    // An upload from client memory into a level of a 2D texture: true when the texture's copy took it too, so it is not changed
-    bool TextureUploaded(uint texture, int level, (int X, int Y, int Width, int Height) rect, (uint Format, uint Type) data,
-        IntPtr pixels);
-
     // One of a texture's parameters set (the first value of a vector one)
     void TextureTuned(uint texture, uint name, float value);
 
-    // glGenerateMipmap on a 2D texture: true when its copy makes its levels too, so it is not changed
+    // glGenerateMipmap on 2D: true when its copy makes the levels too (Vulkan-only: any followed texture, recorded)
     bool TextureMipmapped(uint texture);
+
+    // Vulkan-only (GlTap.Recording), any followed target, after the record took it: a level specified or storage made
+    // (glTexImage*, glTex(ture)Storage*: Levels at once). target: bind target or cube face; data: format and type, 0
+    // for none; pixels: client memory, 0 for none or a pixel unpack buffer's (then also changed)
+    void TextureImaged(uint texture, uint target, (int Level, int Levels) levels,
+        (int Format, int Width, int Height, int Depth) spec, (uint Format, uint Type) data, IntPtr pixels);
+
+    // Vulkan-only: client-memory upload into a box of a level (Z: layer or cube face); true when taken, else changed
+    bool TextureSubImaged(uint texture, uint target, int level, (int X, int Y, int Z, int Width, int Height, int Depth) box,
+        (uint Format, uint Type) data, IntPtr pixels);
+
+    // Vulkan-only: glCopyImageSubData from one texture's level (and layer Z) into another's; true when taken
+    bool TextureCopied((uint Texture, int Level, int X, int Y, int Z) to, (uint Texture, int Level, int X, int Y, int Z) from,
+        (int Width, int Height, int Depth) size);
+
+    // Vulkan-only: glCopyTexSubImage2D from an FBO's read buffer (Read: GlTap.ReadBufferOf) into a level (Z: layer)
+    bool TextureRead(uint texture, int level, (int X, int Y, int Z) at, (int Fbo, int Read) from,
+        (int X, int Y, int Width, int Height) rect);
 }

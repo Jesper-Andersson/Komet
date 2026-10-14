@@ -12,8 +12,8 @@ public sealed class DepthPyramidGpuTests
     [Test]
     public void TheRowsAnOddLevelLeavesOverReachTheTop()
     {
-        using var window = OcclusionGpuTests.Context();
-        if (window is null) Assert.Ignore("no OpenGL 4.6 context here: " + OcclusionGpuTests.Why);
+        using var window = GlContext.Context();
+        if (window is null) Assert.Ignore("no OpenGL 4.6 context here: " + GlContext.Why);
         GpuBackends.Current = GlBackend.Instance;
         GL.GenTextures(1, out int depth);
         GL.BindTexture(TextureTarget.Texture2D, depth);

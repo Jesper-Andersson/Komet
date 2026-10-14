@@ -1,7 +1,6 @@
 namespace Komet.Core;
 
-// At most max items for any threads under one lock, no allocation once warm (a ConcurrentStack allocates a node a push and walks
-// its list for Count)
+// At most max items under one lock, no allocation once warm (ConcurrentStack allocates per push, walks for Count)
 internal sealed class BoundedPool<T>(int max) where T : class
 {
     private readonly Stack<T> _items = new();

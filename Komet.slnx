@@ -1,5 +1,6 @@
 <Solution>
     <Project Path="Komet/Komet.csproj"/>
+    <Project Path="Komet.Bench/Komet.Bench.csproj"/>
     <Folder Name="/tests/">
         <Project Path="tests/Komet.Test/Komet.Test.csproj"/>
         <Project Path="tests/Komet.Testing/Komet.Testing.csproj"/>

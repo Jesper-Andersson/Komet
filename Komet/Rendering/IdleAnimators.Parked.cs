@@ -1,34 +1,30 @@
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Komet.Core;
 using Vintagestory.Client.NoObf;
 
 namespace Komet.Rendering;
 
-// Frame decides per call, so each idle entry still costs its handler, its renderer and (for a util) three more objects: two or three
-// dependent cache misses, ~12,900 times a frame in the user's base, all but ~90 of them idle. Here the four stages the animatables
-// register in (ShadowFar, ShadowNear, Opaque, OIT) are polled once at their start instead: the parked objects lie in dense arrays,
-// each read ahead with prefetch, and their answer goes into one byte per list entry that the transpiled loops read before they
-// touch the handler (Skip). The arrays are rebuilt when the list is another or its _version moved, at most once per stage and frame.
-//
-// Parked are only BlockEntityAnimationUtil (that exact type) and the AnimatableRenderers such utils own: in vanilla nothing turns
-// them active inside a stage (MarkBlockDirty's callbacks, which set ShouldRender, run in Before; StartAnimation is hooked by Woken),
-// whereas GearRenderer switches its tripod's renderer on and off within Opaque. Plain AnimationUtils and mods' renderers stay with
-// Frame. A list that changes during the stage (a renderer registering inside one) makes Skip answer no for the rest of it.
-//
-// A util holds its BlockEntity, so a parking that is no longer polled (the knob off, a stage the engine stopped triggering) would keep
-// a whole snapshot of block entities alive past their chunks: Release lets such a parking go, and the owned set with Opaque's.
+// Frame decides per call, so each idle entry still costs two or three dependent cache misses, ~12,900 times a frame in
+// the user's base, all but ~90 idle. Here ShadowFar, ShadowNear, Opaque and OIT are polled once at stage start: parked
+// objects lie in dense prefetched arrays, answering into one byte per list entry the transpiled loops read before the
+// handler (Skip). Arrays rebuild when the list or its _version changed, at most once per stage and frame. Parked: only
+// BlockEntityAnimationUtil (exact type) and the AnimatableRenderers it owns; vanilla never wakes them mid-stage
+// (MarkBlockDirty callbacks run in Before; StartAnimation hooked by Woken), whereas GearRenderer toggles its tripod in
+// Opaque. Plain AnimationUtils and mod renderers stay with Frame. A list changed mid-stage makes Skip answer no for the
+// rest. A util holds its BlockEntity, so an unpolled parking (knob off, stage no longer triggered) would keep entities
+// past their chunks: Release drops it, the owned set with Opaque's.
 internal static partial class IdleAnimators
 {
     private const int Stages = 4, OpaqueSlot = 2, MaxParked = 1 << 16;
 
-    // Prefetch distances of the rebuild and the poll, in entries: an object Lead on, what it points to Parts on (unmeasured: a step
-    // here takes a few nanoseconds where a render call took tens, so they reach further ahead than Ahead's)
+    // Prefetch distances (rebuild, poll): object Lead entries ahead, its referents Parts (unmeasured; beyond Ahead's)
     private const int Lead = 24, Parts = 12;
 
     private static readonly Parking[] Parkings = [new(), new(), new(), new()]; // by slot, main thread only
 
-    // The renderers of the parked utils of Opaque, as of its last rebuild; _owners counts the changes
+    // Renderers of Opaque's parked utils at its last rebuild; _owners counts changes
     private static HashSet<AnimatableRenderer> _owned = new(ReferenceEqualityComparer.Instance),
         _spare = new(ReferenceEqualityComparer.Instance);
 
@@ -45,8 +41,8 @@ internal static partial class IdleAnimators
     [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_version")]
     private static extern ref int Edits(List<RenderHandler> list);
 
-    // The first question of the transpiled loops and of ModTimes' replay, before the handler is loaded: an entry the poll at the
-    // stage's start found idle. Another list (a stage triggered from inside this one has polled its own) answers no.
+    // First question of the transpiled loops and ModTimes' replay: entry found idle at stage start. Another list (a
+    // nested stage polled its own) answers no.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static bool Skip(List<RenderHandler> list, int i)
     {
@@ -57,8 +53,8 @@ internal static partial class IdleAnimators
         return true;
     }
 
-    // AnimationUtil.StartAnimation: a util started on the main thread inside a stage, after the poll found it idle, runs from here on,
-    // and its renderer is asked again (it draws once MarkBlockDirty's callback has run, in a later Before). The next stage polls anew.
+    // StartAnimation: a util started mid-stage after the poll runs from here, its renderer asked again (draws after
+    // MarkBlockDirty's callback in a later Before). The next stage polls anew.
     internal static void Woken(AnimationUtil __instance, bool __result)
     {
         if (!__result || _current is not { } parking || !NotNull(__instance) || __instance.GetType() != _utilType ||
@@ -77,8 +73,7 @@ internal static partial class IdleAnimators
         _ = Assert(Parkings.Length == Stages) && Assert(_owned.Count == 0);
     }
 
-    // Staged, at a stage's start: rebuild the stage's arrays when they are not of this list as it is (or, outside Opaque, of the
-    // owned renderers as they are), poll them, and hand the bytes to Skip; whether it did
+    // Stage start: rebuild unless of this list as is (outside Opaque, also the owned set), poll, hand bytes to Skip
     private static bool Poll(List<RenderHandler> list, EnumRenderStage stage)
     {
         var slot = stage switch
@@ -128,7 +123,7 @@ internal static partial class IdleAnimators
         _ = Assert(parking.UtilCount + parking.RendererCount <= count);
     }
 
-    // The renderers Opaque's parked utils own, counted as a change only when the set is another
+    // Counted as a change only when the set differs
     private static void Own(Parking parking)
     {
         var (next, changed) = (_spare, false);
@@ -143,8 +138,7 @@ internal static partial class IdleAnimators
         _ = Assert(_owned.Count <= parking.UtilCount) && Assert(!ReferenceEquals(_owned, _spare));
     }
 
-    // Staged: the parkings of all stages, or of those not polled last frame, let their objects go. The owned set goes with Opaque's,
-    // as a change: the other stages filter by it.
+    // All parkings, or those unpolled last frame, release objects; the owned set goes with Opaque's, as a change.
     private static void Release(bool all)
     {
         var stale = _frame - 1;
@@ -163,7 +157,7 @@ internal static partial class IdleAnimators
         _ = Assert(_owned.Count == 0);
     }
 
-    // A renderer is idle while it does not render: one field, on its own line
+    // Idle while not rendering: one field, on its own line
     private static bool PollRenderers(Parking parking)
     {
         if (!NotNull(parking)) return false;
@@ -188,8 +182,7 @@ internal static partial class IdleAnimators
         for (var k = 0; k < Math.Min(count, MaxParked); k++)
         {
             if (k + Lead < count) Fetch(utils[k + Lead], 2);
-            // what Resting reads behind it: the animator's count, the renderer's ShouldRender, the dictionary's count (on the
-            // dictionary's second line as often as not)
+            // what Resting reads: animator count, renderer ShouldRender, dictionary count (often on its second line)
             if (k + Parts < count && utils[k + Parts] is { } next)
             {
                 FetchAt(next.animator, countAt);
@@ -203,7 +196,7 @@ internal static partial class IdleAnimators
         return true;
     }
 
-    // One stage's parked objects, their places in the list and the bytes Skip reads (one per list entry; 0 for any not parked)
+    // A stage's parked objects, their list places and Skip's bytes (one per entry; 0 if not parked)
     private sealed class Parking
     {
         public List<RenderHandler>? Handlers;
@@ -213,10 +206,9 @@ internal static partial class IdleAnimators
         public int[] UtilAt = [], RendererAt = [];
         public byte[] Bits = [];
 
-        // Anything of a build left to let go
         public bool Holds => Handlers is not null || UtilCount + RendererCount > 0;
 
-        // Room for `count` entries; the objects of the last build are let go
+        // Room for `count` entries; last build's objects released
         public void Reset(int count)
         {
             Array.Clear(Utils, 0, Math.Min(UtilCount, Utils.Length));
@@ -247,7 +239,6 @@ internal static partial class IdleAnimators
             UtilCount++;
         }
 
-        // Only the renderers a parked util owns stay parked
         public void KeepOwned(HashSet<AnimatableRenderer> owned)
         {
             var (kept, known) = (0, NotNull(owned));
@@ -263,7 +254,7 @@ internal static partial class IdleAnimators
             _ = Assert(kept <= Renderers.Length);
         }
 
-        // The util and its renderer leave this stage's bytes; how many entries did
+        // Util and renderer leave this stage's bytes; returns entries cleared
         public int Unpark(AnimationUtil util, AnimatableRenderer? shown)
         {
             var found = 0;

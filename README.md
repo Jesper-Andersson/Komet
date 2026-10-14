@@ -8,7 +8,7 @@ produces the same result, measures itself in game and shows a HUD with frame tim
   with tabs (overview with hints that fix what they name on a click, frames, system, render, threads, mods with pinning, timing
   and patch risks, log, settings), Ctrl+F8 the debug window (captures and the protocol, see below).
 - **Options menu**: replaces the in-game settings (Escape → Settings) with a menu in the style of Sodium for Minecraft; also
-  via `.komet`. Details below. Komet's own settings live in `ModConfig/komet-hud.json`.
+  via `.komet`. Details below. Komet's own settings live in `ModConfig/komet.json`.
 - **Update notice**: once you agree, Komet checks GitHub at startup for a newer build of its own channel.
 
 Komet runs on the client only (in singleplayer including the built-in server). If an engine method is missing or another mod
@@ -16,11 +16,11 @@ patches the same method, the engine does the work, and the log or the HUD says s
 
 ## Features
 
-Switches are defined in `Komet/Core/Features.cs`; off or 0 means the engine does the work. All features are on by default.
+Switches are defined in `Komet/Core/Features/Features.cs`; off or 0 means the engine does the work. All features are on by default.
 
 **Rendering**
 - **FrustumSweep**: vectorized chunk culling, on the worker threads from 8,192 entries; 0.97 instead of 2.3 ms per frame.
-- **FrustumStages**: culling per render stage. The first chunk render call of a stage hands the pools of all passes of that stage
+  Culling runs per render stage: the first chunk render call of a stage hands the pools of all passes of that stage
   to the workers at once, including the sync of the pool mirrors; the main thread only waits for the pass it is drawing. Together
   with GlErrorPoll in an A/B: 104.6 → 120.3 FPS, 1 % low 35.4 → 39.1 FPS, frames over 25 ms 53 → 33 per minute.
 - **GlErrorPoll**: the two GL error checks per frame only ask the driver every 16th time; under Mesa's glthread each one waits for
@@ -188,15 +188,14 @@ interfaces, lambdas used as event and tick listeners, and the mod's own Harmony 
 time per frame, the longest call and the share on the main thread, then removes the patches again. The report goes to the
 clipboard and `Logs/komet-debug/profile-<modid>-<time>.txt`; a debug capture running at the same time includes it.
 
-Mod authors can add their own timings and state to the protocol through `KometDebug` (same rules as `KometOptions`):
+Mod authors can add their own timings to the protocol through `KometDebug` (same rules as `KometOptions`):
 
 ```csharp
 using (KometDebug.Measure("mymod:pathfinding")) FindPath(); // costs a field read while no capture runs
-KometDebug.AddSection("mymod", "My mod", () => $"cached paths: {_cache.Count}");
 ```
 
-`Measure` works on any thread; the protocol lists each name with its total time, calls and time per call. A section's text is
-read once per protocol on a pool thread; one that throws shows its exception instead. When the world closes, Komet drops both.
+`Measure` works on any thread; the protocol lists each name with its total time, calls and time per call. When the world closes,
+Komet drops them.
 
 ## Launch settings (optional)
 
@@ -221,10 +220,12 @@ exec /opt/vintagestory/run.sh "$@"
 ## Benchmark
 
 `scripts/bench.sh` starts the game unattended on a copy of the save from `scripts/bench.json`, flies a fixed route (standing,
-turning, flying out and back) and writes `result.json` and `frames.csv` to `~/.cache/komet-bench/runs/`.
+turning, flying out and back) and writes `result.json` and `frames.csv` to `~/.cache/komet-bench/runs/`. The benchmark is a mod of
+its own, `Komet.Bench` (mod id `kometbench`, never in the release): `--build` lays it out in `Releases/kometbench` beside
+`Releases/komet`, and the run loads both.
 
 ```bash
-./build.sh && scripts/bench.sh --profile smoke   # check the measuring chain, about 4 minutes
+scripts/bench.sh --build --profile smoke         # check the measuring chain, about 4 minutes
 scripts/bench.sh --profile full                  # Komet against the engine, about 25 minutes
 ```
 
@@ -242,7 +243,7 @@ stop the game time.
 dotnet test tests/Komet.Test  # local only, needs the game installation
 ```
 
-**Layout:** `Komet/` the mod, `tests/Komet.Test` its tests, `tests/Komet.Testing` the test rigs, `tools/Komet.Rules` the analyzer,
+**Layout:** `Komet/` the mod, `Komet.Bench/` the developer benchmark (a separate mod), `tests/Komet.Test` the tests, `tests/Komet.Testing` the test rigs, `tools/Komet.Rules` the analyzer,
 `scripts/` the benchmark.
 
 **Test rigs:** `Komet.Testing` bundles the test rigs without a dependency on Komet (Harmony ids, loggers, foreign patches, chunk

@@ -3,8 +3,7 @@ using System.Text;
 
 namespace Komet.Vulkan;
 
-// Device functions come through vkGetDeviceProcAddr, which skips the loader's dispatch. Nothing is linked, so a system without
-// Vulkan loads Komet as before and only Load reports false.
+// Device functions via vkGetDeviceProcAddr (no loader dispatch). Nothing linked: without Vulkan Load returns false.
 internal static unsafe partial class VkApi
 {
     private const int MaxName = 128;
@@ -44,10 +43,8 @@ internal static unsafe partial class VkApi
     public static delegate* unmanaged<IntPtr, ulong, void*, void> DestroyImage { get; private set; }
     public static delegate* unmanaged<IntPtr, ulong, Vk.MemoryRequirements*, void> GetImageMemoryRequirements { get; private set; }
     public static delegate* unmanaged<IntPtr, ulong, ulong, ulong, int> BindImageMemory { get; private set; }
-    public static delegate* unmanaged<IntPtr, Vk.GetFdInfo*, int*, int> GetMemoryFd { get; private set; }
     public static delegate* unmanaged<IntPtr, Vk.FlagsInfo*, void*, ulong*, int> CreateSemaphore { get; private set; }
     public static delegate* unmanaged<IntPtr, ulong, void*, void> DestroySemaphore { get; private set; }
-    public static delegate* unmanaged<IntPtr, Vk.GetFdInfo*, int*, int> GetSemaphoreFd { get; private set; }
     private static delegate* unmanaged<IntPtr, Vk.AllocateInfo*, void*, ulong*, int> _allocateMemory;
     private static delegate* unmanaged<IntPtr, ulong, void*, void> _freeMemory;
 
@@ -57,18 +54,8 @@ internal static unsafe partial class VkApi
         if (!Assert(_allocateMemory != null) || !Assert(info != null && memory != null)) return -1;
         VulkanWatch.Mark($"vkAllocateMemory {info->Size >> 20} MB for {Path.GetFileNameWithoutExtension(file)}");
         var result = _allocateMemory(device, info, allocator, memory);
-        if (result == Vk.Success) VkMemory.Allocated(*memory, info->Size, file, Exportable(info->Next));
+        if (result == Vk.Success) VkMemory.Allocated(*memory, info->Size, file);
         return result;
-    }
-
-    // Whether the allocation's chain holds a VkExportMemoryAllocateInfo
-    private static bool Exportable(void* next)
-    {
-        var chained = (Vk.Chained*)next;
-        for (var i = 0; i < 8 && chained != null; i++, chained = (Vk.Chained*)chained->Next)
-            if (chained->SType == Vk.ExportMemoryAllocateInfo)
-                return Assert(chained->HandleTypes != 0);
-        return !Assert(chained == null); // a longer chain than any of Komet's counts as exportable
     }
 
     public static void FreeMemory(IntPtr device, ulong memory, void* allocator)
@@ -112,6 +99,7 @@ internal static unsafe partial class VkApi
         EnumerateDeviceExtensions = (delegate* unmanaged<IntPtr, byte*, uint*, Vk.ExtensionProperties*, int>)Instance(
             instance, "vkEnumerateDeviceExtensionProperties");
         LoadSurface(instance);
+        LoadFormats(instance);
         return DestroyInstance != null && EnumeratePhysicalDevices != null && GetPhysicalDeviceProperties2 != null &&
                GetPhysicalDeviceFeatures2 != null &&
                GetQueueFamilies != null && GetMemoryProperties != null && CreateDevice != null && _deviceProc != null &&
@@ -139,7 +127,7 @@ internal static unsafe partial class VkApi
         QueueSubmit = (delegate* unmanaged<IntPtr, uint, Vk.Submit*, ulong, int>)Device(device, "vkQueueSubmit");
         LoadSwapchain(device);
         return LoadSync(device) && LoadMemory(device) && LoadCompute(device) && LoadGraphics(device) && LoadDraws(device) &&
-               LoadQueries(device) &&
+               LoadQueries(device) && LoadOnly(device) &&
                DestroyDevice != null &&
                DeviceWaitIdle != null &&
                GetDeviceQueue != null && CreateCommandPool != null && DestroyCommandPool != null &&
@@ -157,9 +145,8 @@ internal static unsafe partial class VkApi
         CreateSemaphore =
             (delegate* unmanaged<IntPtr, Vk.FlagsInfo*, void*, ulong*, int>)Device(device, "vkCreateSemaphore");
         DestroySemaphore = (delegate* unmanaged<IntPtr, ulong, void*, void>)Device(device, "vkDestroySemaphore");
-        GetSemaphoreFd = (delegate* unmanaged<IntPtr, Vk.GetFdInfo*, int*, int>)Device(device, "vkGetSemaphoreFdKHR");
         return Assert(CreateFence != null) && DestroyFence != null && WaitForFences != null && ResetFences != null &&
-               CreateSemaphore != null && DestroySemaphore != null && GetSemaphoreFd != null;
+               CreateSemaphore != null && DestroySemaphore != null;
     }
 
     private static bool LoadMemory(IntPtr device)
@@ -173,9 +160,8 @@ internal static unsafe partial class VkApi
             (delegate* unmanaged<IntPtr, Vk.AllocateInfo*, void*, ulong*, int>)Device(device, "vkAllocateMemory");
         _freeMemory = (delegate* unmanaged<IntPtr, ulong, void*, void>)Device(device, "vkFreeMemory");
         BindImageMemory = (delegate* unmanaged<IntPtr, ulong, ulong, ulong, int>)Device(device, "vkBindImageMemory");
-        GetMemoryFd = (delegate* unmanaged<IntPtr, Vk.GetFdInfo*, int*, int>)Device(device, "vkGetMemoryFdKHR");
         return Assert(CreateImage != null) && DestroyImage != null && GetImageMemoryRequirements != null &&
-               _allocateMemory != null && _freeMemory != null && BindImageMemory != null && GetMemoryFd != null;
+               _allocateMemory != null && _freeMemory != null && BindImageMemory != null;
     }
 
     private static IntPtr Instance(IntPtr instance, string name) =>

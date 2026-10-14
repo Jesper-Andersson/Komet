@@ -1,21 +1,17 @@
 using System.Reflection;
 using System.Reflection.Emit;
 using HarmonyLib;
+using Komet.Core;
 
 namespace Komet.World;
 
-// A firepit holding a cooking pot asks every cooking recipe, twice a burn tick, whether the pot's contents match it
-// (BlockEntityFirepit.canSmeltInput -> CanSmelt -> GetMatchingCookingRecipe -> CookingRecipe.Matches), and every ask allocates: a copy
-// of the input stacks, the recipe's ingredients copied into a list, a counter per ingredient, and in each ingredient's GetMatchingStack
-// a fresh GlobalConstants.IgnoredStackAttributes plus "timeFrozen" for every stack it compares. 5.9 MB/s in the bench world, a tenth
-// of all garbage. The rewrites keep the engine's code and swap only those allocations:
-// - Matches works on the thread's own two lists and counter array, emptied and filled as the constructors fill theirs. It only reads,
-//   shortens and indexes them and never lets them out; the counters it zeroes itself, all of them, and it reads only as many as there
-//   are ingredients. A Matches nested in another on the same thread (nothing does it) allocates as the engine does: a prefix and a
-//   finalizer count the depth.
-// - GetMatchingStack compares against one shared copy of the ignored attributes, made again whenever IgnoredStackAttributes is
-//   replaced or one of its entries changes. The comparison (ItemStack.Equals and the collectible's Equals) only reads the list; the
-//   locals the removed code filled are not read anywhere else (EngineShape pins the body this was checked on).
+// A firepit's cooking pot tests every recipe twice a burn tick (CookingRecipe.Matches), allocating copies, counters and
+// per GetMatchingStack a fresh IgnoredStackAttributes + "timeFrozen": 5.9 MB/s in the bench world, a tenth of all
+// garbage.
+// - Matches uses the thread's two lists and counter array, never lets them out and reads only the counters it zeroed. A
+//   nested Matches (none exists) allocates as the engine; a prefix and finalizer count depth.
+// - GetMatchingStack compares against one shared copy, rebuilt when the source changes; Equals only reads it
+//   (EngineShape pins the body).
 internal static class CookingMatch
 {
     // EngineShape of Seams() in Vintage Story 1.22.7
@@ -70,9 +66,15 @@ internal static class CookingMatch
         _ = Assert(_depth > 0);
     }
 
+    // The main thread outlives the world the stacks and ingredients belong to
     private static void Leave()
     {
-        _depth--;
+        if (--_depth == 0)
+        {
+            _stacks?.Clear();
+            (_items as System.Collections.IList)?.Clear();
+        }
+
         _ = Assert(_depth >= 0);
     }
 
@@ -126,8 +128,7 @@ internal static class CookingMatch
         return counts;
     }
 
-    // Each of the two copies of IgnoredStackAttributes plus "timeFrozen" is taken out, from the static load to the store of
-    // "timeFrozen", and the load of the copy the Equals call reads becomes Ignored(); any other shape keeps the engine's IL
+    // Both IgnoredStackAttributes + "timeFrozen" copies removed, Equals reads Ignored(); any other shape keeps the IL
     internal static List<CodeInstruction> RewriteMatching(IEnumerable<CodeInstruction> instructions)
     {
         _rewritten &= ~StackBit;
@@ -152,8 +153,7 @@ internal static class CookingMatch
         return code;
     }
 
-    // The store of "timeFrozen" that ends the copy starting at `start`, when nothing jumps into it or out of it, it makes one string
-    // array, and right after it the copy is loaded for the Equals call; -1 otherwise
+    // The "timeFrozen" store ending a jump-free copy from `start`, with the copy loaded for Equals right after; else -1
     private static int Copy(List<CodeInstruction> code, int start, MethodInfo equals)
     {
         var (arrays, end) = (0, -1);
@@ -171,8 +171,7 @@ internal static class CookingMatch
                code[end + 2].Calls(equals) && code[end + 1].labels.Count == 0 ? end : -1;
     }
 
-    // IgnoredStackAttributes and "timeFrozen", as the engine's collection expression builds them, shared while the source is the
-    // same array with the same entries
+    // IgnoredStackAttributes + "timeFrozen", shared while the source array and its entries are unchanged
     internal static string[] Ignored()
     {
         var source = GlobalConstants.IgnoredStackAttributes; // null throws in Same as the engine's ldlen does

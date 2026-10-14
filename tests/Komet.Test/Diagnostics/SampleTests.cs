@@ -1,3 +1,5 @@
+using Komet.Diagnostics;
+
 namespace Komet.Test.Diagnostics;
 
 // What the HUD samples once a second off the main thread: /proc read into a buffer of its own, a log parsed again only once it grew

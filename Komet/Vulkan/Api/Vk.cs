@@ -1,11 +1,10 @@
 namespace Komet.Vulkan;
 
-// Declared by hand as the C headers lay it out on 64-bit platforms. Dispatchable handles (instance, physical device, device,
-// queue, command buffer) are pointers, the others 64-bit numbers.
+// Hand-declared per the C headers on 64-bit: dispatchable handles are pointers, the others 64-bit numbers.
 internal static partial class Vk
 {
-    public const uint ApiVersion13 = (1u << 22) | (3u << 12), QueueFamilyIgnored = ~0u, QueueFamilyExternal = ~0u - 1;
-    public const int Success = 0, Timeout = 2;
+    public const uint ApiVersion13 = (1u << 22) | (3u << 12), QueueFamilyIgnored = ~0u;
+    public const int Success = 0;
 
     // VkStructureType
     public const int ApplicationInfo = 0, InstanceCreateInfo = 1, DeviceQueueCreateInfo = 2, DeviceCreateInfo = 3;
@@ -13,28 +12,23 @@ internal static partial class Vk
     public const int ImageCreateInfo = 14, CommandPoolCreateInfo = 39, CommandBufferAllocateInfo = 40;
     public const int CommandBufferBeginInfo = 42, ImageMemoryBarrier = 45;
     public const int PhysicalDeviceProperties2 = 1000059001, PhysicalDeviceIdProperties = 1000071004;
-    public const int ExternalMemoryImageCreateInfo = 1000072001, ExportMemoryAllocateInfo = 1000072002;
-    public const int MemoryGetFdInfo = 1000074002, ExportSemaphoreCreateInfo = 1000077000;
-    public const int SemaphoreGetFdInfo = 1000079001;
-    public const int MemoryDedicatedAllocateInfo = 1000127001;
 
-    public const uint OpaqueFd = 0x1, FormatRgba8 = 37, TransferSrc = 0x1, TransferDst = 0x2, Sampled = 0x4;
+    public const uint FormatRgba8 = 37, TransferSrc = 0x1, TransferDst = 0x2, Sampled = 0x4;
     public const uint Storage = 0x8, ColorAttachment = 0x10, DepthAttachment = 0x20, AspectDepth = 0x2;
     public const uint FormatRgba16F = 97, FormatD32F = 126, FormatR16F = 76;
     public const uint FormatRgba32F = 109, FormatR8 = 9, FormatRg16F = 83, FormatRgba16 = 91;
+    public const uint FormatRg8 = 16, FormatSrgba8 = 43, FormatR16 = 70, FormatA2B10G10R10 = 64, FormatB10G11R11F = 122;
     public const int LayoutUndefined = 0, LayoutGeneral = 1, LayoutTransferDst = 7;
     public const uint StageTop = 0x1, StageTransfer = 0x1000, StageBottom = 0x2000, StageAll = 0x10000;
     public const uint AccessTransferWrite = 0x1000, AccessMemoryRead = 0x8000, AccessMemoryWrite = 0x10000;
     public const uint QueueGraphics = 0x1, QueueCompute = 0x2, DeviceLocal = 0x1, AspectColor = 0x1;
     public const uint OneTimeSubmit = 0x1, ResetCommandBuffer = 0x2;
 
-    // VkPhysicalDeviceProperties2 with VkPhysicalDeviceProperties inside: vendorID at 16 + 8, deviceID at 16 + 12, deviceName at
-    // 16 + 20, pipelineCacheUUID at 16 + 276, the whole well under Properties
+    // VkPhysicalDeviceProperties2: vendorID at 16+8, deviceID 16+12, deviceName 16+20, pipelineCacheUUID 16+276
     public const int PropertiesBytes = 1024, DeviceNameOffset = 36;
-    public const int VendorOffset = 24, ModelOffset = 28, CacheUuidOffset = 292;
+    public const int VendorOffset = 24, ModelOffset = 28, TypeOffset = 32, CacheUuidOffset = 292;
 
-    // VkPhysicalDeviceLimits start 8-aligned after the cache UUID, at 312: timestampComputeAndGraphics at 420 in them,
-    // timestampPeriod (float, ns per tick) at 424
+    // VkPhysicalDeviceLimits at 312: timestampComputeAndGraphics at 420, timestampPeriod (float ns/tick) at 424
     public const int TimestampsOffset = 312 + 420, TimestampPeriodOffset = 312 + 424;
 
     public unsafe struct AppInfo
@@ -125,13 +119,6 @@ internal static partial class Vk
         public int InitialLayout;
     }
 
-    public unsafe struct Chained
-    {
-        public int SType; public void* Next;
-        // VkExternalMemoryImageCreateInfo, VkExportMemoryAllocateInfo, VkExportSemaphoreCreateInfo
-        public uint HandleTypes;
-    }
-
     public struct MemoryRequirements
     {
         public ulong Size, Alignment;
@@ -143,19 +130,6 @@ internal static partial class Vk
         public int SType; public void* Next;
         public ulong Size;
         public uint TypeIndex;
-    }
-
-    public unsafe struct DedicatedInfo
-    {
-        public int SType; public void* Next;
-        public ulong Image, Buffer;
-    }
-
-    public unsafe struct GetFdInfo
-    {
-        public int SType; public void* Next;
-        public ulong Handle; // the memory or the semaphore
-        public uint HandleType;
     }
 
     public unsafe struct FlagsInfo

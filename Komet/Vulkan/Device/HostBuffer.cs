@@ -1,8 +1,7 @@
 namespace Komet.Vulkan;
 
-// Mapped for its life, device-local where the GPU offers such memory to the CPU (resizable BAR). A bulk buffer is only ever the
-// source of copies: it lies in system memory, cached where it can, which the CPU writes (and OpenGL reads back into) at memory
-// speed instead of across the bus into the card's memory.
+// Mapped for life, device-local where CPU-visible (resizable BAR). A bulk buffer is only a copy source: cached system
+// memory, so CPU writes (and GL readbacks) run at memory speed, not across the bus.
 internal sealed unsafe class HostBuffer : IDisposable
 {
     private const uint Usage = Vk.UsageUniform | Vk.UsageStorage | Vk.UsageIndirect | Vk.UsageIndex | Vk.UsageVertex |

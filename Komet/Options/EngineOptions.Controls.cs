@@ -1,17 +1,17 @@
 using KeyMap = Vintagestory.API.Datastructures.OrderedDictionary<string, Vintagestory.API.Client.HotKey>;
+using Komet.Api;
 using Vintagestory.Client;
 using Vintagestory.Client.NoObf;
 using static Komet.Options.KometPages;
 
 namespace Komet.Options;
 
-// GuiCompositeSettings.OnControlOptions and the mouse tab's mouse actions (Vintage Story 1.22.7) as one page. Keys take effect at
-// once, as in the game; the switch of the locked modifiers waits for Apply like every other.
+// OnControlOptions and the mouse tab (1.22.7) as one page. Keys apply at once; the locked-modifiers switch waits for
+// Apply.
 internal static partial class EngineOptions
 {
     private const int MaxKeys = OptionPage.MaxRows - 16; // the headings, the switch and the buttons besides
 
-    // The game's sortOrder and titles; the second creative kind shares the first's heading
     private static readonly (HotkeyType Type, string Title)[] KeyKinds =
     [
         (HotkeyType.MovementControls, "Movement controls"), (HotkeyType.MouseModifiers, "Mouse click modifiers"),
@@ -21,11 +21,9 @@ internal static partial class EngineOptions
         (HotkeyType.MouseControls, "mouseactions")
     ];
 
-    // The hotkeys a change of which the game announces (its ShiftOrCtrlChanged)
     private static readonly string[] Announced = ["shift", "ctrl", "primarymouse", "secondarymouse", "toolmodeselect"];
 
-    // null without a game running (the tests)
-    private static KeyMap? HotKeys => ScreenManager.hotkeyManager?.HotKeys;
+    private static KeyMap? HotKeys => ScreenManager.hotkeyManager?.HotKeys; // null without a running game (tests)
 
     private static Dictionary<string, string>? _clashes; // code -> the name of another key bound the same; rebuilt after each change
     private static bool _armed; // the reset asked once and waits for its second click
@@ -71,8 +69,7 @@ internal static partial class EngineOptions
         return _clashes.TryGetValue(code, out var other) ? other : "";
     }
 
-    // The game's check: keys of the listed kinds bound alike, except a mouse modifier beside sneak or sprint (the same key by design).
-    // The game compares the shown text; the parts it is made of say the same without naming every key
+    // The game's clash check (a mouse modifier beside sneak/sprint is by design), comparing parts, not shown text.
     private static Dictionary<string, string> Clashes()
     {
         Dictionary<string, string> clashes = [];
@@ -102,7 +99,7 @@ internal static partial class EngineOptions
         return modifier.KeyCombinationType == HotkeyType.MouseModifiers && other.Code is "sneak" or "sprint";
     }
 
-    // The game's CompletedCapture: shift and ctrl follow sneak and sprint while the modifiers are locked to them
+    // The game's CompletedCapture: shift and ctrl follow sneak and sprint while locked
     internal static void Bind(string code, KeyCombination? combination)
     {
         if (HotKeys is not { } keys || combination is null || !NotNull(code) || !keys.TryGetValue(code, out var key)) return;
@@ -123,7 +120,6 @@ internal static partial class EngineOptions
             Bind(code, fallback.Clone());
     }
 
-    // The game's OnConfirmReset, on the second click
     private static void ResetKeys()
     {
         var keys = HotKeys;
@@ -144,7 +140,6 @@ internal static partial class EngineOptions
         (_capi?.Event as ClientEventAPI)?.TriggerHotkeysChanged();
     }
 
-    // The game's onSeparateCtrl
     private static void Locked(bool locked)
     {
         if (HotKeys is not { } keys) return;

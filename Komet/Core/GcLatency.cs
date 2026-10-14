@@ -2,10 +2,8 @@ using System.Runtime;
 
 namespace Komet.Core;
 
-// The collector's latency mode, the one GC setting a running game can change (the others are read from the launch environment):
-// SustainedLowLatency keeps full collections in the background. Under the game's Interactive mode a gen2 that judged the heap
-// fragmented compacted it with every thread stopped: 2.75 s with 5.2 GB live at view distance 1536 while flying. The runtime still
-// blocks when the machine runs short of memory, so this only removes the optional stop. Off restores the mode found.
+// Under Interactive a fragmented gen2 compacted with all threads stopped (2.75 s at 5.2 GB, view distance 1536),
+// SustainedLowLatency keeps it in the background. The one GC setting changeable at runtime; Off restores.
 internal static class GcLatency
 {
     private static GCLatencyMode? _before;

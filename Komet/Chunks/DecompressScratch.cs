@@ -1,17 +1,14 @@
 using System.Reflection;
 using System.Reflection.Emit;
 using HarmonyLib;
+using Komet.Core;
 using Vintagestory.Common;
 
 namespace Komet.Chunks;
 
-// Every chunk layer the tesselator, the network thread or the server unpacks goes through Compression.DecompressCombined, which
-// decompresses the block planes with ICompression.Decompress. For zstd that fills the thread's reusable buffer and hands back an
-// exact-size copy of it (CompressionZSTD.Decompress -> ArrayConvert.ByteToByte). The copy is read twice - the length check and
-// ByteToIntArrays into the int[1024] slices - and dropped: 8 MB/s of garbage while chunks stream in. The rewrite hands the method
-// the thread's buffer itself and answers the length check with the decompressed size instead of the array's length, which keeps
-// the InvalidDataException for short data. Between the two nothing compresses on this thread: ByteToIntArrays only asks the pool
-// (ChunkDataPool.NewData) for slices before it copies.
+// DecompressCombined (every chunk unpack) gets an exact-size zstd copy of the thread buffer (ByteToByte), reads it
+// twice and drops it: 8 MB/s garbage while streaming. The rewrite passes the buffer and answers the length check with
+// the decompressed size; safe, nothing decompresses on this thread before ByteToIntArrays copies.
 internal static class DecompressScratch
 {
     private const int MaxInstructions = 1024;
@@ -38,9 +35,7 @@ internal static class DecompressScratch
         return NotNull(method) && Assert(method.ReturnType == typeof(int[])) ? method : null;
     }
 
-    // callvirt ICompression.Decompress(byte[], int, int); dup; ldlen; conv.i4 - exactly once, and the array consumed by exactly one
-    // ByteToIntArrays with no other call in between but the exception's constructor, and nothing that could keep it: no store, no second
-    // dup, no return. Anything else hands back the engine's IL.
+    // Expects Decompress(byte[], int, int); dup; ldlen; conv.i4 once, then into ByteToIntArrays (Stop); else engine IL
     internal static List<CodeInstruction> Rewrite(IEnumerable<CodeInstruction> instructions)
     {
         Rewritten = false;
@@ -58,15 +53,13 @@ internal static class DecompressScratch
         var stop = Stop(code, at + 4, consume);
         // Running off the body's end is logged, stopping is not
         if (!Index(stop, code.Count) || !code[stop].Calls(consume)) return code;
-        // The length first, since on its own it answers every array with its length as ldlen does; conv.i4 after it is a no-op on an int
+        // Length first (alone it answers any ldlen); conv.i4 after it is a no-op on an int
         Rewritten = Assert(Il.Substitute(code, at + 2, length)) && Assert(Il.Substitute(code, at, mine));
         return code;
     }
 
-    // Where the walk from `from` stops: at ByteToIntArrays, at any other call but the throw's new InvalidDataException(), or at anything
-    // that could keep the array - a store, a dup, a return: the engine's copy could be read later, the thread's buffer is overwritten
-    // by the next decompression on this thread, so it may only go from the length check straight into ByteToIntArrays. code.Count when
-    // the body ends first.
+    // Walk stops at ByteToIntArrays, any call but new InvalidDataException(), or what could keep the array (store, dup,
+    // return): the buffer is overwritten by the next decompression. code.Count if the body ends.
     private static int Stop(List<CodeInstruction> code, int from, MethodInfo consume)
     {
         if (!NotNull(consume) || !Assert(from > 0)) return code.Count;
@@ -83,8 +76,7 @@ internal static class DecompressScratch
         return code.Count;
     }
 
-    // Stands in for compression.Decompress(data, offset, length). Only zstd's Decompress is known to be DecompressAndSize plus a copy,
-    // so anything else - and an out-of-range size, which the engine's copy rejects with its own exception - takes the engine's call.
+    // zstd only (DecompressAndSize plus a copy); other codecs and bad sizes take the engine's call
     internal static byte[] Decompress(ICompression compression, byte[] data, int offset, int length)
     {
         if (!Enabled || !NotNull(compression) || compression.GetType() != typeof(CompressionZSTD))
@@ -98,7 +90,7 @@ internal static class DecompressScratch
         return buffer;
     }
 
-    // Stands in for the length check's ldlen: the decompressed size for the buffer handed out above, the array's length otherwise
+    // Replaces the length check's ldlen: decompressed size for the buffer handed out above, else the array's length
     internal static int Length(byte[] array)
     {
         if (!NotNull(array) || !ReferenceEquals(array, _buffer)) return array.Length; // null throws here as ldlen would

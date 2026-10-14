@@ -29,8 +29,7 @@ internal sealed unsafe class Samplers(IntPtr device) : IDisposable
         };
     }
 
-    // The state after one glTexParameter: the parameters FromGl reads (and the border colour's red) change it, the ones it
-    // does not read (wrapping T and R, the compare function, anisotropy) leave it; null for any other, whose effect it cannot say
+    // State after one glTexParameter: FromGl's parameters (and border red) change it, others keep it; null if unknown
     public static State? Tuned(State state, uint name, float value)
     {
         var v = (int)value;

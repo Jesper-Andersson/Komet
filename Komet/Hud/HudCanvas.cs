@@ -1,4 +1,5 @@
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.InteropServices;
 using System.Text;
 using Cairo;
 
@@ -9,39 +10,73 @@ internal readonly record struct Rgba(double R, double G, double B, double A)
     public static Rgba White(double alpha) => new(1, 1, 1, Assert(alpha is >= 0 and <= 1) ? alpha : 1);
 }
 
-internal sealed class HudCanvas(ICoreClientAPI capi) : IDisposable
+// Draws recorded on the main thread, painted by Cairo at End() there or (background) on a worker; the main thread only
+// uploads. A page not yet painted when a newer one ends is dropped.
+internal sealed class HudCanvas(ICoreClientAPI capi, bool background = false) : IDisposable
 {
     public const int GraphFrames = 240;
-    private const int SizeStep = 32, MaxSize = 16384, MaxGridLines = MaxSize / 8;
+    private const int SizeStep = 32, MaxSize = 16384, MaxGridLines = MaxSize / 8, MaxCmds = 1 << 16;
 
-    // The options screen's and the update check's colours
     public static readonly Rgba Accent = new(0.16, 0.45, 0.85, 1), Warning = new(1.0, 0.72, 0.25, 1), Error = new(1.0, 0.38, 0.35, 1),
         Good = new(0.35, 0.75, 0.45, 1);
 
     private static readonly Rgba GridLine = Rgba.White(0.07), GridMajor = Rgba.White(0.18);
+    private static readonly FontOptions Subpixel = new() { Antialias = Antialias.Subpixel }; // what CairoFont.SetupContext sets
 
-    private Context? _ctx;
-    private CairoFont? _font; // set up on _ctx since Begin() or BeginMeasure()
+    private enum Op : byte { Fill, Text, Line, Polyline, Area, Circle, Arc, Triangle, Caret, Clip, Unclip, Outline }
 
+    private readonly record struct Cmd(Op Op, double A, double B, double C = 0, double D = 0, double E = 0, double F = 0,
+        Rgba Color = default, CairoFont? Font = null, string? Text = null, int From = 0, int Count = 0, bool Flag = false);
+
+    private sealed class Page
+    {
+        public readonly List<Cmd> Cmds = [];
+        public readonly List<double> Points = [];
+        public double W, H;
+        public object? Tag; // what goes with the picture (a dialog's click map)
+    }
+
+    private Page _page = new();
+    private Page? _next, _busy, _spare; // waiting to be painted, being painted, free
+    private Task? _job;
+
+    private Context? _ctx; // the painter's: the worker's while a job runs
     private ImageSurface? _surface;
+    private CairoFont? _font;
+    private byte[] _text = new byte[256];
+
+    private Context? _measure; // the main thread's
+    private ImageSurface? _measureSurface;
+    private CairoFont? _measureFont; // set up on _measure since Blank() or BeginMeasure()
+    private byte[] _utf8 = new byte[256];
+
     private LoadedTexture _texture = new(capi);
     private readonly Vintagestory.API.MathTools.Vec4f _tint = new();
-    private byte[] _utf8 = new byte[256]; // the text for Cairo, used by whichever thread draws this canvas
 
     public double Width { get; private set; }
     public double Height { get; private set; }
     public double X { get; private set; }
     public double Y { get; private set; }
 
-    public bool Ready => _texture.TextureId != 0; // End() has uploaded at least once
+    public bool Ready
+    {
+        get
+        {
+            if (background) Pump();
+            return _texture.TextureId != 0;
+        }
+    }
 
     public void Dispose()
     {
+        if (_job is not null) _ = ((IAsyncResult)_job).AsyncWaitHandle.WaitOne(); // a worker still painting into the surface
         _texture.Dispose();
         Release();
+        _measure?.Dispose();
+        _measureSurface?.Dispose();
+        (_measure, _measureSurface, _measureFont) = (null, null, null);
     }
 
-    // The CPU side, width x height x 4 bytes; Draw() needs only the texture, and the next Begin() or BeginMeasure() makes a new one
     private void Release()
     {
         _ctx?.Dispose();
@@ -49,179 +84,160 @@ internal sealed class HudCanvas(ICoreClientAPI capi) : IDisposable
         (_ctx, _surface, _font) = (null, null, null);
     }
 
-    // A measure pass starts here: the fonts may have been resized since the context last set one up
     public void BeginMeasure()
     {
-        if (_ctx is null || _surface is null) Surface(SizeStep, SizeStep);
-        _font = null;
+        if (_measure is null)
+        {
+            _measureSurface = new ImageSurface(Format.Argb32, SizeStep, SizeStep);
+            _measure = new Context(_measureSurface);
+        }
+
+        _measureFont = null;
     }
 
-    // On this canvas's context with the drawing's font: CairoFont.GetTextExtents runs SetupContext on every call, slower and allocating
+    // GetTextExtents runs SetupContext per call, slow and allocating
     public double TextWidth(CairoFont font, string text)
     {
-        if (text.Length == 0 || !NotNull(_ctx) || !Assert(font.UnscaledFontsize > 0)) return 0;
-        _ = Use(font);
-        return _ctx.TextExtents(Utf8(text)).XAdvance;
+        if (text.Length == 0 || !Assert(font.UnscaledFontsize > 0)) return 0;
+        if (_measure is null) BeginMeasure();
+        if (!ReferenceEquals(font, _measureFont)) Setup(_measure!, font);
+        _measureFont = font;
+        return _measure!.TextExtents(Utf8(ref _utf8, text)).XAdvance;
+    }
+
+    // The longest start of text that fits width with an ellipsis (whole if it fits). trimmed: at least one character, and
+    // no space before the ellipsis (the options screen's rows).
+    public string Fit(CairoFont font, string text, double width, bool trimmed = false)
+    {
+        if (!NotNull(font) || !NotNull(text) || !Finite(width)) return text ?? "";
+        if (text.Length == 0 || TextWidth(font, text) <= width) return text;
+        var (lo, hi) = (0, text.Length);
+        for (var step = 0; step < 16 && lo < hi; step++)
+        {
+            var mid = (lo + hi + 1) / 2;
+            if (TextWidth(font, text[..mid] + "…") <= width) lo = mid;
+            else hi = mid - 1;
+        }
+
+        if (!Assert(lo <= text.Length)) return text;
+        return trimmed ? text[..Math.Max(1, lo)].TrimEnd() + "…" : text[..lo] + "…";
+    }
+
+    // Greedy wrap of one paragraph at its spaces, at most maxWords words: a line takes words while it fits width (a lone
+    // word wider than that stays whole)
+    public void Wrap(CairoFont font, string paragraph, double width, int maxWords, List<string> into)
+    {
+        if (!NotNull(paragraph) || !NotNull(into) || !Assert(maxWords > 0)) return;
+        var line = "";
+        foreach (var word in paragraph.Split(' ').Bounded(maxWords))
+        {
+            var next = line.Length == 0 ? word : line + " " + word;
+            if (line.Length > 0 && TextWidth(font, next) > width)
+            {
+                into.Add(line);
+                next = word;
+            }
+
+            line = next;
+        }
+
+        into.Add(line);
     }
 
     public bool Contains(double px, double py) =>
         Finite(px) && Finite(py) && px >= X && px < X + Width && py >= Y && py < Y + Height;
 
-    public void Begin(double width, double height)
+    public bool Blank(double width, double height)
     {
-        if (!Assert(width > 0) || !Assert(height > 0) || !Assert(width <= MaxSize) ||
-            !Assert(height <= MaxSize)) return;
-        (Width, Height) = (width, height);
-        _font = null; // before anything below can return: a new context has no font set up
-        int w = RoundUp(width), h = RoundUp(height);
-        if (_ctx is null || _surface is null || _surface.Width != w || _surface.Height != h) Surface(w, h);
-        if (!Assert(_surface.Status == Status.Success) || !Source(default)) return;
-        _ctx.Operator = Operator.Source;
-        _ctx.Paint();
-        _ctx.Operator = Operator.Over;
+        if (!Assert(width > 0) || !Assert(height > 0) || !Assert(width <= MaxSize) || !Assert(height <= MaxSize)) return false;
+        (_page.W, _page.H, _measureFont) = (width, height, null);
+        _page.Cmds.Clear();
+        _page.Points.Clear();
+        return true;
     }
 
-    // A straight line; dash > 0 draws it dashed (the mockup's guide lines)
+    private void Add(in Cmd cmd)
+    {
+        if (Assert(_page.W > 0) && Assert(_page.Cmds.Count < MaxCmds)) _page.Cmds.Add(cmd); // W 0: a draw without Blank()
+    }
+
     public void Line(double x1, double y1, double x2, double y2, Rgba color, double width = 1, double dash = 0)
     {
-        if (!Finite(x1 + y1 + x2 + y2) || !Assert(width > 0) || !Source(color)) return;
-        _ctx.LineWidth = width;
-        if (dash > 0) _ctx.SetDash([dash, dash], 0);
-        _ctx.MoveTo(x1, y1);
-        _ctx.LineTo(x2, y2);
-        _ctx.Stroke();
-        if (dash > 0) _ctx.SetDash([], 0);
+        if (Finite(x1 + y1 + x2 + y2) && Assert(width > 0)) Add(new(Op.Line, x1, y1, x2, y2, width, dash, color));
     }
 
-    // count points through at; NaN y leaves a gap
-    public void Polyline(int count, System.Func<int, (double X, double Y)> at, Rgba color, double width)
+    // Gradient area from fill to clear (NaN y: bottom) and the line (NaN y: gap)
+    public void Graph(int count, System.Func<int, (double X, double Y)> at, (double Top, double Bottom) span, Rgba fill,
+        (Rgba Color, double Width) line)
     {
-        if (!NotNull(at) || !Assert(count is >= 0 and <= MaxSize) || count < 2 || !Source(color)) return;
-        var open = false;
+        if (!NotNull(at) || !Assert(count is >= 0 and <= MaxSize) || count < 2 || !Assert(span.Bottom > span.Top)) return;
+        var from = Points(count, at);
+        Add(new(Op.Area, span.Top, span.Bottom, Color: fill, From: from, Count: count));
+        Add(new(Op.Polyline, 0, 0, E: line.Width, Color: line.Color, From: from, Count: count));
+    }
+
+    private int Points(int count, System.Func<int, (double X, double Y)> at)
+    {
+        var from = _page.Points.Count;
         for (var i = 0; i < Math.Min(count, MaxSize); i++)
         {
             var (px, py) = at(i);
-            if (!double.IsFinite(py)) open = false;
-            else if (!open) (open, _) = (true, Move(px, py));
-            else _ctx.LineTo(px, py);
+            _page.Points.Add(px);
+            _page.Points.Add(py);
         }
 
-        _ctx.LineWidth = width;
-        _ctx.Stroke();
-    }
-
-    // The area under count points down to bottom, a gradient from color at top to clear at bottom; NaN y counts as the bottom
-    public void Area(int count, System.Func<int, (double X, double Y)> at, double top, double bottom, Rgba color)
-    {
-        if (!NotNull(at) || !NotNull(_ctx) || !Assert(count is >= 0 and <= MaxSize) || count < 2 || !Assert(bottom > top)) return;
-        var (x0, _) = at(0);
-        _ctx.MoveTo(x0, bottom);
-        var last = x0;
-        for (var i = 0; i < Math.Min(count, MaxSize); i++)
-        {
-            var (px, py) = at(i);
-            _ctx.LineTo(px, double.IsFinite(py) ? py : bottom);
-            last = px;
-        }
-
-        _ctx.LineTo(last, bottom);
-        _ctx.ClosePath();
-        using var gradient = new LinearGradient(0, top, 0, bottom);
-        _ = gradient.AddColorStop(0, new Color(color.R, color.G, color.B, color.A));
-        _ = gradient.AddColorStop(1, new Color(color.R, color.G, color.B, 0));
-        _ctx.SetSource(gradient);
-        _ctx.Fill();
-    }
-
-    private bool Move(double x, double y)
-    {
-        if (!NotNull(_ctx) || !Finite(x + y)) return false;
-        _ctx.MoveTo(x, y);
-        return true;
+        return from;
     }
 
     public void Circle(double cx, double cy, double r, Rgba color)
     {
-        if (!Finite(cx + cy) || !Assert(r > 0) || !Source(color)) return;
-        _ctx.Arc(cx, cy, r, 0, 2 * Math.PI);
-        _ctx.Fill();
+        if (Finite(cx + cy) && Assert(r > 0)) Add(new(Op.Circle, cx, cy, r, Color: color));
     }
 
-    // A warning sign: a filled triangle pointing up, its box size wide
+    public void Arc(double cx, double cy, double r, double from, double to, Rgba color, double width)
+    {
+        if (Finite(cx + cy + from + to) && Assert(r > 0) && Assert(width > 0)) Add(new(Op.Arc, cx, cy, r, from, to, width, color));
+    }
+
     public void Triangle(double x, double y, double size, Rgba color)
     {
-        if (!Finite(x + y) || !Assert(size > 0) || !Source(color)) return;
-        _ctx.MoveTo(x + size / 2, y);
-        _ctx.LineTo(x + size, y + size);
-        _ctx.LineTo(x, y + size);
-        _ctx.ClosePath();
-        _ctx.Fill();
+        if (Finite(x + y) && Assert(size > 0)) Add(new(Op.Triangle, x, y, size, Color: color));
     }
 
-    // A disclosure caret in a box of size: pointing right when closed, down when open
     public void Caret(double x, double y, double size, bool down, Rgba color)
     {
-        if (!Finite(x + y) || !Assert(size > 0) || !Source(color)) return;
-        _ctx.MoveTo(x, y);
-        if (down) _ctx.LineTo(x + size, y);
-        else _ctx.LineTo(x + size, y + size / 2);
-        _ctx.LineTo(down ? x + size / 2 : x, y + size);
-        _ctx.ClosePath();
-        _ctx.Fill();
+        if (Finite(x + y) && Assert(size > 0)) Add(new(Op.Caret, x, y, size, Color: color, Flag: down));
     }
 
     public void Text(double x, double y, double rowHeight, CairoFont font, string text, Rgba? color = null)
     {
-        if (text.Length == 0 || !NotNull(_ctx) || !Finite(x) || !Finite(y) || !Assert(rowHeight > 0)) return;
-        if (!Use(font) && color is null) FontColor(font.Color);
-
-        if (color is { } c && !Source(c)) return;
-        var extents = _ctx.FontExtents;
-        _ctx.MoveTo(x, y + (rowHeight - extents.Height * font.LineHeightMultiplier) / 2 + extents.Ascent);
-        _ctx.ShowText(Utf8(text));
+        if (text.Length > 0 && NotNull(font) && Finite(x) && Finite(y) && Assert(rowHeight > 0))
+            Add(new(Op.Text, x, y, rowHeight, Color: color ?? default, Font: font, Text: text, Flag: color is not null));
     }
 
     public void Fill(double x, double y, double width, double height, Rgba color, double radius = 0)
     {
-        if (!Finite(x) || !Finite(y) || !Assert(width >= 0) || !Assert(height >= 0) || !Assert(radius >= 0) ||
-            !Source(color)) return;
-        RoundRectangle(_ctx, x, y, width, height, radius);
-        _ctx.Fill();
-    }
-
-    // False when Begin() refused the size
-    public bool Blank(double width, double height)
-    {
-        Begin(width, height);
-        return Assert(Width >= width) && Assert(Height >= height);
+        if (Finite(x) && Finite(y) && Assert(width >= 0) && Assert(height >= 0) && Assert(radius >= 0))
+            Add(new(Op.Fill, x, y, width, height, radius, Color: color));
     }
 
     public void Clip(double x, double y, double width, double height)
     {
-        if (!NotNull(_ctx) || !Assert(width >= 0) || !Assert(height >= 0)) return;
-        _ctx.Rectangle(x, y, width, height);
-        _ctx.Clip();
+        if (Assert(width >= 0) && Assert(height >= 0)) Add(new(Op.Clip, x, y, width, height));
     }
 
-    public void Unclip()
-    {
-        if (NotNull(_ctx)) _ctx.ResetClip();
-    }
+    public void Unclip() => Add(new(Op.Unclip, 0, 0));
 
     public void Outline(double x, double y, double width, double height, Rgba color)
     {
-        if (!Finite(x) || !Finite(y) || !Assert(width > 1) || !Assert(height > 1) || !Source(color)) return;
-        RoundRectangle(_ctx, x + 0.5, y + 0.5, width - 1, height - 1, 0);
-        _ctx.LineWidth = 1;
-        _ctx.Stroke();
+        if (Finite(x) && Finite(y) && Assert(width > 1) && Assert(height > 1)) Add(new(Op.Outline, x, y, width, height, Color: color));
     }
 
     public static HudCanvas Grid(ICoreClientAPI capi, double step)
     {
         var canvas = new HudCanvas(capi);
         double width = capi.Render.FrameWidth, height = capi.Render.FrameHeight;
-        if (!Assert(step > 0) || !Assert(width > 0) || !Assert(height > 0)) return canvas;
-        canvas.Begin(width, height);
+        if (!Assert(step > 0) || !Assert(width > 0) || !Assert(height > 0) || !canvas.Blank(width, height)) return canvas;
         for (var i = 0; i < Math.Min((int)(width / step) + 1, MaxGridLines); i++)
             canvas.Fill(i * step, 0, 1, height, i % 4 == 0 ? GridMajor : GridLine);
         for (var i = 0; i < Math.Min((int)(height / step) + 1, MaxGridLines); i++)
@@ -231,13 +247,183 @@ internal sealed class HudCanvas(ICoreClientAPI capi) : IDisposable
         return canvas;
     }
 
-    public void End()
+    // A background canvas shows the last page a while after End()
+    public object? Shown { get; private set; }
+
+    public bool Holds(object tag) =>
+        NotNull(tag) && (ReferenceEquals(Shown, tag) || ReferenceEquals(_next?.Tag, tag) || ReferenceEquals(_busy?.Tag, tag));
+
+    public void End(object? tag = null)
     {
-        if (!NotNull(_surface) || !Assert(Width > 0)) return; // End() without Begin()
-        capi.Gui.LoadOrUpdateCairoTexture(_surface, false, ref _texture);
+        if (!Assert(_page.W > 0)) return; // End() without Blank()
+        _page.Tag = tag;
+        if (!background)
+        {
+            Paint(_page);
+            Upload(_page);
+            return;
+        }
+
+        var free = _next ?? _spare ?? new Page();
+        if (ReferenceEquals(free, _spare)) _spare = null;
+        (_next, _page) = (_page, free);
+        Pump();
     }
 
-    // z: the depth among the GUI's own draws (the hotbar's item stacks sit above the default)
+    private void Pump()
+    {
+        if (_job is { IsCompleted: true } done)
+        {
+            if (Assert(done.IsCompletedSuccessfully) && NotNull(_busy)) Upload(_busy);
+            (_spare, _busy, _job) = (_busy, null, null);
+        }
+
+        if (_job is not null || _next is not { } next) return;
+        (_busy, _next) = (next, null);
+        _job = Task.Run(() => Paint(next));
+    }
+
+    private void Upload(Page page)
+    {
+        if (!NotNull(_surface)) return;
+        capi.Gui.LoadOrUpdateCairoTexture(_surface, false, ref _texture);
+        (Width, Height, Shown) = (page.W, page.H, page.Tag);
+    }
+
+    private void Paint(Page page)
+    {
+        int w = RoundUp(page.W), h = RoundUp(page.H);
+        if (_ctx is null || _surface is null || _surface.Width != w || _surface.Height != h) Surface(w, h);
+        if (!Assert(_surface.Status == Status.Success)) return;
+        var ctx = _ctx;
+        _font = null; // a new page may come with resized fonts
+        ctx.Operator = Operator.Source;
+        ctx.SetSourceRGBA(0, 0, 0, 0);
+        ctx.Paint();
+        ctx.Operator = Operator.Over;
+        var cmds = CollectionsMarshal.AsSpan(page.Cmds);
+        var points = CollectionsMarshal.AsSpan(page.Points);
+        for (var i = 0; i < Math.Min(cmds.Length, MaxCmds); i++) Paint(ctx, cmds[i], points);
+        ctx.ResetClip();
+        _surface.Flush();
+    }
+
+    private void Paint(Context ctx, in Cmd c, ReadOnlySpan<double> points)
+    {
+        if (c.Op is not (Op.Text or Op.Clip or Op.Unclip)) Source(ctx, c.Color);
+        switch (c.Op)
+        {
+            case Op.Fill:
+                RoundRectangle(ctx, c.A, c.B, c.C, c.D, c.E);
+                ctx.Fill();
+                break;
+            case Op.Text:
+                Text(ctx, c);
+                break;
+            case Op.Line:
+                Line(ctx, c);
+                break;
+            case Op.Polyline:
+                Polyline(ctx, c, points.Slice(c.From, 2 * c.Count));
+                break;
+            case Op.Area:
+                Area(ctx, c, points.Slice(c.From, 2 * c.Count));
+                break;
+            case Op.Circle:
+                ctx.Arc(c.A, c.B, c.C, 0, 2 * Math.PI);
+                ctx.Fill();
+                break;
+            case Op.Arc:
+                ctx.LineWidth = c.F;
+                ctx.NewPath();
+                ctx.Arc(c.A, c.B, c.C, c.D, c.E);
+                ctx.Stroke();
+                break;
+            case Op.Triangle:
+                ctx.MoveTo(c.A + c.C / 2, c.B);
+                ctx.LineTo(c.A + c.C, c.B + c.C);
+                ctx.LineTo(c.A, c.B + c.C);
+                ctx.ClosePath();
+                ctx.Fill();
+                break;
+            case Op.Caret:
+                ctx.MoveTo(c.A, c.B);
+                ctx.LineTo(c.A + c.C, c.Flag ? c.B : c.B + c.C / 2);
+                ctx.LineTo(c.Flag ? c.A + c.C / 2 : c.A, c.B + c.C);
+                ctx.ClosePath();
+                ctx.Fill();
+                break;
+            case Op.Clip:
+                ctx.Rectangle(c.A, c.B, c.C, c.D);
+                ctx.Clip();
+                break;
+            case Op.Unclip:
+                ctx.ResetClip();
+                break;
+            case Op.Outline:
+                RoundRectangle(ctx, c.A + 0.5, c.B + 0.5, c.C - 1, c.D - 1, 0);
+                ctx.LineWidth = 1;
+                ctx.Stroke();
+                break;
+        }
+    }
+
+    private static void Line(Context ctx, in Cmd c)
+    {
+        ctx.LineWidth = c.E;
+        if (c.F > 0) ctx.SetDash([c.F, c.F], 0);
+        ctx.MoveTo(c.A, c.B);
+        ctx.LineTo(c.C, c.D);
+        ctx.Stroke();
+        if (c.F > 0) ctx.SetDash([], 0);
+    }
+
+    private void Text(Context ctx, in Cmd c)
+    {
+        var font = c.Font!;
+        var setUp = !ReferenceEquals(font, _font);
+        if (setUp) Setup(ctx, font);
+        _font = font;
+        if (c.Flag) Source(ctx, c.Color);
+        else if (!setUp) FontColor(ctx, font.Color);
+        var extents = ctx.FontExtents;
+        ctx.MoveTo(c.A, c.B + (c.C - extents.Height * font.LineHeightMultiplier) / 2 + extents.Ascent);
+        ctx.ShowText(Utf8(ref _text, c.Text!));
+    }
+
+    private static void Polyline(Context ctx, in Cmd c, ReadOnlySpan<double> xy)
+    {
+        var open = false;
+        for (var i = 0; i < Math.Min(xy.Length - 1, 2 * MaxSize); i += 2)
+        {
+            if (!double.IsFinite(xy[i + 1])) open = false;
+            else if (open) ctx.LineTo(xy[i], xy[i + 1]);
+            else if (double.IsFinite(xy[i]))
+            {
+                ctx.MoveTo(xy[i], xy[i + 1]);
+                open = true;
+            }
+        }
+
+        ctx.LineWidth = c.E;
+        ctx.Stroke();
+    }
+
+    private static void Area(Context ctx, in Cmd c, ReadOnlySpan<double> xy)
+    {
+        ctx.MoveTo(xy[0], c.B);
+        for (var i = 0; i < Math.Min(xy.Length - 1, 2 * MaxSize); i += 2)
+            ctx.LineTo(xy[i], double.IsFinite(xy[i + 1]) ? xy[i + 1] : c.B);
+        ctx.LineTo(xy[^2], c.B);
+        ctx.ClosePath();
+        using var gradient = new LinearGradient(0, c.A, 0, c.B);
+        _ = gradient.AddColorStop(0, new Color(c.Color.R, c.Color.G, c.Color.B, c.Color.A));
+        _ = gradient.AddColorStop(1, new Color(c.Color.R, c.Color.G, c.Color.B, 0));
+        ctx.SetSource(gradient);
+        ctx.Fill();
+    }
+
+    // z: depth among the GUI's draws (the hotbar's item stacks sit above the default)
     public void Draw(double x, double y, float z = 50)
     {
         if (!Finite(x) || !Finite(y) || !Assert(_texture.TextureId != 0) || !Assert(_texture.Width >= Width)) return;
@@ -246,11 +432,10 @@ internal sealed class HudCanvas(ICoreClientAPI capi) : IDisposable
         capi.Render.Render2DTexturePremultipliedAlpha(_texture.TextureId, X, Y, _texture.Width, _texture.Height, z);
     }
 
-    // Where Draw puts it: inside the frame
     public (double X, double Y) Within(double x, double y) => !Finite(x + y) ? (0, 0) :
         (Math.Clamp(x, 0, Math.Max(0, capi.Render.FrameWidth - Width)), Math.Clamp(y, 0, Math.Max(0, capi.Render.FrameHeight - Height)));
 
-    // Faded by alpha and scaled about its centre, the windows' opening; X and Y stay where a click lands
+    // Faded and scaled about its centre (window opening); X and Y stay where a click lands
     public void Fade(double x, double y, float z, double alpha, double scale)
     {
         if (!Finite(alpha + scale) || !Assert(scale > 0) || !Assert(_texture.TextureId != 0)) return;
@@ -262,7 +447,7 @@ internal sealed class HudCanvas(ICoreClientAPI capi) : IDisposable
             z, _tint);
     }
 
-    // This canvas stretched over a box and tinted: on a plain white canvas a quad of any colour (premultiplied: the colour times alpha)
+    // Premultiplied tint over a white canvas: a quad of any colour
     public void Stretch(double x, double y, double w, double h, float z, Rgba color)
     {
         if (!Finite(x + y) || w <= 0 || h <= 0 || color.A <= 0 || !Assert(_texture.TextureId != 0)) return;
@@ -270,7 +455,6 @@ internal sealed class HudCanvas(ICoreClientAPI capi) : IDisposable
         capi.Render.Render2DTexturePremultipliedAlpha(_texture.TextureId, x, y, w, h, z, _tint);
     }
 
-    // Where it is put, partly off the frame too: a list taller than its view, moved by its scroll under a scissor
     public void Place(double x, double y, float z)
     {
         if (!Finite(x) || !Finite(y) || !Assert(_texture.TextureId != 0)) return;
@@ -278,59 +462,51 @@ internal sealed class HudCanvas(ICoreClientAPI capi) : IDisposable
         capi.Render.Render2DTexturePremultipliedAlpha(_texture.TextureId, X, Y, _texture.Width, _texture.Height, z);
     }
 
-    // CairoFont.SetupContext sets size and face and allocates a finalizable FontOptions every call; a panel measures and draws a few
-    // hundred strings in three fonts, so the context keeps the last one. True when it set the font up, colour included.
-    private bool Use(CairoFont font)
+    // SetupContext without a finalizable FontOptions per call and without writing the font (measured on main while a
+    // worker paints); each context keeps the last font
+    private static void Setup(Context ctx, CairoFont font)
     {
-        if (ReferenceEquals(font, _font) || !NotNull(_ctx)) return false;
-        font.SetupContext(_ctx);
-        _font = font;
-        return true;
+        ctx.SetFontSize(scaled(font.UnscaledFontsize));
+        ctx.SelectFontFace(font.Fontname, font.Slant, font.FontWeight);
+        ctx.FontOptions = Subpixel;
+        FontColor(ctx, font.Color);
     }
 
     [MemberNotNull(nameof(_ctx), nameof(_surface))]
     private void Surface(int width, int height)
     {
-        _ctx?.Dispose();
-        _surface?.Dispose();
+        Release();
         _surface = new ImageSurface(Format.Argb32, width, height);
         _ctx = new Context(_surface);
         _ = Assert(width <= MaxSize && height <= MaxSize);
     }
 
-    // ShowText(string) and TextExtents(string) encode into a new array on every call; an array that ends in 0 they take as it is,
-    // and Cairo reads it up to the first 0
-    private byte[] Utf8(string text)
+    // ShowText/TextExtents(string) allocate per call; a 0-terminated array is taken as is. One buffer per thread.
+    private static byte[] Utf8(ref byte[] buffer, string text)
     {
         var need = Encoding.UTF8.GetMaxByteCount(text.Length) + 1;
-        if (_utf8.Length < need) _utf8 = new byte[Math.Max(need, 2 * _utf8.Length)];
-        var n = Encoding.UTF8.GetBytes(text, _utf8);
-        (_utf8[n], _utf8[^1]) = (0, 0);
-        return Assert(n < _utf8.Length) ? _utf8 : [0];
+        if (buffer.Length < need) buffer = new byte[Math.Max(need, 2 * buffer.Length)];
+        var n = Encoding.UTF8.GetBytes(text, buffer);
+        (buffer[n], buffer[^1]) = (0, 0);
+        return Assert(n < buffer.Length) ? buffer : [0];
     }
 
-    // What SetupContext sets from the font: RGB or RGBA, nothing for a font without a colour
-    private void FontColor(double[]? color)
+    private static void FontColor(Context ctx, double[]? color)
     {
-        if (!NotNull(_ctx) || !Assert(color is null or { Length: 3 or 4 })) return;
-        if (color is [var r, var g, var b]) _ctx.SetSourceRGB(r, g, b);
-        else if (color is [var r4, var g4, var b4, var a]) _ctx.SetSourceRGBA(r4, g4, b4, a);
+        if (!Assert(color is null or { Length: 3 or 4 })) return;
+        if (color is [var r, var g, var b]) ctx.SetSourceRGB(r, g, b);
+        else if (color is [var r4, var g4, var b4, var a]) ctx.SetSourceRGBA(r4, g4, b4, a);
     }
 
-    [MemberNotNullWhen(true, nameof(_ctx))]
-    private bool Source(Rgba color)
-    {
-        if (!NotNull(_ctx)) return false;
-        _ctx.SetSourceRGBA(color.R, color.G, color.B, color.A);
-        return true;
-    }
+    private static void Source(Context ctx, Rgba color) => ctx.SetSourceRGBA(color.R, color.G, color.B, color.A);
+
 
     private static int RoundUp(double value) =>
         Assert(value is > 0 and <= MaxSize) ? (int)Math.Ceiling(value / SizeStep) * SizeStep : SizeStep;
 }
 
-// Rebuilt when the font scale or the game's GUI scale changed (RuntimeEnv.GUIScale changes without an event, and CairoFont scales by
-// it). Main thread: CairoFont measures on the engine's shared context.
+
+// Rebuilt on font or GUI scale change (GUIScale has no event). Main thread: CairoFont measures on the engine's context.
 internal sealed class HudFonts
 {
     private const double BaseFontSize = 14, BaseTitleSize = 16, HeaderPad = 2, BadgePad = 3;
@@ -364,8 +540,7 @@ internal sealed class HudFonts
         Assert(font.UnscaledFontsize > 0) ? font.GetFontExtents().Height * font.LineHeightMultiplier : 0;
 }
 
-// One full-screen texture (2560x1440 is a 14.7 MB surface and a TexImage2D), built on the first drag and again only when the frame
-// size or the GUI scale changed; built is told of each build, a frame of its own cost.
+// Full-screen texture (2560x1440: 14.7 MB), built on the first drag, again only on frame size or GUI scale change
 internal sealed class SnapGrid(ICoreClientAPI capi, Action built) : IDisposable
 {
     private HudCanvas? _canvas;

@@ -2,7 +2,7 @@ using System.Runtime.InteropServices;
 
 namespace Komet.Vulkan;
 
-// The quad index pattern (Quads) is shared and not the recorder's to free.
+// The quad index pattern (Quads) is shared, not the recorder's to free.
 internal sealed unsafe class TerrainDraw(HostBuffer quads)
 {
     private const int MaxResources = 32, MaxRanges = 1 << 18, CommandBytes = 20; // a counted draw: 4 runs a location
@@ -26,7 +26,7 @@ internal sealed unsafe class TerrainDraw(HostBuffer quads)
         return images;
     }
 
-    // The index pattern of ClientPlatformWindows.AllocateEmptySSBOMesh: 0 1 2 0 2 3, then 4 more
+    // ClientPlatformWindows.AllocateEmptySSBOMesh's pattern: 0 1 2 0 2 3, then +4
     public static HostBuffer? Quads(VulkanDevice device, int quads)
     {
         if (!NotNull(device) || !Assert(quads is > 0 and <= 1 << 26)) return null;
@@ -42,7 +42,7 @@ internal sealed unsafe class TerrainDraw(HostBuffer quads)
 
     public static long PackTicks { get; private set; } // probe
 
-    // Faces: the SSBO path (the quad pattern, the pool's FaceData), else the classic one (the pool's own indices)
+    // SSBO path (quad pattern, FaceData), else classic (the pool's own indices)
     public bool Draw(VulkanFrame frame, HostBuffer uploads, (TerrainPipeline Pipeline, TerrainPools.Pool Pool) with,
         Program program, (int[] Starts, int[] Sizes, int Count, bool Faces) ranges)
     {
@@ -62,7 +62,7 @@ internal sealed unsafe class TerrainDraw(HostBuffer quads)
         return Posted(frame, (uploads, pipeline, program), pool, op);
     }
 
-    // Commands and count written by OcclusionCulling's cull.comp, the starts as index offsets
+    // Commands and count from OcclusionCulling's cull.comp, starts as index offsets
     public bool Counted(VulkanFrame frame, HostBuffer uploads, (TerrainPipeline Pipeline, TerrainPools.Pool Pool) with,
         Program program, (bool Faces, (ulong Buffer, ulong Offset) Commands, (ulong Buffer, ulong Offset) Count, int Max) draw)
     {
@@ -72,7 +72,6 @@ internal sealed unsafe class TerrainDraw(HostBuffer quads)
         var index = draw.Faces ? quads.Buffer : pool.Indices?.Buffer ?? 0;
         if (index == 0 || draw.Commands.Buffer == 0 || draw.Count.Buffer == 0 ||
             VkApi.CmdDrawIndexedIndirectCount == null) return false;
-        // Vulkan's alignment for both: a command's field and the count are uints
         if (!Assert(draw.Commands.Offset % 4 == 0) || !Assert(draw.Count.Offset % 4 == 0)) return false;
         var op = new VulkanFrame.Op
         {
@@ -148,8 +147,8 @@ internal sealed unsafe class TerrainDraw(HostBuffer quads)
         (op.Vertices, op.VertexCount) = (at, bound.Length);
     }
 
-    // Every recorder binds through here, the pipeline first: not again what the command buffer has bound (a pipeline, the
-    // index and vertex buffers, which nothing else in it binds and no rendering or pipeline change unbinds)
+    // All recorders bind here, pipeline first: skips what is already bound (nothing else binds these, and neither
+    // rendering nor pipeline changes unbind them)
     public static void Bind(IntPtr commands, ulong pipeline)
     {
         if (!Assert(commands != IntPtr.Zero) || !Assert(pipeline != 0)) return;
@@ -196,7 +195,7 @@ internal sealed unsafe class TerrainDraw(HostBuffer quads)
         return at;
     }
 
-    // Not again when they are the ones pushed last for the same layout into the same command buffer
+    // Skipped when identical to the last push for the layout in this command buffer
     public static void Pushed(IntPtr commands, ulong layout, Vk.WriteInfo* writes, int count)
     {
         if (!Assert(count is >= 0 and <= MaxResources) || !Assert(writes != null)) return;
@@ -220,7 +219,7 @@ internal sealed unsafe class TerrainDraw(HostBuffer quads)
     private static ulong _pushedLayout;
     private static int _pushedCount;
 
-    // The block's image in the uploads, reused where the program's last draw put it while it is unchanged
+    // Reused from the program's last draw while unchanged
     internal static Vk.BufferDescriptor Block(HostBuffer uploads, Program program, GlslPort.Block block)
     {
         var mirror = program.Uniforms;
@@ -250,7 +249,6 @@ internal sealed unsafe class TerrainDraw(HostBuffer quads)
             : default;
     }
 
-    // A run of consecutive locations in one call
     [System.Runtime.CompilerServices.SkipLocalsInit]
     public static void BindVertices(IntPtr commands, ReadOnlySpan<(uint Location, ulong Buffer, ulong Offset)> bound)
     {
@@ -278,7 +276,6 @@ internal sealed unsafe class TerrainDraw(HostBuffer quads)
         bound.CopyTo(LastVertices);
     }
 
-    // The same list as bound last into the command buffer
     private static bool Bound(ReadOnlySpan<(uint Location, ulong Buffer, ulong Offset)> bound)
     {
         if (bound.Length != _vertexCount || !Assert(_vertexCount <= LastVertices.Length)) return false;

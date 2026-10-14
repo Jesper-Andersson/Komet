@@ -1,3 +1,6 @@
+using Komet.Core;
+using Komet.Tessellation;
+
 namespace Komet.Test.Tessellation;
 
 // Golden tests against the engine: the same ClientChunkData, built through the engine's own pool and setters, read by the engine's

@@ -3,8 +3,7 @@ using System.Text;
 
 namespace Komet.Vulkan;
 
-// Offsets and strides as the compiler laid them out, so whoever fills a block writes where the shader reads, whatever the layout
-// rules made of it
+// Offsets and strides as compiled, so a filler writes where the shader reads
 internal static partial class Spirv
 {
     private const int OpName = 5, OpMemberName = 6, OpMemberDecorate = 72;
@@ -69,7 +68,7 @@ internal static partial class Spirv
         }
     }
 
-    // A literal string: UTF-8, zero-terminated, packed four bytes a word
+    // UTF-8, zero-terminated, four bytes a word
     private static string Text(ReadOnlySpan<uint> words)
     {
         var bytes = MemoryMarshal.AsBytes(words);

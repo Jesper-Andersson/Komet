@@ -1,5 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using Komet.Core;
+using Komet.Tessellation;
 
 namespace Komet.Test.Tessellation;
 
@@ -173,6 +175,25 @@ public sealed class TessSafetyTests
         _ = blocker.Patch(AccessTools.DeclaredMethod(typeof(CrossTesselator), nameof(CrossTesselator.DrawCross)),
             transpiler: new HarmonyMethod(typeof(TessSafetyTests), nameof(OneMoreLoad)) { priority = Priority.First });
         Assert.That(TessSafety.Broken, Is.True);
+    }
+
+    // Another mod's patch on Block's own OnJsonTesselation locks only the flag writers whose override calls it (BlockFernTree's), not
+    // BlockPlant, whose override never reaches it (player log: every plant meshed one thread at a time)
+    [Test]
+    public void APatchOnBlocksOwnHookLocksOnlyItsCallers()
+    {
+        using var other = new TestHarmony("komet-test-tesssafety-jsonhook");
+        _ = other.Patch(AccessTools.DeclaredMethod(typeof(Block), nameof(Block.OnJsonTesselation), TessSafety.JsonArgs),
+            prefix: new HarmonyMethod(typeof(TessSafetyTests), nameof(Nothing)));
+        var plant = (Block)RuntimeHelpers.GetUninitializedObject(typeof(Vintagestory.GameContent.BlockPlant));
+        var fernTree = (Block)RuntimeHelpers.GetUninitializedObject(typeof(Vintagestory.GameContent.BlockFernTree));
+        (plant.BlockId, fernTree.BlockId) = (1, 2);
+        Assert.That((TessSafety.WritesFlags(plant), TessSafety.WritesFlags(fernTree)), Is.EqualTo((true, false)));
+    }
+
+    private static void Nothing()
+    {
+        // another mod's patch: only being there counts
     }
 
     // Another mod's transpiler that reads CrossTesselator.startRot once more
@@ -457,5 +478,60 @@ public sealed class TessParallelTests
 
         public override string ToString() =>
             string.Create(CultureInfo.InvariantCulture, $"{Vertices} vertices, {Hash}");
+    }
+}
+
+public sealed class JitWarmTests
+{
+    // Leaving a world unpatches, but Harmony keeps an empty record: the next world must warm again
+    [Test]
+    public void WarmsAgainInTheNextWorld()
+    {
+        var method = JitWarm.Methods()[0];
+        using (var first = new TestHarmony("komet-test-jitwarm")) JitWarm.Install(first, null);
+        using var second = new TestHarmony("komet-test-jitwarm");
+        JitWarm.Install(second, null);
+        Assert.That(Harmony.GetPatchInfo(method)?.Owners, Does.Contain(second.Id));
+    }
+}
+
+public sealed class FarFoliageTests
+{
+    // 1440 px at 70 degrees: a block is one pixel at about 1028 blocks; a chunk switches far only past the band and back only inside it
+    [Test]
+    public void ThresholdAndHysteresis()
+    {
+        var d = FarFoliage.Distance(1440, 70, 1);
+        Assert.That(d, Is.EqualTo(1440 / (2 * Math.Tan(35 * Math.PI / 180))).Within(1e-9));
+        Assert.That(FarFoliage.Distance(1440, 70, 0), Is.NaN);
+        Assert.That(FarFoliage.Distance(1440, 70, 2), Is.EqualTo(d / 2).Within(1e-9));
+        Assert.Multiple(() =>
+        {
+            Assert.That(FarFoliage.Want(d, 0, d), Is.EqualTo(1));
+            Assert.That(FarFoliage.Want(d + 100, 0, d), Is.EqualTo(2));
+            Assert.That(FarFoliage.Want(d + 80, 1, d), Is.EqualTo(1));
+            Assert.That(FarFoliage.Want(d + 80, 2, d), Is.EqualTo(2));
+            Assert.That(FarFoliage.Want(d + 50, 2, d), Is.EqualTo(1));
+            Assert.That(FarFoliage.Want(d + 90, 1, d), Is.EqualTo(2));
+            Assert.That(FarFoliage.Want(5000, 2, double.NaN), Is.EqualTo(1));
+        });
+    }
+}
+
+public sealed class DeepCullingTests
+{
+    // A deep chunk is culled past the near distance plus the band and kept culled until it comes inside the near distance
+    [Test]
+    public void CullsWithHysteresis()
+    {
+        Assert.Multiple(() =>
+        {
+            Assert.That(DeepCulling.Cull(0, 200, 96), Is.True);
+            Assert.That(DeepCulling.Cull(0, 120, 96), Is.False);
+            Assert.That(DeepCulling.Cull(2, 120, 96), Is.True);
+            Assert.That(DeepCulling.Cull(2, 90, 96), Is.False);
+            Assert.That(DeepCulling.Cull(1, 130, 96), Is.False);
+            Assert.That(DeepCulling.Cull(0, 5000, double.NaN), Is.False);
+        });
     }
 }

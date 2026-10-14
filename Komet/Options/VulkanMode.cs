@@ -1,68 +1,61 @@
+using Komet.Core;
+using Komet.Hud;
 using Komet.Vulkan;
 
 namespace Komet.Options;
 
-// One mode for the Vulkan switches, which stay knobs of their own (the settings page shows each, the bench arms and
-// komet-hud.json set them singly). A switch is on from its mode up; the shader cache and the lean handoff (0) are on in every mode.
+// The renderer: OpenGL (the engine's own) or Vulkan (knob VulkanOnly: Vulkan draws everything, OpenGL rests). The
+// shader cache and the other Vulkan knobs stay as they are.
 internal static class VulkanMode
 {
-    public const int Switches = 18;
-    public static readonly string[] Names = ["off", "terrain", "scene", "all"];
+    public const string Knob = "VulkanOnly";
+    public static readonly string[] Names = ["opengl", "vulkan"];
 
-    private static readonly (string Key, int From)[] Levels =
-    [
-        ("VulkanShaderCache", 0), ("VulkanLazyHandoff", 0), ("VulkanCore", 1), ("VulkanTerrain", 1), ("VulkanOpaque", 1),
-        ("VulkanShadows", 1), ("VulkanLiquidDepth", 1), ("VulkanTransparent", 1), ("VulkanWaterPlants", 1),
-        ("VulkanOwnDepth", 1), ("VulkanScene", 2), ("VulkanSky", 2), ("VulkanEntities", 2), ("VulkanParticles", 2),
-        ("VulkanPost", 2), ("VulkanOther", 2), ("VulkanWindow", 3), ("VulkanPresent", 3)
-    ];
+    // The settings' choices, each with its mode
+    public static readonly (string Name, int Mode)[] Choices = [("opengl", 0), ("vulkan", 1)];
 
-    private static readonly Func<string>[] Renderers =
-    [
-        HudText.Once("hud-renderer-opengl"), HudText.Once("hud-renderer-terrain"), HudText.Once("hud-renderer-scene"),
-        HudText.Once("hud-renderer-all"), HudText.Once("hud-renderer-failed")
-    ];
+    public static int Choice(int mode) => Index(mode, Names.Length) && Assert(Choices.Length == 2) ? mode : 0;
 
-    private static int[] _knobs = [];
+    private static readonly string[] RendererKeys = ["hud-renderer-opengl", "hud-renderer-vulkan", "hud-renderer-failed"];
 
-    // Knob indices of Levels, found once: the built-in knob table is fixed for the process
-    public static int[] Indices
+    private static readonly Func<string>[] Renderers = Array.ConvertAll(RendererKeys, static key => HudText.Once(key));
+
+    private static int _knob = -1;
+
+    // Found once: the built-in table is fixed
+    public static int CoreKnob
     {
         get
         {
-            if (_knobs.Length == 0) _knobs = Array.ConvertAll(Levels, level => Knobs.Find(level.Key));
-            return Assert(_knobs.Length == Switches) && Assert(Array.IndexOf(_knobs, -1) < 0) ? _knobs : [];
+            if (_knob < 0) _knob = Knobs.Find(Knob);
+            return Assert(_knob >= 0) && Assert(_knob < Knobs.BuiltInCount) ? _knob : -1;
         }
     }
 
-    public static int CoreKnob => Indices.Length == Switches ? Indices[2] : -1;
-
-    // The highest mode whose switches are all on: a mix set singly shows as the mode it covers
     public static int Of(System.Func<int, int> value)
     {
-        var (knobs, mode) = (Indices, Names.Length - 1);
-        if (!NotNull(value) || knobs.Length == 0) return 0;
-        for (var i = 0; i < Math.Min(knobs.Length, Switches); i++)
-            if (Levels[i].From > 0 && value(knobs[i]) == 0) mode = Math.Min(mode, Levels[i].From - 1);
-        return Assert(mode >= 0) ? mode : 0;
+        var knob = CoreKnob;
+        if (!NotNull(value) || knob < 0) return 0;
+        return value(knob) != 0 ? 1 : 0;
     }
 
     public static void Set(int mode, Action<int, int> write)
     {
-        var knobs = Indices;
-        if (!NotNull(write) || !Index(mode, Names.Length)) return;
-        for (var i = 0; i < Math.Min(knobs.Length, Switches); i++) write(knobs[i], mode >= Levels[i].From ? 1 : 0);
+        var knob = CoreKnob;
+        if (!NotNull(write) || !Index(mode, Names.Length) || knob < 0) return;
+        write(knob, mode);
     }
 
-    // What draws the frame now: OpenGL, or Vulkan with the mode the live switches cover
-    public static string Renderer()
+    public static string Renderer() => RendererIndex() is var i && Index(i, Renderers.Length) ? Renderers[i]() : "";
+
+    public static string RendererKey() => RendererIndex() is var i && Index(i, RendererKeys.Length) ? RendererKeys[i] : RendererKeys[0];
+
+    public static int RendererCode() => RendererIndex() is var i && Assert(i >= 0) && Index(i, RendererKeys.Length) ? i : 0;
+
+    private static int RendererIndex() => VulkanRenderer.State switch
     {
-        var index = VulkanRenderer.State switch
-        {
-            VulkanRenderer.Phase.Running => Math.Max(1, Of(static knob => Knobs.At(knob).Get())),
-            VulkanRenderer.Phase.Failed => Renderers.Length - 1,
-            _ => 0
-        };
-        return Index(index, Renderers.Length) ? Renderers[index]() : "";
-    }
+        VulkanRenderer.Phase.Running => 1,
+        VulkanRenderer.Phase.Failed => RendererKeys.Length - 1,
+        _ => 0
+    };
 }

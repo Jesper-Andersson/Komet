@@ -1,4 +1,5 @@
 using Komet.Gpu;
+using Komet.Rendering;
 
 namespace Komet.Test.Gpu;
 

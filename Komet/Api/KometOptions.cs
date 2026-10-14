@@ -1,12 +1,11 @@
 using System.Globalization;
+using Komet.Hud;
 
 namespace Komet.Api;
 
-// Pages in Komet's options window, which replaces the game's graphics settings. Another mod adds its own in StartClientSide, from a
-// class of its own that it calls only when api.ModLoader.IsModEnabled("komet"), so Komet.dll is loaded only when present: Page() with
-// an id and a title, then Group, Switch, Slider, Choice and Button in row order (the README has an example). The getters and setters
-// are the mod's, so is saving what they set; labels are shown as given (translate them with Lang.Get). Komet drops all pages and
-// Applied's subscribers when the world closes. Main thread only.
+// Komet's options window (replaces the game's graphics settings). Mods add pages in StartClientSide from an own class
+// called only when IsModEnabled("komet"): Page(), then rows in order (README). Getters, setters, saving and translation
+// are the mod's. Dropped when the world closes. Main thread only.
 public static class KometOptions
 {
     public const int MaxPages = 32;
@@ -14,12 +13,10 @@ public static class KometOptions
 
     internal static int Count => Registered.Count;
 
-    // After the options screen applied changes (Apply, Done): a mod that acts on several of its options at once does it here. A
-    // handler that throws is logged once and unsubscribed.
+    // After Apply/Done, for acting on several options at once; a throwing handler is logged once and unsubscribed
     public static event EventHandler? Applied;
 
-    // The page with this id, new and empty: calling it again for the same id starts the page over, so a world rejoined does not
-    // double its rows. section groups the page in the sidebar (default: the title).
+    // New, empty page; reusing an id starts it over (no doubled rows on rejoin). section: sidebar group, default title.
     public static OptionPage Page(string id, string title, string? section = null)
     {
         if (!NotNull(id) || !NotNull(title) || !Assert(id.Length > 0) || !Assert(title.Length > 0))
@@ -83,6 +80,7 @@ public sealed class OptionRow
     internal System.Func<double, string>? Format { get; set; }
     internal Func<bool>? Enabled { get; set; }
     internal Func<string?>? Locked { get; set; } // why the row takes no input, shown above its hint; null: it does
+    internal double Default { get; set; } = double.NaN; // a slider's shipped value, marked on its track and taken back by Delete
 
     internal bool IsEnabled => (Enabled?.Invoke() ?? true) && Locked?.Invoke() is null;
 
@@ -90,7 +88,6 @@ public sealed class OptionRow
         ? Format?.Invoke(value) ?? value.ToString("0.##", CultureInfo.InvariantCulture) + Unit
         : "";
 
-    // A slider's value from the x fraction of its track, on its step
     internal double At(double fraction)
     {
         if (!Assert(Max > Min) || !Assert(Step > 0)) return Min;
@@ -120,7 +117,6 @@ public sealed class OptionPage
     internal OptionRow this[int index] =>
         Index(index, _options.Count) ? _options[index] : new OptionRow(OptionKind.Group, "?", null);
 
-    // A header over the rows that follow
     public OptionPage Group(string title) =>
         NotNull(title) && Assert(title.Length > 0) ? Add(new OptionRow(OptionKind.Group, title, null)) : this;
 
@@ -159,7 +155,7 @@ public sealed class OptionPage
             ? Add(new OptionRow(OptionKind.Button, label, hint) { Shows = text, Set = _ => click() })
             : this;
 
-    // One of the game's hotkeys by its code: the row shows what the key is bound to, warn tells whether another has the same
+    // A game hotkey by code: the row shows its binding, warn tells whether another key shares it
     internal OptionPage Key(string label, string code, Func<string> shows, Func<bool> warn, string? hint = null) =>
         NotNull(label) && NotNull(code) && NotNull(shows) && NotNull(warn) && Assert(code.Length > 0)
             ? Add(new OptionRow(OptionKind.Key, label, hint) { Code = code, Shows = shows, Warn = warn })
@@ -179,7 +175,14 @@ public sealed class OptionPage
         return this;
     }
 
-    // The option added last is locked while locked() says why (a held feature's knob): dimmed, and the reason above its hint
+    // The slider added last marks its shipped value; Delete and its ↺ take it back
+    internal OptionPage Standard(double value)
+    {
+        if (Finite(value) && Assert(_options.Count > 0)) _options[^1].Default = value;
+        return this;
+    }
+
+    // Last option locked while locked() gives a reason (held feature knob): dimmed, reason above its hint
     internal OptionPage LockedWhen(Func<string?> locked)
     {
         if (NotNull(locked) && Assert(_options.Count > 0)) _options[^1].Locked = locked;

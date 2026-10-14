@@ -1,3 +1,5 @@
+using Komet.Core;
+using Komet.Rendering;
 using OpenTK.Graphics.OpenGL;
 
 namespace Komet.Test.Gpu;
@@ -12,7 +14,7 @@ public sealed class FacePackingGpuTests
     [TestCase(true, 4)]
     public void TheUploadIsTheEngines(bool persistent, int workers)
     {
-        using var window = OcclusionGpuTests.Context();
+        using var window = GlContext.Context();
         if (window is null) Assert.Ignore("no OpenGL 4.6 context here");
         var platform = (ClientPlatformWindows)RuntimeHelpers.GetUninitializedObject(typeof(ClientPlatformWindows));
         var data = Mesh(new Random(5));
@@ -39,58 +41,6 @@ public sealed class FacePackingGpuTests
             engine.Vao.Dispose(); // an undisposed VAO's finalizer asks for a platform the test has none of
             komet.Vao.Dispose();
             Counting.Hud = hud;
-            if (workers > 0) _ = WorkerPool.Stop();
-        }
-    }
-
-    // With room given (Vulkan's staging), the faces are packed straight into it - the bytes the engine uploads - and the colours and
-    // ints go there too: each buffer gets its room and is committed once, holding what the engine's upload put into OpenGL
-    [TestCase(0)]
-    [TestCase(4)]
-    public unsafe void FacesPackedInPlaceAreTheEngines(int workers)
-    {
-        using var window = OcclusionGpuTests.Context();
-        if (window is null) Assert.Ignore("no OpenGL 4.6 context here");
-        var platform = (ClientPlatformWindows)RuntimeHelpers.GetUninitializedObject(typeof(ClientPlatformWindows));
-        var data = Mesh(new Random(7));
-        if (workers > 0) WorkerPool.Resize(null, workers);
-        var (engine, komet) = (Vao(false), Vao(false));
-        var (room, colours, ints) = (new byte[64 * Faces + 64], new byte[4 * Vertices], new byte[4 * Vertices]);
-        var (given, committed) = (0, 0);
-        try
-        {
-            fixed (byte* into = room, c = colours, n = ints)
-            {
-                var (faces, colour, integer) = ((nint)into, (nint)c, (nint)n);
-                FacePacking.Room = (_, buffer, offset, bytes) =>
-                {
-                    given++;
-                    Assert.That(offset, Is.Zero);
-                    if (buffer == komet.Faces) return bytes == 64 * Faces ? (byte*)faces : null;
-                    if (buffer == komet.Colors) return bytes == 4 * Vertices ? (byte*)colour : null;
-                    Assert.That((buffer, bytes), Is.EqualTo((komet.Ints, 4 * Vertices)));
-                    return (byte*)integer;
-                };
-                FacePacking.Committed = () => committed++;
-                platform.UpdateSSBOMesh(engine.Vao, data);
-                Assert.That(FacePacking.Uploading(platform, komet.Vao, data), Is.False, "Komet made the upload");
-                FacePacking.Settle(); // packed in the background: done before the room is read, and unpinned
-            }
-
-            GL.Finish();
-            Assert.Multiple(() =>
-            {
-                Assert.That((given, committed), Is.EqualTo((3, 3)));
-                Assert.That(room.AsSpan(0, 64 * Faces).ToArray(), Is.EqualTo(Read(engine.Faces, 64 * Faces)), "the faces");
-                Assert.That(colours, Is.EqualTo(Read(engine.Colors, 4 * Vertices)), "the colours");
-                Assert.That(ints, Is.EqualTo(Read(engine.Ints, 4 * Vertices)), "the ints");
-            });
-        }
-        finally
-        {
-            (FacePacking.Room, FacePacking.Committed) = (null, null);
-            engine.Vao.Dispose();
-            komet.Vao.Dispose();
             if (workers > 0) _ = WorkerPool.Stop();
         }
     }

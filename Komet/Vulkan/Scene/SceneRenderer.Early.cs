@@ -2,20 +2,19 @@ using OpenTK.Graphics.OpenGL;
 
 namespace Komet.Vulkan;
 
-// The engine clears the window and its primary framebuffer as each frame begins; left to OpenGL, that was OpenGL work on
-// shared images every frame, so no handoff was ever free of OpenGL work to wait for. Such a clear is kept and recorded as
-// Vulkan's first work once the frame's first segment opens; should OpenGL touch anything before that, the frame end without
-// a segment, or the scene go off, OpenGL clears first after all (FlushEarly).
+// The engine clears window and primary framebuffer between frames: such a clear is kept as Vulkan's first work in the
+// next frame's first segment; if the scene goes off first, OpenGL clears after all (FlushEarly).
 internal sealed partial class SceneRenderer
 {
     private const int MaxEarly = 8;
     private const uint ColorMaskBits = 0xFu << 22;
 
     private readonly List<Early> _early = [];
+    private readonly Early[] _kept = new Early[MaxEarly]; // Opened's: a segment Recorded opens runs Opened again
 
     private sealed record Early(int Fbo, GlTap.ClearCall Call, bool Colors, bool Depth);
 
-    // From the frame's end to the next frame's stages, while the scene runs: clears may be kept for the next segment
+    // Frame end to the next frame's stages: clears may be kept for the next segment
     public bool Between { get; set; }
 
     public long EarlyClears { get; private set; }
@@ -25,17 +24,18 @@ internal sealed partial class SceneRenderer
         Mirrors.Opened();
         _terrain.PoolsOpened();
         if (_early.Count == 0 || !Assert(_early.Count <= MaxEarly)) return;
-        Early[] kept = [.. _early];
+        var count = _early.Count;
+        _early.CopyTo(_kept);
         _early.Clear();
         var failed = 0;
-        foreach (var early in kept.Bounded(MaxEarly))
-            if (failed > 0 || !Recorded(early))
+        for (var i = 0; i < Math.Min(count, MaxEarly); i++)
+            if (failed > 0 || !Recorded(_kept[i]))
             {
-                _early.Add(early); // and every one after it, in order
+                _early.Add(_kept[i]); // and every one after it, in order
                 failed++;
             }
 
-        FlushEarly(); // OpenGL's, before the segment's own work: it signals after them
+        FlushEarly(); // those it could not record: OpenGL's after all
     }
 
     // True when OpenGL must not run the clear
@@ -51,72 +51,36 @@ internal sealed partial class SceneRenderer
                     _early.Count < MaxEarly;
         for (var i = 0; plain && colors && i < GlTap.MaxBuffers; i++)
             plain = (state.Blend[i] & ColorMaskBits) == ColorMaskBits;
-        if (!plain)
-        {
-            FlushEarly(); // OpenGL's clear comes after the ones kept before it
-            return false;
-        }
+        if (!plain) return false; // the scene's own clear, in its segment
 
         if (depth || colors) _early.Add(new Early(fbo, call, colors, depth));
         _ = Assert(fbo > 0);
         return Assert(_early.Count <= MaxEarly); // a clear OpenGL would write nothing with is done too
     }
 
-    // Into the framebuffer's images as they are now: Start may have moved them
+    // Into the framebuffer's current images: Start may have moved them
     private bool Recorded(Early early)
     {
         if (!NotNull(early) || !Assert(early.Fbo > 0)) return false;
         var target = _terrain.Target(GlTap.State, out _, early.Fbo, !early.Depth, foreign: true);
         if (target is null) return false;
         Span<Vk.ClearAttachment> attachments = stackalloc Vk.ClearAttachment[GlTap.MaxBuffers + 1];
-        var count = Attachments(attachments, target, early.Call, (early.Colors, early.Depth), null);
+        var count = Attachments(attachments, target, early.Call, (early.Colors, early.Depth, false), null);
         if (count == 0) return true;
         _sampled.Clear();
-        var sync = _terrain.Frame.Pending ? SegmentSync.Deferred : SegmentSync.Ordered;
-        if (!_terrain.Segment(target, sync, _sampled, out _)) return false;
+        if (!_terrain.Segment(target, _sampled, out _)) return false;
         Cleared(target, attachments[..count], false);
         EarlyClears++;
         return true;
     }
 
-    // A draw or compute may sample anything; a clear, blit, copy, read or texture call touches the kept clears' images only
-    // when it names one; a buffer upload never does
+    // OpenGL touches none of the kept clears' images: it rests
     public void Touching(GlTap.Touch kind, uint id)
     {
-        if (_early.Count == 0 || !Assert(kind <= GlTap.Touch.Mipmap)) return;
-        var touches = kind switch
-        {
-            GlTap.Touch.Upload => false,
-            GlTap.Touch.Clear => Overlaps(GlTap.DrawFramebuffer),
-            GlTap.Touch.ClearNamed => Overlaps((int)id),
-            GlTap.Touch.TextureUpload or GlTap.Touch.Mipmap or GlTap.Touch.ClearTexture => id == 0 || Attaches((int)id),
-            _ => true
-        };
-        if (touches) FlushEarly();
-        _ = Assert(!touches || _early.Count == 0);
+        if (Assert(kind <= GlTap.Touch.Mipmap) && Assert(id < uint.MaxValue)) Untaken(kind);
     }
 
-    private bool Overlaps(int fbo)
-    {
-        if (fbo <= 0) return true;
-        var (colors, depth) = _terrain.Frame.Attached(fbo);
-        _ = Assert(depth >= 0);
-        return Attaches(depth) || colors.Any(Attaches);
-    }
-
-    private bool Attaches(int texture)
-    {
-        if (texture <= 0 || !Assert(_early.Count <= MaxEarly)) return false;
-        foreach (var early in _early.Bounded(MaxEarly))
-        {
-            var (colors, depth) = _terrain.Frame.Attached(early.Fbo);
-            if (depth == texture || colors.Contains(texture)) return true;
-        }
-
-        return false;
-    }
-
-    // As the engine called them: no scissor, every color component and the depth written
+    // As the engine called them: no scissor, all color components and depth written
     public void FlushEarly()
     {
         if (_early.Count == 0 || !Assert(_early.Count <= MaxEarly)) return;
@@ -145,11 +109,39 @@ internal sealed partial class SceneRenderer
         if (!NotNull(early) || !Assert(early.Fbo > 0)) return;
         var call = early.Call;
         var buffers = GlTap.DrawBuffersOf(early.Fbo);
-        float[] color = [call.Color.R, call.Color.G, call.Color.B, call.Color.A];
+        Span<float> color = [call.Color.R, call.Color.G, call.Color.B, call.Color.A];
         for (var i = 0; early.Colors && i < Math.Min(buffers.Length, GlTap.MaxBuffers); i++)
             if (buffers[i] >= 0 && (call.Output < 0 || call.Output == i))
-                GL.ClearNamedFramebuffer(early.Fbo, ClearBuffer.Color, i, color);
+                GL.ClearNamedFramebuffer(early.Fbo, ClearBuffer.Color, i, ref color[0]);
         var depth = (float)call.Depth;
         if (early.Depth) GL.ClearNamedFramebuffer(early.Fbo, ClearBuffer.Depth, 0, ref depth);
+    }
+
+    private bool _asked; // the call OpenGL is about to run was judged and left (Leave), so it is counted already
+
+    private void Waited()
+    {
+        _asked = !GlTap.LaterRange; // a later range of a multi-draw: no Touched comes to take it
+        _terrain.MissWaiting();
+        _ = Assert(_asked || GlTap.LaterRange);
+    }
+
+    // GPU work no scene judge saw (multi-draw/indirect, integer clears, window blits, compute) is missing.
+    // Copies and texture clears are judged as they run (TerrainRenderer.Copied, TextureCleared).
+    private void Untaken(GlTap.Touch kind)
+    {
+        var asked = _asked;
+        _asked = false;
+        if (asked || !Framing || !Assert(!_asked)) return;
+        var what = kind switch
+        {
+            GlTap.Touch.Draw => "a multi-draw or an indirect draw",
+            GlTap.Touch.Clear or GlTap.Touch.ClearNamed => "a clear of integers",
+            GlTap.Touch.Blit => "a blit from or into the window itself",
+            GlTap.Touch.Compute => "a compute dispatch",
+            _ => ""
+        };
+        if (what.Length > 0) _terrain.Miss(what);
+        _ = Assert(!_asked);
     }
 }

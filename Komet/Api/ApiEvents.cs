@@ -1,15 +1,13 @@
 namespace Komet.Api;
 
-// What the public API sends other mods: its events, and the log lines of what it refused. The logger is Komet's from StartPre, before
-// any mod's Start, so a registration refused before Komet started is logged too.
+// Public API events and refusal log; the logger is set at StartPre, so refusals before Komet's Start log too
 internal static class ApiEvents
 {
     public const int MaxHandlers = 64;
 
     public static ILogger? Logger { get; set; }
 
-    // Every handler on its own, at most MaxHandlers: one that throws is logged once, with the assembly that declared it, and removed,
-    // so neither Komet nor the other handlers see its exception again
+    // Each handler separately, at most MaxHandlers; one that throws is logged once with its assembly and removed
     public static void Raise<T>(T? handlers, Action<T> invoke, Action<T> remove, string name) where T : Delegate
     {
         if (handlers is null || !NotNull(invoke) || !NotNull(remove)) return;

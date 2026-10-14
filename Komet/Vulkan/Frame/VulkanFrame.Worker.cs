@@ -1,10 +1,8 @@
 namespace Komet.Vulkan;
 
-// Recorded on a thread of its own, as glthread takes OpenGL's work off the engine's thread. The thread begins, records, ends
-// and submits the segments' command buffers, which come from its own pool (a pool is used by one thread at a time), and makes
-// the frame's queue operations in the order they were posted (Queue): the engine's thread waits for it only where it needs a
-// submission made (Reach) - OpenGL's wait for a segment's signal, another thread's queue operation - and where the arenas are
-// reused from the start.
+// Recorded on its own thread, like glthread for GL: it begins, records, ends and submits segment command buffers from
+// its own pool (one thread per pool) and makes queue operations in post order (Queue). The engine thread waits only
+// where a submission must exist (Reach): GL's segment wait, other threads' queue ops, arena reuse.
 internal sealed unsafe partial class VulkanFrame
 {
     public const int MaxOps = 1 << 15, MaxDescriptors = 1 << 18, MaxVertexBindings = 1 << 16, MaxPushWords = 1 << 19;
@@ -26,6 +24,7 @@ internal sealed unsafe partial class VulkanFrame
         Timestamp,
         Copy, // CountOffset bytes from Index at IndexOffset to Indirect at IndirectOffset: no closure per copy
         Blit, // VulkanFrame.Blit's: the images in Pipeline and Layout, the corners in X..Height and Index..IndirectOffset
+        Fill, // zeros, CountOffset bytes into Indirect at IndirectOffset, then compute's order (VulkanBackend.Ordered)
         Call,
         Begin, // the frame's own: a segment's command buffer begun (Ref the segment)
         Queue // the frame's own: a queue operation (Ref an Action), made even after a fault
@@ -36,7 +35,9 @@ internal sealed unsafe partial class VulkanFrame
         Direct,
         Indexed,
         IndexedIndirect,
-        IndexedIndirectCount // Count the most, the count read at CountBuffer + CountOffset
+        IndexedIndirectCount, // Count the most, the count read at CountBuffer + CountOffset
+        Indirect, // Vulkan-only's, from mods: glDrawArraysIndirect's commands, Count of them First bytes apart
+        IndirectCount
     }
 
     public struct Op
@@ -67,9 +68,11 @@ internal sealed unsafe partial class VulkanFrame
         public ulong Depth;
         public int DepthLayout;
         public uint Width, Height;
+        public bool Stencil; // the depth's view holds a stencil too: attached as the stencil as well
+        public uint Layers = 1; // a layered rendering's (every layer of an array attached at once)
     }
 
-    public sealed record Clearing(Vk.ClearAttachment[] Attachments, Vk.Rect Rect);
+    public sealed record Clearing(Vk.ClearAttachment[] Attachments, Vk.Rect Rect, uint Layers = 1);
 
     // Also orders all memory before it against all after
     public sealed class Moves
@@ -109,7 +112,7 @@ internal sealed unsafe partial class VulkanFrame
     private Thread? _worker;
     private long _posted, _recorded;
     private int _descriptorsUsed, _vertexBindingsUsed, _pushUsed, _sleeping, _stop;
-    private IntPtr _recording; // the command buffer the thread records into
+    private IntPtr _recording;
     private ulong _workerPool;
 
     // Recording thread faults end its segment's work: nothing is recorded any more, the segments stay empty
@@ -171,7 +174,8 @@ internal sealed unsafe partial class VulkanFrame
         _ = Assert(op.Kind <= OpKind.Queue);
         if (_posted - Volatile.Read(ref _recorded) >= MaxOps) Drain();
         _ops[_posted % MaxOps] = op;
-        Volatile.Write(ref _posted, _posted + 1);
+        // Both store then load the other's value (Sleep): full fences, else both read stale and it sleeps until Reach
+        _ = Interlocked.Exchange(ref _posted, _posted + 1);
         if (Volatile.Read(ref _sleeping) != 0) _wake.Set();
         _ = Assert(_posted - Volatile.Read(ref _recorded) <= MaxOps);
     }
@@ -223,8 +227,7 @@ internal sealed unsafe partial class VulkanFrame
                 ref var op = ref _ops[read % MaxOps];
                 if (Fault.Length == 0 || op.Kind == OpKind.Queue) Emit(ref op);
             }
-            catch (Exception e) when (e is InvalidOperationException or ArgumentException or IndexOutOfRangeException or
-                                          NullReferenceException)
+            catch (Exception e) when (e is not OutOfMemoryException) // unhandled on this thread it would end the game
             {
                 Fault = $"the recording thread failed: {e.Message}";
             }
@@ -239,7 +242,7 @@ internal sealed unsafe partial class VulkanFrame
     {
         _ = Assert(Volatile.Read(ref _sleeping) == 0) && Assert(Thread.CurrentThread == _worker);
         _wake.Reset();
-        Volatile.Write(ref _sleeping, 1);
+        _ = Interlocked.Exchange(ref _sleeping, 1);
         if (Volatile.Read(ref _recorded) == Volatile.Read(ref _posted) && Volatile.Read(ref _stop) == 0) _ = _wake.Wait(100);
         Volatile.Write(ref _sleeping, 0);
     }
@@ -249,8 +252,8 @@ internal sealed unsafe partial class VulkanFrame
         if (_worker is not { } worker || !Assert(Thread.CurrentThread != worker)) return;
         Volatile.Write(ref _stop, 1);
         _wake.Set();
-        _ = Assert(worker.Join(MaxWaitMs)); // else the pool is destroyed under a thread still recording
         _worker = null;
+        if (!Assert(worker.Join(MaxWaitMs))) return; // leaked: neither the pool nor the wake goes under a thread still recording
         if (_workerPool != 0) _device.DestroyPool(_workerPool);
         _workerPool = 0;
         _wake.Dispose();

@@ -1,3 +1,5 @@
+using Komet.Chunks;
+
 namespace Komet.Test.Chunks;
 
 // Golden test against the engine: layers compressed by Compression.CompressAndCombine, as ChunkDataLayer does, and unpacked by the

@@ -1,7 +1,7 @@
 namespace Komet.Vulkan;
 
-// Pipeline statistics of the draws posted while the counted section is the frame's (the opaque terrain), every Every-th frame:
-// one query over each run of them inside a rendering, ended before any other draw, clear, call or the rendering's end
+// Pipeline statistics of draws posted in the frame's counted section (opaque terrain), every Every-th frame: one query
+// per run inside a rendering, ended before any other draw, clear, call or rendering end
 internal sealed unsafe partial class VulkanFrame
 {
     public const int Statistics = 4;
@@ -9,15 +9,14 @@ internal sealed unsafe partial class VulkanFrame
 
     private readonly double[] _statisticTotals = new double[Statistics];
     private readonly double[] _lastStatistics = [double.NaN, double.NaN, double.NaN, double.NaN];
-    private ulong _statistics; // the query pool, 0 until made
+    private ulong _statistics;
     private long _counting = -1, _countedFrames; // the query open now, -1 for none
     private double _countedPixels = double.NaN; // the area of the rendering the last counted run drew into
 
     // The section whose draws are counted, -1 for none
     public int Counted { get; set; } = -1;
 
-    // The last counted frame's statistics in Occlusion's order: vertex shader invocations, fragment shader invocations,
-    // primitives clipping took in, primitives it gave out; NaN before the first
+    // Last counted frame in Occlusion's order: VS, FS invocations, clipping primitives in, out; NaN before
     public double LastStatistic(int at) => Index(at, Statistics) ? _lastStatistics[at] : double.NaN;
 
     public double CountedPixels => _countedPixels;
@@ -62,7 +61,7 @@ internal sealed unsafe partial class VulkanFrame
         if (!NotNull(slot)) return;
         var count = slot.Queries;
         (slot.Queries, slot.Reset) = (0, false);
-        // only for the HUD (and the report while it counts): queries around the opaque pass are not free on every fourth frame
+        // only for the HUD (and the report while counting): queries around the opaque pass cost on every fourth frame
         slot.Sampled = Measuring && Core.Counting.Hud && _device.PipelineStatistics && Number % Every == 0;
         if (count == 0 || !finished || _statistics == 0 || !Assert(count <= QueriesPerFrame)) return;
         var results = stackalloc ulong[MaxResults];

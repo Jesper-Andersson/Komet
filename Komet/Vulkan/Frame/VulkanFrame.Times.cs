@@ -1,7 +1,6 @@
 namespace Komet.Vulkan;
 
-// Timestamps at the bottom of the pipe: an interval between two of a command buffer's timestamps is the earlier one's
-// section's, a setup's the transfers'. What of the frame's span no segment took, the GPU spent on OpenGL's work or idle.
+// Bottom-of-pipe timestamps: an interval is its earlier stamp's section, a setup's the transfers'. Rest: GL or idle.
 internal sealed unsafe partial class VulkanFrame
 {
     private const int QueriesPerSlot = 1024, MaxSections = 128, ReportSections = 14;
@@ -21,7 +20,7 @@ internal sealed unsafe partial class VulkanFrame
 
     public static bool Measuring { get; set; } = true;
 
-    // The last frame timed (Slots frames back), for the HUD: a section's time and Vulkan's busy time; NaN before the first
+    // Last timed frame (Slots frames back), for the HUD: a section's time and Vulkan's busy time; NaN before the first
     public double LastMs(int section) =>
         _lastBusyMs >= 0 && Index(section, MaxSections) && Assert(_lastNs[section] >= 0) ? _lastNs[section] / 1e6 : double.NaN;
 
@@ -85,7 +84,7 @@ internal sealed unsafe partial class VulkanFrame
         if (!NotNull(slot)) return;
         var count = slot.Stamps.Count;
         if (count == 0 || !Assert(count <= QueriesPerSlot)) return;
-        var ticks = stackalloc ulong[count]; // as many as were written: it is zeroed
+        var ticks = stackalloc ulong[count]; // not QueriesPerSlot: stackalloc zeroes it
         var read = finished && _stamps != 0 && VkApi.GetQueryPoolResults(_device.Handle, _stamps,
             (uint)(slot.Index * QueriesPerSlot), (uint)count, (nuint)(8 * count), ticks, 8, Vk.Result64) == Vk.Success;
         if (read) Summed(slot.Stamps, new ReadOnlySpan<ulong>(ticks, count), _device.TimestampPeriod);

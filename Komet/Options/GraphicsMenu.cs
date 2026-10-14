@@ -1,19 +1,20 @@
 using System.Reflection;
 using HarmonyLib;
+using Komet.Api;
+using Komet.Core;
 using Vintagestory.API.Datastructures;
 using Vintagestory.Client.NoObf;
 
 namespace Komet.Options;
 
-// The escape menu's Settings button and Graphics tab both run OnGraphicsOptions. The prefix loads an empty composer named like the
-// graphics tab, so nothing shows behind the screen and the menu raises "leftGraphicsDlg" once its composer stops being the graphics
-// one. Stands down when another mod patches OnGraphicsOptions: its additions would miss the controls they expect.
+// Escape menu Settings and Graphics tab run OnGraphicsOptions; the prefix loads an empty composer named like the
+// graphics tab, so "leftGraphicsDlg" fires once it changes. Stands down when another mod patches OnGraphicsOptions.
 internal static class GraphicsMenu
 {
     internal const ulong Fingerprint = 0x4DF9587AB32B1D45UL; // the six rebuilt tabs, Vintage Story 1.22.7
     private const string DialogName = "gamesettings-graphics";
 
-    // The tabs the screen rebuilds: a game update that changes one leaves the whole menu to the game
+    // A game update changing one leaves the whole menu to the game
     private static readonly string[] Tabs =
         ["OnGraphicsOptions", "OnMouseOptions", "OnAccessibilityOptions", "OnSoundOptions", "OnInterfaceOptions", "OnDeveloperOptions"];
 
@@ -51,9 +52,8 @@ internal static class GraphicsMenu
         Installed = true;
     }
 
-    // The game's frame graph and FPS line (HudDebugScreen) wait while the screen is open: the escape menu shows them on its own for
-    // as long as a composer named like the graphics tab is loaded (enteredGraphicsDlg), and Alt+F3 may have them on anyway. A prefix
-    // that only skips the drawing, whatever the body does, so it needs no fingerprint; the graph keeps recording under it.
+    // HudDebugScreen's graph and FPS line hide while open (the menu shows them for the graphics composer). Drawing
+    // only: no fingerprint needed; the graph keeps recording.
     private static void Quieten(Harmony harmony)
     {
         var render = AccessTools.Method(typeof(HudDebugScreen), nameof(HudDebugScreen.OnRenderGUI), [typeof(float)]);
@@ -68,7 +68,6 @@ internal static class GraphicsMenu
         (_dialog, _target, _handler, _composer, _logger, Installed) = (null, null, null, null, null, false);
     }
 
-    // Harmony binds the instance and the argument by name
     private static bool Replace(GuiCompositeSettings __instance, bool on)
     {
         if (!Enabled || _original || !on || _dialog is null || _handler is null || _composer is null ||
@@ -84,7 +83,6 @@ internal static class GraphicsMenu
         return false;
     }
 
-    // One of the game's own screens by handler name: a tab's takes on (OnGraphicsOptions: the original tab), others nothing (OnMacroEditor)
     private static void Open(GuiCompositeSettings settings, string handler)
     {
         var tab = AccessTools.Method(typeof(GuiCompositeSettings), handler, [typeof(bool)]);
@@ -109,7 +107,7 @@ internal static class GraphicsMenu
     private static bool Foreign()
     {
         if (!NotNull(_target)) return true;
-        var foreign = EngineShape.Foreign([_target], EngineShape.Kinds.All, _owner, typeof(GraphicsMenu));
+        var foreign = EngineShape.Foreign([_target], PatchKinds.All, _owner, typeof(GraphicsMenu));
         _foreign = EngineShape.Report(_logger, nameof(GraphicsMenu), _foreign, foreign);
         return foreign;
     }

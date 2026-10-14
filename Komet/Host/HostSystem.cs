@@ -3,16 +3,16 @@ using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using HarmonyLib;
+using Komet.Core;
+using Komet.World;
 using Vintagestory.API.Server;
 using Vintagestory.Server;
 
 namespace Komet.Host;
 
-// The server side of HostLaunch. In the game's own process (a singleplayer world loading its mods) StartPre is Komet's first chance
-// before the world loads, used for the handover. In the child (HostLaunch.ParentVariable set) it keeps the singleplayer rules the engine
-// ties to its in-memory connection - the player joins with the highest role - and ends with the game: when the player leaves or the game
-// process is gone, the server stops as /stop does, saving. The game's pause reaches it over a loopback link (HostLaunch.Accept), read on
-// a thread of its own: a suspended server runs no main thread tasks, so the resume could not wait for one.
+// Server side of HostLaunch. In-process, StartPre is the handover point. In the child (ParentVariable set) it keeps
+// singleplayer rules (highest role) and stops like /stop when the player leaves or the game is gone. Pause arrives on a
+// loopback link thread: a suspended server runs no main thread tasks.
 public sealed class HostSystem : ModSystem, IDisposable
 {
     private const int WatchMs = 1000, MaxMessages = int.MaxValue;
@@ -40,18 +40,27 @@ public sealed class HostSystem : ModSystem, IDisposable
         if (!NotNull(join)) return;
         _harmony = new Harmony("komet.host.child");
         _ = _harmony.Patch(join, prefix: new HarmonyMethod(typeof(HostSystem), nameof(Join)));
-        // Komet's patches on server code, which its client side installs only while the server runs in the game's process
-        LightRepair.Enabled = HostLaunch.Saved(nameof(LightRepair)) ?? LightRepair.Enabled;
-        ColumnNoiseScratch.Enabled = HostLaunch.Saved(nameof(ColumnNoiseScratch)) ?? ColumnNoiseScratch.Enabled;
-        WorldGenScratch.Enabled = HostLaunch.Saved(nameof(WorldGenScratch)) ?? WorldGenScratch.Enabled;
-        ChunkThreadClosure.Install(_harmony);
-        LightRepair.Install(_harmony, Mod.Logger);
-        ColumnNoiseScratch.Install(_harmony, Mod.Logger);
-        WorldGenScratch.Install(_harmony);
+        ServerFeatures(_harmony, Mod.Logger);
         _api = server;
         Mod.Logger.Notification("Komet: running a singleplayer world for game process {0}", _parent);
         if (int.TryParse(Environment.GetEnvironmentVariable(HostLaunch.ControlVariable), NumberStyles.None,
                 CultureInfo.InvariantCulture, out var port)) Connect(port, server.World as ServerMain);
+    }
+
+    // Server-code patches, installed client side only while the server runs in-process: here every feature the table
+    // marks ServerOnly, in its order, its switches as komet.json saved them
+    private static void ServerFeatures(Harmony harmony, ILogger logger)
+    {
+        if (!NotNull(harmony) || !NotNull(logger)) return;
+        var features = Features.All;
+        var context = FeatureContext.Server(harmony, logger);
+        for (var i = 0; i < Math.Min(features.Length, Features.MaxFeatures); i++)
+        {
+            if (!features[i].ServerOnly) continue;
+            foreach (var knob in features[i].Knobs.Bounded(Knobs.MaxKnobs))
+                if (knob.IsSwitch && HostLaunch.Saved(knob.Persisted) is { } on) knob.Set(on ? 1 : 0);
+            features[i].Install?.Invoke(context);
+        }
     }
 
     private void Connect(int port, ServerMain? server)
@@ -61,7 +70,8 @@ public sealed class HostSystem : ModSystem, IDisposable
         {
             _link = new TcpClient();
             _link.Connect(IPAddress.Loopback, port);
-            new Thread(() => Listen(_link.GetStream(), server)) { IsBackground = true, Name = "komet-host-link" }.Start();
+            var stream = _link.GetStream(); // here: Dispose may null _link before the thread runs
+            new Thread(() => Listen(stream, server)) { IsBackground = true, Name = "komet-host-link" }.Start();
         }
         catch (SocketException e)
         {
@@ -111,11 +121,10 @@ public sealed class HostSystem : ModSystem, IDisposable
         (_harmony, _api, _link) = (null, null, null);
     }
 
-    // Once: the tick and the disconnect both come here, and ShutDown disconnects again. Queued, so the leave in progress completes first.
+    // Once (tick, disconnect, link thread; ShutDown disconnects again); queued so the leave completes first
     private void Stop(string why)
     {
-        if (_api is not { } api || !NotNull(api.Server) || !Assert(why.Length > 0)) return;
-        _api = null;
+        if (!Assert(why.Length > 0) || Interlocked.Exchange(ref _api, null) is not { } api || !NotNull(api.Server)) return;
         Mod.Logger.Notification("Komet: stopping, {0}", why);
         api.Event.EnqueueMainThreadTask(api.Server.ShutDown, "komet-host-stop");
     }

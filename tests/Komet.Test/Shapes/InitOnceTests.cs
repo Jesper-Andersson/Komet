@@ -1,3 +1,6 @@
+using Komet.Core;
+using Komet.Shapes;
+
 namespace Komet.Test.Shapes;
 
 // EntityPlayer.OnTesselation runs Shape.InitForAnimations twice on the local player's shape, the second time with no disable

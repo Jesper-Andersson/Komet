@@ -57,7 +57,7 @@ public sealed class GlTapGpuTests
     [Test]
     public void TheStateIsKeptAsOpenGlHasIt()
     {
-        using var window = OcclusionGpuTests.Context();
+        using var window = GlContext.Context();
         if (window is null) Assert.Ignore("no OpenGL 4.6 context here");
         GL.Enable(EnableCap.DepthTest);
         GL.DepthFunc(DepthFunction.Lequal);
@@ -111,36 +111,5 @@ public sealed class GlTapGpuTests
             GL.DepthMask(true);
             GL.ColorMask(true, true, true, true);
         }
-    }
-
-    [Test]
-    public void EveryTextureBoundToAUnitIsToldBeforeTheDriverBindsIt()
-    {
-        using var window = OcclusionGpuTests.Context();
-        if (window is null) Assert.Ignore("no OpenGL 4.6 context here");
-        Assert.That(GlTap.Tap(), Is.True);
-        var textures = new int[2];
-        GL.CreateTextures(TextureTarget.Texture2D, 2, textures);
-        try
-        {
-            var told = new List<uint>();
-            GlTap.Binding = told.Add;
-            GL.ActiveTexture(TextureUnit.Texture3);
-            GL.BindTexture(TextureTarget.Texture2D, textures[0]);
-            GL.BindTextureUnit(5, textures[1]);
-            GL.BindTexture(TextureTarget.Texture2D, 0);
-            uint[] expected = [(uint)textures[0], (uint)textures[1]];
-            Assert.That(told, Is.EqualTo(expected), "unbinding tells nothing");
-            Assert.That(GlTap.Unit(3).Texture, Is.Zero);
-            Assert.That(GlTap.Unit(5).Texture, Is.EqualTo(textures[1]));
-        }
-        finally
-        {
-            GlTap.Untap();
-            GL.ActiveTexture(TextureUnit.Texture0);
-            GL.DeleteTextures(2, textures);
-        }
-
-        Assert.That(GlTap.Binding, Is.Null, "untapped: nobody told any more");
     }
 }

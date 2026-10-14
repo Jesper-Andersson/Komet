@@ -1,3 +1,11 @@
+using Komet.Api;
+using Komet.Chunks;
+using Komet.Core;
+using Komet.Diagnostics;
+using Komet.Rendering;
+using Komet.Shapes;
+using Komet.Tessellation;
+using Komet.World;
 using OpenTK.Windowing.Desktop;
 
 namespace Komet.Test.Core;
@@ -230,8 +238,8 @@ public sealed class EngineShapeTests
         Assert.That(Harmony.GetPatchInfo(target!)?.Owners, Is.Null.Or.Empty, "a patch another test left behind");
         using var other = new TestHarmony("komet-test-foreign-other");
         using var own = new TestHarmony("komet-test-foreign-own");
-        const EngineShape.Kinds replacing = EngineShape.Kinds.Replacing, all = EngineShape.Kinds.All,
-            body = EngineShape.Kinds.Body;
+        const PatchKinds replacing = PatchKinds.Replacing, all = PatchKinds.All,
+            body = PatchKinds.Body;
         Assert.Multiple(() =>
         {
             Assert.That(EngineShape.Foreign([target], all, null), Is.False, "no patch");

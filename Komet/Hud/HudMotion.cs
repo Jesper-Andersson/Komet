@@ -1,8 +1,7 @@
 namespace Komet.Hud;
 
-// What makes a window feel alive without composing it again: it fades and rises in on opening and fades out on closing, a soft
-// shadow lies under it, the part under the mouse lights up, a click flashes where it landed, the tab underline slides to the open
-// tab. All of it tinted quads of one small white canvas over and under the composed one, drawn each frame at no Cairo cost.
+// Fade, shadow, hover, click flash and tab underline as tinted quads of one white canvas each frame: no Cairo, no
+// recompose.
 internal sealed class HudMotion(ICoreClientAPI capi) : IDisposable
 {
     private const double OpenMs = 170, CloseMs = 120, HoverMs = 120, FlashMs = 280, SlideMs = 180, Rise = 10, Shrink = 0.03;
@@ -16,7 +15,6 @@ internal sealed class HudMotion(ICoreClientAPI capi) : IDisposable
 
     private static long Now => Environment.TickCount64;
 
-    // 0 at the start of a move, 1 at its end, slowing down towards it
     private static double Ease(double t)
     {
         var u = 1 - Math.Clamp(double.IsFinite(t) ? t : 1, 0, 1);
@@ -25,13 +23,10 @@ internal sealed class HudMotion(ICoreClientAPI capi) : IDisposable
 
     public bool Closing => _closingAt >= 0;
 
-    // Faded out after a close: time to close the dialog for real
     public bool Closed => Closing && Now - _closingAt >= CloseMs;
 
-    // How far the window is in: 0 gone, 1 fully there
     public double Shown => Closing ? 1 - Ease((Now - _closingAt) / CloseMs) : Ease((Now - _openedAt) / OpenMs);
 
-    // On opening, and to come back while still fading out: from where the fade got to
     public void Open()
     {
         var t = Closing ? 1 - Math.Cbrt(1 - Shown) : 0; // Ease inverted: the fade goes on from where it is
@@ -46,7 +41,6 @@ internal sealed class HudMotion(ICoreClientAPI capi) : IDisposable
         _ = Assert(_closingAt >= 0);
     }
 
-    // The canvas with its shadow, risen and faded in by Shown
     public void Draw(HudCanvas canvas, double x, double y, float z)
     {
         if (!NotNull(canvas) || !Solid()) return;
@@ -61,7 +55,6 @@ internal sealed class HudMotion(ICoreClientAPI capi) : IDisposable
         canvas.Fade(cx, cy, z, s, 1 - (1 - s) * Shrink);
     }
 
-    // The hit under the mouse lit, fading in; a click's flash fading out. Rows across the window get a lighter touch than buttons.
     public void Hover(HudCanvas canvas, List<HudUi.Hit> hits, float z)
     {
         if (!NotNull(canvas) || !NotNull(hits) || !Solid()) return;
@@ -89,7 +82,6 @@ internal sealed class HudMotion(ICoreClientAPI capi) : IDisposable
         (_flash, _flashAt) = ((hit.X, hit.Y, hit.W, hit.H), Now);
     }
 
-    // An underline sliding from the tab it was under to the open one
     public void Slide(HudCanvas canvas, (double X, double Y, double W, double H) to, float z, Rgba color)
     {
         if (!NotNull(canvas) || !Assert(to.W >= 0) || !Solid()) return;
@@ -106,7 +98,6 @@ internal sealed class HudMotion(ICoreClientAPI capi) : IDisposable
     private (double X, double Y, double W, double H) Lerp(double t) => !Assert(t is >= 0 and <= 1) ? _to :
         (_from.X + (_to.X - _from.X) * t, _from.Y + (_to.Y - _from.Y) * t, _from.W + (_to.W - _from.W) * t, _from.H + (_to.H - _from.H) * t);
 
-    // A drag's landing: on the snap step, inside the frame's margin
     public static double Snap(double at, double size, double frame)
     {
         var step = scaled(HudSettings.SnapStep);
@@ -115,7 +106,6 @@ internal sealed class HudMotion(ICoreClientAPI capi) : IDisposable
         return Math.Clamp(Math.Round(at / step) * step, margin, Math.Max(margin, frame - size - margin));
     }
 
-    // The white canvas the quads are cut from, made once
     private bool Solid()
     {
         if (!NotNull(_solid) || _solid.Ready) return true;

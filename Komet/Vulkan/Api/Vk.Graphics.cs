@@ -1,4 +1,3 @@
-
 namespace Komet.Vulkan;
 
 internal static partial class Vk

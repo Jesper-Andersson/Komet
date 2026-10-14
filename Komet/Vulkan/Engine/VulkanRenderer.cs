@@ -1,13 +1,13 @@
 using HarmonyLib;
+using Komet.Diagnostics;
 using Vintagestory.Client.NoObf;
 
 namespace Komet.Vulkan;
 
-// LiquidDepth and Shadows are deferred (they commute with OpenGL's work); Opaque (after the sky, before the entities),
-// Transparent (after the clouds) and WaterPlants (before the decals) are ordered, handed off right after
-// ChunkRenderer.RenderOpaque, RenderOIT and RenderAfterOIT. The programs are read back from the driver as the engine
-// compiled them, so its settings and other mods' changes carry over. The phase is decided in the Before stage only, so a
-// frame is Vulkan's or OpenGL's from its start; Off keeps what Vulkan holds for switching on again.
+// Vulkan-only: Vulkan draws every terrain pass (liquid depth, shadow maps, opaque, transparent, water plants) and, via
+// the scene, the rest of the frame; OpenGL rests. Programs are read back from the driver as compiled, keeping engine
+// settings and mod changes. The phase is decided only in Before, so a frame is wholly Vulkan's or GL's; Off keeps
+// Vulkan's holdings.
 internal static partial class VulkanRenderer
 {
     public enum Phase
@@ -48,19 +48,21 @@ internal static partial class VulkanRenderer
     private static string _failure = "";
     private static bool _failed;
 
-    public static bool Enabled { get; set; }
-    public static bool Opaque { get; set; } = true;
-    public static bool Shadows { get; set; } = true;
-    public static bool LiquidDepth { get; set; } = true;
-    public static bool Transparent { get; set; } = true;
+    // The wait for the GPU at the frame's start instead of in its middle (VulkanFrame.Pace)
+    public static bool Pacing { get; set; } = true;
 
-    // The handoff left out where OpenGL touched nothing shared since the last one (VulkanFrame.Lazy), with the scene on
-    public static bool LazyHandoff { get; set; } = true;
-    public static bool WaterPlants { get; set; } = true;
+    // Vulkan-only: refreshes the engine misses are shown turned as the camera goes (FrameBridge)
+    public static bool Bridging { get; set; }
 
-    // The opaque terrain and, with the scene on, the shadow passes test and write a depth of Komet's own (TerrainRenderer.Owned):
-    // what lies behind is rejected before it is shaded
-    public static bool OwnDepth { get; set; } = true;
+    // Vulkan-only: the terrain past TerrainRenderer.FarRadius drawn now and then into a layer laid in between
+    public static bool FarCaching { get; set; }
+
+    // FramePacer's, at window_RenderFrame's start
+    public static void Paced()
+    {
+        if (!Pacing || State != Phase.Running || _renderer is not { } renderer || !Assert(renderer.Frame.Number >= 0)) return;
+        renderer.Frame.Pace();
+    }
 
     public static Phase State { get; private set; }
     public static string Status { get; private set; } = "";
@@ -78,16 +80,20 @@ internal static partial class VulkanRenderer
         Patch(harmony);
         VulkanWatch.Watching = () => State == Phase.Running;
         VulkanWatch.Start();
+        Recorded();
     }
 
     public static void Stop()
     {
         _ = Assert(Built.Length == Programs.Length);
         Unhook();
+        Unpushed();
         VulkanWatch.Stop();
         Release();
         GlTap.Untap();
         (_failed, _failure, State, Status) = (false, "", Phase.Off, "");
+        if (_held) (_only, _held) = (false, false); // switched off while lean could not give back: off with the world
+        GlTap.GuiStage = false;
         foreach (var porting in Porting.Bounded(Programs.Length)) porting?.Drop();
         Array.Clear(Porting);
         Array.Clear(Ports);
@@ -113,7 +119,7 @@ internal static partial class VulkanRenderer
                 ShaderPrograms.Chunktopsoil, ShaderPrograms.Chunkliquid, ShaderPrograms.Chunktransparent]
             : [];
 
-    // Ported on a builder: until the port is done its pass stays OpenGL's (PassOf finds no port)
+    // Ported on a builder and awaited: a pass without its port would be missing from the picture
     internal static void Update(ShaderProgramBase?[] programs, TerrainRenderer? renderer, ReadOnlySpan<bool> passes)
     {
         if (!NotNull(programs) || !Assert(programs.Length == Programs.Length)) return;
@@ -121,6 +127,7 @@ internal static partial class VulkanRenderer
         {
             if (Needed(i, passes) && programs[i] is { ProgramId: > 0 } program && program.ProgramId != Built[i])
                 Port(i, program.ProgramId, renderer);
+            if (Porting[i] is { Done: false } waited) _ = waited.Awaited(Hitches.Kind.Port); // else missing
             if (Porting[i] is { Done: true } done) Ported(i, done, renderer);
         }
     }
@@ -142,7 +149,11 @@ internal static partial class VulkanRenderer
         if (!Index(at, Programs.Length) || !NotNull(done)) return;
         Porting[at] = null;
         var ported = Ports[at] = done.Take(out var error);
-        if (ported is not null) _ = renderer?.Watch(Programs[at].Name, Built[at], ported);
+        if (ported is not null && renderer?.Watch(Programs[at].Name, Built[at], ported) is { } watched)
+        {
+            watched.Sources = PipelineRecipes.SourcesOf(Built[at]); // the pipelines it drew with at earlier starts begin now
+            renderer.Warm(watched);
+        }
         _logger?.Notification("Komet: Vulkan port of {0}: {1}", Programs[at].Name,
             ported is null ? error : $"{FrameClock.ToMs(done.Ticks):0} ms off the engine's thread");
     }
@@ -151,7 +162,7 @@ internal static partial class VulkanRenderer
         Index(at, Programs.Length) && Assert(passes.Length == Taking.Length) &&
         (passes[(int)Programs[at].Pass] || (Programs[at].Also != Pass.None && passes[(int)Programs[at].Also]));
 
-    // None for what stays OpenGL's (Komet's distant shadow cascade after the far map)
+    // None for what is no terrain pass's (Komet's distant shadow cascade after the far map: the scene's)
     internal static Pass PassOf(int program, EnumRenderStage stage)
     {
         if (!Assert(program >= 0) || program == 0) return Pass.None;
@@ -169,24 +180,15 @@ internal static partial class VulkanRenderer
         };
     }
 
-    internal static SegmentSync SyncOf(Pass pass) =>
-        Assert(pass != Pass.None) && pass is Pass.Opaque or Pass.Transparent or Pass.WaterPlants
-            ? SegmentSync.Ordered
-            : SegmentSync.Deferred;
-
-    // The opaque pass samples the liquid depth and the shadow maps, so all four are shared whichever pass is on
-    private static int[] Shared() => (Assert(Taking.Length == 5), SceneOn, Taking[(int)Pass.Transparent]) switch
-    {
-        (false, _, _) => [],
-        (_, true, _) => EveryFramebuffer,
-        (_, _, true) => TerrainAndTransparent,
-        _ => TerrainFramebuffers
-    };
+    // The engine framebuffers Vulkan's images stand for: every one with the scene, else the terrain passes'
+    private static int[] Shared() => Assert(Taking.Length == 5) && SceneOn ? EveryFramebuffer : TerrainAndTransparent;
 
     private const int EngineFramebuffers = 18; // EnumFrameBuffer: Primary 0 to SSAOBlurHorizontalHalfRes 17
 
     private static readonly int[] EveryFramebuffer = [.. Enumerable.Range(0, EngineFramebuffers)],
-        TerrainFramebuffers =
-            [TerrainTargets.Primary, TerrainTargets.LiquidDepth, TerrainTargets.ShadowFar, TerrainTargets.ShadowNear],
-        TerrainAndTransparent = [.. TerrainFramebuffers, TerrainTargets.Transparent];
+        TerrainAndTransparent =
+        [
+            TerrainTargets.Primary, TerrainTargets.LiquidDepth, TerrainTargets.ShadowFar, TerrainTargets.ShadowNear,
+            TerrainTargets.Transparent
+        ];
 }

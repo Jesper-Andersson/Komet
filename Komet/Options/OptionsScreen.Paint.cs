@@ -1,4 +1,6 @@
 using System.Text.RegularExpressions;
+using Komet.Api;
+using Komet.Hud;
 using static Komet.Options.KometPages;
 
 namespace Komet.Options;
@@ -29,20 +31,24 @@ internal sealed partial class OptionsScreen
         _hits.Add(new Hit(x, 0, h, h, (_, _) => Close(), Glow: StrongGlow, Group: TopGroup));
     }
 
-    // Closing without Done (the ×, Escape) drops what was not applied
     private bool Close()
     {
         _staged.Clear();
         return Assert(_staged.Count == 0) && TryClose();
     }
 
+    // Scrolls when the pages outgrow it (the game's, Komet's and every mod's); the chosen page is brought into view
+    // as it is selected (SideFollow), a wheel over the sidebar scrolls it
     private void Sidebar(Columns c, string current)
     {
-        var (bottom, rowH) = (c.Height - (c.Desc > 0 ? 0 : 3 * (S(ButtonHeight) + c.Gap)), S(RowHeight));
+        var (bottom, rowH) = (c.Height - (c.Desc > 0 ? 0 : 3 * (S(ButtonHeight) + c.Gap)), S(SideRow));
         if (!Assert(bottom > c.Top) || !Assert(rowH > 0)) return;
         _canvas.Fill(0, c.Top, c.Side, c.Height - c.Top, Panel);
-        _canvas.Clip(0, c.Top, c.Side, bottom - c.Top);
-        var y = c.Top + S(Spacer);
+        var view = bottom - c.Top;
+        _sideView = (0, c.Top, c.Side, view);
+        var total = SideScrolled(current, rowH, view);
+        _canvas.Clip(0, c.Top, c.Side, view);
+        var y = c.Top + S(Spacer) - _sideScroll;
         string? section = null;
         foreach (var page in _pages.Bounded(MaxPages))
         {
@@ -50,26 +56,67 @@ internal sealed partial class OptionsScreen
             {
                 if (section is not null) y += 2 * S(Spacer);
                 section = page.Section;
-                SectionName(y, section);
+                SectionName(y, section, c.Side);
                 y += S(SectionHeight);
             }
 
             var chosen = _query.Length == 0 && page.Id == current;
             if (chosen) Lit(0, y, c.Side, rowH);
-            _canvas.Text(S(Pad) * 1.5, y, rowH, _fonts.Text, page.Title, chosen ? null : Soft);
-            _hits.Add(new Hit(0, y, c.Side, rowH, (_, _) => Select(page), Glow: RowGlow, Group: SideGroup));
+            _canvas.Text(S(Pad) * 1.5, y, rowH, _fonts.Text, Fit(page.Title, c.Side - 2.5 * S(Pad)), chosen ? null : Soft);
+            if (y + rowH > c.Top && y < bottom)
+                _hits.Add(new Hit(0, Math.Max(y, c.Top), c.Side, Math.Min(y + rowH, bottom) - Math.Max(y, c.Top), (_, _) => Select(page),
+                    Glow: RowGlow, Group: SideGroup));
             y += rowH;
+        }
+
+        if (total > view) // a thumb at the edge says how much lies above and below
+        {
+            var (thumb, track) = (Math.Max(S(Spacer) * 2, view * view / total), view - 2);
+            _canvas.Fill(c.Side - S(AccentBar), c.Top + 1 + (track - thumb) * _sideScroll / Math.Max(1, total - view), S(AccentBar) / 2,
+                thumb, Faint);
         }
 
         _canvas.Unclip();
     }
 
-    private void SectionName(double y, string section)
+    // The sidebar's whole height; the scroll clamped to it and, following a selection, moved to show the chosen page
+    private double SideScrolled(string current, double rowH, double view)
+    {
+        var (total, chosenAt) = (S(Spacer), double.NaN);
+        string? section = null;
+        if (!Assert(rowH > 0) || !Assert(view > 0)) return 0;
+        foreach (var page in _pages.Bounded(MaxPages))
+        {
+            if (page.Section != section)
+            {
+                if (section is not null) total += 2 * S(Spacer);
+                section = page.Section;
+                total += S(SectionHeight);
+            }
+
+            if (_query.Length == 0 && page.Id == current) chosenAt = total;
+            total += rowH;
+        }
+
+        total += S(Spacer);
+        if (!Finite(_sideScroll)) _sideScroll = 0;
+        if (_sideFollow && Finite(chosenAt))
+        {
+            if (chosenAt < _sideScroll) _sideScroll = chosenAt - S(Spacer);
+            else if (chosenAt + rowH > _sideScroll + view) _sideScroll = chosenAt + rowH + S(Spacer) - view;
+        }
+
+        _sideFollow = false;
+        _sideScroll = Math.Clamp(_sideScroll, 0, Math.Max(0, total - view));
+        return total;
+    }
+
+    private void SectionName(double y, string section, double width)
     {
         var half = S(SectionHeight) / 2;
         if (!NotNull(section) || !Finite(y) || !Assert(half > 0)) return;
-        _canvas.Text(S(Pad), y, half, _fonts.Title, section);
-        _canvas.Text(S(Pad), y + half, half, _fonts.Text, Version(section), Faint);
+        _canvas.Text(S(Pad), y, half, _fonts.Title, Fit(section, width - 2 * S(Pad), _fonts.Title));
+        _canvas.Text(S(Pad), y + half, half, _fonts.Text, Fit(Version(section), width - 2 * S(Pad)), Faint);
     }
 
     private string Version(string section)
@@ -83,7 +130,7 @@ internal sealed partial class OptionsScreen
     private void Select(OptionPage page)
     {
         if (!NotNull(page) || !Assert(page.Id.Length > 0)) return;
-        (_page, _scroll, _query, _searching, _picker, _dirty) = (page.Id, 0, "", false, null, true);
+        (_page, _scroll, _query, _searching, _picker, _dirty, _focus, _sideFollow) = (page.Id, 0, "", false, null, true, null, true);
     }
 
     private void Content(Columns c, List<Item> items)
@@ -109,16 +156,17 @@ internal sealed partial class OptionsScreen
         {
             case ItemKind.Section:
                 Band(x, y, w, item.Height);
-                _canvas.Text(x + S(Pad), y, item.Height, _fonts.Title, item.Text);
+                _canvas.Text(x + S(Pad), y, item.Height, _fonts.Title,
+                    Fit(item.Text, w - 3 * S(Pad) - _canvas.TextWidth(_fonts.Text, item.Page.Section), _fonts.Title));
                 Value(x + w - S(Pad), y, item.Height, item.Page.Section, Faint);
                 break;
             case ItemKind.Page:
                 Band(x, y, w, item.Height);
-                _canvas.Text(x + S(Pad), y, item.Height, _fonts.Header, item.Text, Title);
+                _canvas.Text(x + S(Pad), y, item.Height, _fonts.Header, Fit(item.Text, w - 2 * S(Pad), _fonts.Header), Title);
                 break;
             case ItemKind.Group:
                 _canvas.Fill(x, y, w, item.Height, RowBack);
-                _canvas.Text(x + S(Pad), y, item.Height, _fonts.Header, item.Text.ToUpperInvariant(), Faint);
+                _canvas.Text(x + S(Pad), y, item.Height, _fonts.Header, Fit(item.Text.ToUpperInvariant(), w - 2 * S(Pad), _fonts.Header), Faint);
                 break;
             case ItemKind.Row when item.Row is { } row:
                 Guarded(row, x, y, w, item.Height);
@@ -126,7 +174,7 @@ internal sealed partial class OptionsScreen
         }
     }
 
-    // A mod's getter that throws costs its row, not the screen: the row keeps its name, the log gets the exception once
+    // A throwing mod getter costs its row, not the screen; logged once
     private void Guarded(OptionRow row, double x, double y, double w, double h)
     {
         if (!NotNull(row) || !Finite(y)) return;
@@ -144,11 +192,13 @@ internal sealed partial class OptionsScreen
 
     private void Row(OptionRow row, double x, double y, double w, double h)
     {
-        var (hovered, enabled) = (ReferenceEquals(row, _hover) || ReferenceEquals(_drag?.Option, row), row.IsEnabled);
+        var enabled = row.IsEnabled;
         if (!Assert(h > 0) || !Assert(w > 0)) return;
         _canvas.Fill(x, y, w, h, RowBack);
-        if (_staged.ContainsKey(row)) _canvas.Fill(x, y, S(AccentBar), h, HudCanvas.Accent);
-        var reserved = ValueWidth(row) + (row.Kind == OptionKind.Slider ? S(TrackWidth) + S(Pad) : 0); // a slider's track shows on hover
+        double staged = _staged.ContainsKey(row) ? 1 : 0;
+        if (row.Kind == OptionKind.Slider) staged = MotionOf(row).Staged; // a slider's grows in
+        if (staged > 0.01) _canvas.Fill(x, y + h * (1 - staged) / 2, S(AccentBar), h * staged, HudCanvas.Accent);
+        var reserved = row.Kind == OptionKind.Slider ? SliderWidth(row) : ValueWidth(row);
         var label = Fit(row.Label, w - reserved - 3 * S(Pad));
         _canvas.Text(x + S(Pad), y, h, _fonts.Text, label, enabled ? null : Faint);
         if (!enabled) _canvas.Fill(x + S(Pad), y + h / 2, _canvas.TextWidth(_fonts.Text, label), 1, Faint);
@@ -163,7 +213,7 @@ internal sealed partial class OptionsScreen
                 Choice(row, x, y, w, h, right, enabled);
                 break;
             case OptionKind.Slider:
-                Slider(row, y, right, h, hovered, enabled);
+                Slider(row, y, right, h, enabled);
                 break;
             case OptionKind.Button:
                 Value(right, y, h, Caption(row), enabled ? Title : Faint);
@@ -236,27 +286,6 @@ internal sealed partial class OptionsScreen
         return names.Length > MaxCycled ? name + "  ›" : name;
     }
 
-    private void Slider(OptionRow row, double y, double right, double h, bool hovered, bool enabled)
-    {
-        var value = Value(row);
-        if (!Finite(value)) return;
-        var text = row.ValueText(value);
-        Value(right, y, h, text, enabled ? Soft : Faint);
-        double w = S(TrackWidth), left = right - Widest(row) - S(Pad) - w, range = row.Max - row.Min;
-        if (!enabled || !Assert(range > 0) || w <= S(KnobSize)) return;
-        var fraction = Math.Clamp((value - row.Min) / range, 0, 1);
-        if (hovered)
-        {
-            double track = S(Track), knob = S(KnobSize);
-            _canvas.Fill(left, y + (h - track) / 2, w, track, Rgba.White(0.18), track / 2);
-            _canvas.Fill(left, y + (h - track) / 2, w * fraction, track, HudCanvas.Accent, track / 2);
-            _canvas.Fill(left + w * fraction - knob / 2, y + (h - knob) / 2, knob, knob, Rgba.White(0.95), knob / 2);
-        }
-
-        _rows.Insert(0, new Hit(left, y, w, h, (f, _) => Stage(row, row.At(f)), true, row));
-    }
-
-    // What a row shows at its right, so its label may run up to it
     private double ValueWidth(OptionRow row)
     {
         if (!NotNull(row) || !Assert(row.Label.Length > 0)) return 0;
@@ -270,8 +299,7 @@ internal sealed partial class OptionsScreen
         };
     }
 
-    // The widest value a slider can show, so its track stays put while the value changes
-    // (up to 65 measures, so once per font size: a composition asks for it twice per slider)
+    // Keeps the track still; up to 65 measures, cached per font size
     private double Widest(OptionRow row)
     {
         if (!NotNull(row) || !Assert(row.Step > 0)) return 0;
@@ -284,19 +312,9 @@ internal sealed partial class OptionsScreen
         return widest;
     }
 
-    // The text, cut to width with an ellipsis; the description shows it whole
-    private string Fit(string text, double width)
-    {
-        if (!NotNull(text) || !Assert(width > 0) || _canvas.TextWidth(_fonts.Text, text) <= width) return text;
-        var cut = text.Length;
-        for (var i = 0; i < Math.Min(text.Length, MaxWords); i++)
-        {
-            cut = text.Length - 1 - i;
-            if (cut <= 1 || _canvas.TextWidth(_fonts.Text, text[..cut] + "…") <= width) break;
-        }
-
-        return text[..Math.Max(1, cut)].TrimEnd() + "…";
-    }
+    // Cut with an ellipsis where it would run past width (the hover description shows it whole)
+    private string Fit(string text, double width, CairoFont? font = null) =>
+        NotNull(text) && Assert(width > 0) ? _canvas.Fit(font ?? _fonts.Text, text, width, trimmed: true) : text;
 
     private void Lit(double x, double y, double w, double h)
     {
@@ -319,14 +337,20 @@ internal sealed partial class OptionsScreen
 
     private void Description(Columns c)
     {
-        if (c.Desc <= 0 || _picker is not null || _hover is not { } row) return; // an open window shows the hint itself
+        if (c.Desc <= 0 || _picker is not null || (_hover ?? _focus) is not { } row) return; // an open window shows the hint itself
         double x = c.Width - c.Desc, pad = S(Pad), line = _fonts.TextRow;
         var hint = Markup().Replace(row.Hint ?? "", ""); // the game's hints carry VTML
+        if (ReferenceEquals(row, _focus)) hint += (hint.Length > 0 ? "\n\n" : "") + T("slider-keys");
         if (row.Locked?.Invoke() is { } locked) hint = locked + "\n" + hint;
         var (title, lines) = (Wrap(row.Label, _fonts.Header, c.Desc - 2 * pad), Wrap(hint, _fonts.Text, c.Desc - 2 * pad));
         var room = c.Height - c.Top - 3 * (S(ButtonHeight) + c.Gap) - 2 * pad - title.Count * _fonts.HeaderRow; // above the buttons
         if (!Assert(line > 0)) return;
-        if (lines.Count * line > room) lines = [.. lines.Take(Math.Max(0, (int)(room / line)))];
+        if (lines.Count * line > room) // the room above the buttons: the last line says there is more
+        {
+            lines = [.. lines.Take(Math.Max(1, (int)(room / line)))];
+            lines[^1] = Fit(lines[^1].TrimEnd() + " …", c.Desc - 2 * pad);
+        }
+
         _canvas.Fill(x, c.Top, c.Desc, 2 * pad + (title.Count * _fonts.HeaderRow) + lines.Count * line, Panel);
         var y = c.Top + pad;
         foreach (var text in title.Bounded(MaxLines))

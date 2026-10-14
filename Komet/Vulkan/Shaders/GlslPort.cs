@@ -4,10 +4,9 @@ using System.Text.RegularExpressions;
 
 namespace Komet.Vulkan;
 
-// Runs after the preprocessor, so no macro or conditional is left to reason about. Storage buffers sit at their OpenGL binding plus
-// 40 and uniform blocks plus 56, as OpenGL keeps a binding namespace per kind and Vulkan one per set. Vertex outputs get locations
-// in order and fragment inputs by name, as OpenGL's linker matches them. Every change keeps the line count, so the compiler's
-// messages point into the preprocessed source.
+// Runs after the preprocessor. Storage buffers sit at their OpenGL binding + 40, uniform blocks + 56 (OpenGL has a
+// namespace per kind, Vulkan one per set). Vertex outputs get locations in order, fragment inputs by name, as OpenGL's
+// linker matches. Line count is kept so compiler messages point into the preprocessed source.
 internal static partial class GlslPort
 {
     public const int VertexBlock = 0, FragmentBlock = 1, FirstSampler = 8, MaxSamplers = 32, FirstStorage = 40,
@@ -22,7 +21,7 @@ internal static partial class GlslPort
 
     private sealed class Context(IReadOnlyDictionary<string, int>? attributes)
     {
-        // Loose uniforms that go into the push constants both stages share (KometHot) instead of the stage's block
+        // Loose uniforms put into the push constants both stages share (KometHot)
         public IReadOnlySet<string> Hot { get; init; } = new HashSet<string>(StringComparer.Ordinal);
         public Dictionary<string, Sampler> Samplers { get; } = new(StringComparer.Ordinal);
         public Dictionary<string, int> Locations { get; } = new(StringComparer.Ordinal);
@@ -56,7 +55,8 @@ internal static partial class GlslPort
         if (blockAt >= 0) _ = output.Insert(blockAt, LooseBlocks(vertex, uniforms, context.Hot));
         var ported = Version().Replace(output.ToString(), Versioned, 1);
         if (!vertex) return ported;
-        return VertexId().Replace(ported, m => m.Value == "gl_VertexID" ? "gl_VertexIndex" : "gl_InstanceIndex");
+        ported = VertexId().Replace(ported, m => m.Value == "gl_VertexID" ? "gl_VertexIndex" : "gl_InstanceIndex");
+        return PointSized ? Sized(ported) : ported;
     }
 
     private static string LooseBlocks(bool vertex, List<Uniform> uniforms, IReadOnlySet<string> hot)
@@ -139,7 +139,7 @@ internal static partial class GlslPort
         Assert(type.Length > 0) && (type.Contains("sampler", StringComparison.Ordinal) ||
                                     type.Contains("image", StringComparison.Ordinal) || type == "atomic_uint");
 
-    // A declaration's replacement (as many lines as it had), or null to keep it as it is
+    // Replacement with as many lines, or null to keep it
     private static string? Declaration(string statement, bool vertex, Context context, List<Uniform> uniforms)
     {
         var match = DeclarationPattern().Match(statement);
@@ -212,7 +212,7 @@ internal static partial class GlslPort
         return found;
     }
 
-    // A constant array size: sums and products of integers, which is what the engine's macros leave; -1 for anything else
+    // Sums and products of integers (what the engine's macros leave); -1 otherwise
     private static int ArraySize(string size)
     {
         var tokens = SizeToken().Matches(size);

@@ -1,4 +1,5 @@
 using Komet.Gpu;
+using Komet.Rendering;
 using Komet.Vulkan;
 using OpenTK.Graphics.OpenGL;
 
@@ -61,7 +62,7 @@ public sealed class SortedDrawsGpuTests
     [Test]
     public void OnlyAnOrderlessStateIsSorted()
     {
-        using var window = OcclusionGpuTests.Context();
+        using var window = GlContext.Context();
         if (window is null) Assert.Ignore("no OpenGL 4.6 context here");
         Assert.That(OcclusionCulling.Orderless(), Is.False, "not tapped: OpenGL's state unknown");
         GL.Enable(EnableCap.DepthTest);

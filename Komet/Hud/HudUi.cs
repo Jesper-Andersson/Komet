@@ -2,7 +2,7 @@ using Cairo;
 
 namespace Komet.Hud;
 
-// The fonts of the HUD's windows and overlay, at the mockup's pixel sizes times the font scale (CairoFont applies the GUI scale)
+// HUD fonts at the mockup's pixel sizes times the font scale (CairoFont applies the GUI scale)
 internal sealed class HudUiFonts
 {
     private const double Unit = 1.15; // mockup px to the game's unscaled font size
@@ -28,7 +28,6 @@ internal sealed class HudUiFonts
     public double HugeRow { get; private set; }
     public double MonoRow { get; private set; }
 
-    // Rebuilt when the font scale or the GUI scale changed
     public void Update(double fontScale)
     {
         var gui = BitConverter.SingleToInt32Bits(RuntimeEnv.GUIScale);
@@ -47,17 +46,18 @@ internal sealed class HudUiFonts
         Assert(font.UnscaledFontsize > 0) ? font.GetFontExtents().Height * 1.12 : 0;
 }
 
-// The mockup's look on a canvas: rows, headers, tiles, stat boxes, meters, chips, buttons, links, graphs and segmented bars, laid
-// out top to bottom from a cursor (Y, in content pixels) inside a column (X, W) that scrolls under a clip (Top..Bottom on the
-// canvas). Every clickable part leaves a hit box in canvas pixels; a part outside the view is skipped, its height still counted.
+// The mockup's look, laid out top-down from cursor Y in column (X, W) under clip Top..Bottom; off-view parts are
+// skipped but counted. Clickable parts leave hit boxes in canvas px.
 internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, double W, double Top, double Bottom, double Scroll) view,
     List<HudUi.Hit> hits)
 {
     public const int MaxHits = 512;
 
+    [ThreadStatic] private static List<string>? _lines; // Wrap's, reused
+    private static List<string> Wrapped => _lines ??= [];
+
     public readonly record struct Hit(double X, double Y, double W, double H, Action Click);
 
-    // The topmost hit (the last laid) under the point, relative to the canvas
     public static Hit? HitAt(List<Hit> hits, double x, double y)
     {
         if (!NotNull(hits) || !Assert(hits.Count <= MaxHits)) return null;
@@ -79,10 +79,8 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
     public double W => view.W;
     public double Y { get; set; }
 
-    // mockup px to screen px
     public double Px(double px) => scaled(px * fonts.Scale);
 
-    // Green to red over 0..100 %, as the mockup's tone()
     public static Rgba Tone(double percent)
     {
         var t = double.IsFinite(percent) ? Math.Clamp(percent / 100, 0, 1) : 0;
@@ -113,21 +111,8 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
     public void TextRight(double right, double y, double h, CairoFont font, string text, Rgba? color = null) =>
         Text(right - TextW(font, text), y, h, font, text, color);
 
-    // Cut to width with an ellipsis
-    public string Fit(CairoFont font, string text, double width)
-    {
-        if (!NotNull(font) || !Finite(width)) return text;
-        if (text.Length == 0 || TextW(font, text) <= width) return text;
-        var (lo, hi) = (0, text.Length);
-        for (var step = 0; step < 16 && lo < hi; step++)
-        {
-            var mid = (lo + hi + 1) / 2;
-            if (TextW(font, text[..mid] + "…") <= width) lo = mid;
-            else hi = mid - 1;
-        }
-
-        return Assert(lo <= text.Length) ? text[..lo] + "…" : text;
-    }
+    public string Fit(CairoFont font, string text, double width) =>
+        NotNull(font) && Finite(width) ? canvas.Fit(font, text, width) : text;
 
     public void Fill(double x, double y, double w, double h, Rgba color, double radius = 0)
     {
@@ -136,7 +121,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
         canvas.Fill(x, At(y), w, h, color, radius);
     }
 
-    // A line of text left and one right, the row's height down
     public void Row(string left, string right, Rgba? leftColor = null, Rgba? rightColor = null, CairoFont? font = null,
         Action? click = null)
     {
@@ -160,28 +144,19 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
         Y += h;
     }
 
-    // Word-wrapped to the column, indent px in
     public void Wrap(string text, Rgba? color = null, CairoFont? font = null, double indent = 0)
     {
         var f = font ?? fonts.Body;
         var h = f == fonts.Small ? fonts.SmallRow : fonts.BodyRow;
-        var line = "";
-        foreach (var word in text.Split(' ').Bounded(512))
+        Wrapped.Clear();
+        canvas.Wrap(f, text, W - indent, 512, Wrapped);
+        foreach (var line in Wrapped.Bounded(512))
         {
-            var next = line.Length == 0 ? word : line + " " + word;
-            if (line.Length > 0 && TextW(f, next) > W - indent)
-            {
-                Text(X + indent, Y, h, f, line, color);
-                (Y, line) = (Y + h, word);
-            }
-            else line = next;
+            Text(X + indent, Y, h, f, line, color);
+            Y += Assert(h > 0) ? h : 0;
         }
-
-        Text(X + indent, Y, h, f, line, color);
-        Y += Assert(h > 0) ? h : 0;
     }
 
-    // Word-wrapped into at most max lines of width, the last cut with an ellipsis when the text goes on
     public string[] Lines(string text, CairoFont font, double width, int max)
     {
         if (!NotNull(text) || !Assert(max is > 0 and <= 64) || !Assert(width > 0)) return [];
@@ -209,7 +184,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
         return [.. lines];
     }
 
-    // The mockup's .lbl: a small faint caption with space above
     public void Label(string text)
     {
         if (!NotNull(text) || !Assert(view.W > 0)) return;
@@ -218,7 +192,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
         Y += fonts.SmallRow + Px(3);
     }
 
-    // The mockup's .hd: a header on a faint band
     public void Header(string text)
     {
         if (!NotNull(text) || !Assert(view.W > 0)) return;
@@ -239,7 +212,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
 
     public void Space(double px) => Y += Px(px);
 
-    // count cells in columns, gap px apart; each cell drawn at (x, y, width), the row as high as its highest cell
     public void Grid(int columns, int count, double gap, System.Func<int, double, double, double, double> cell)
     {
         if (!Assert(columns is > 0 and <= 8) || !NotNull(cell) || count <= 0) return;
@@ -256,7 +228,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
         Y += row;
     }
 
-    // The mockup's .tile: a big number over its label; its height
     public double Tile(double x, double y, double w, string value, string label)
     {
         if (!NotNull(value) || !Assert(w > 0)) return 0;
@@ -267,7 +238,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
         return Assert(h > 0) ? h : 0;
     }
 
-    // The mockup's .st: label, value, an optional line under it
     public double Stat(double x, double y, double w, string label, string value, string sub = "", Rgba? color = null)
     {
         if (!NotNull(value) || !Assert(w > 0)) return 0;
@@ -281,7 +251,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
         return Assert(h > 0) ? h : 0;
     }
 
-    // The mockup's meter: label and value on a line, a thin bar in the green-to-red tone under them
     public double Meter(double x, double y, double w, string label, string value, double percent)
     {
         if (!NotNull(value) || !Assert(w > 0)) return 0;
@@ -295,7 +264,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
         return Assert(h > 0) ? h : 0;
     }
 
-    // An inline bar, 6 px high, w wide, centred in a row of height h
     public void Bar(double x, double y, double w, double h, double percent)
     {
         if (!Finite(x) || !Finite(y)) return;
@@ -306,7 +274,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
         _ = Assert(w > 0);
     }
 
-    // The mockup's .ch: a small rounded label, accent when on; its width
     public double Chip(double x, double y, string text, bool on, Action? click)
     {
         if (!NotNull(text) || !Finite(x)) return 0;
@@ -320,14 +287,12 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
 
     public double ChipHeight => fonts.SmallRow + Px(2);
 
-    // A row of chips from the left; the next x
     public double Chips(double x, double y, ReadOnlySpan<(string Text, bool On, Action Click)> chips)
     {
         foreach (var (text, on, click) in chips.Bounded(16)) x += Chip(x, y, text, on, click) + Px(4);
         return Assert(x >= 0) ? x : 0;
     }
 
-    // The mockup's .go: a filled button; its width
     public double Go(double x, double y, string text, Action click, bool stop = false, bool enabled = true)
     {
         if (!NotNull(text) || !NotNull(click)) return 0;
@@ -342,7 +307,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
 
     public double GoHeight => fonts.StrongRow + Px(6);
 
-    // The mockup's .lk: a link in light blue; its width
     public double LinkText(double x, double y, string text, Action click, CairoFont? font = null)
     {
         if (!NotNull(text) || !NotNull(click)) return 0;
@@ -354,7 +318,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
         return Assert(w >= 0) ? w : 0;
     }
 
-    // A bar of coloured parts, the mockup's segmented bars
     public void Segments(double y, double h, ReadOnlySpan<(double Value, Rgba Color)> parts, double total = double.NaN)
     {
         double sum = 0;
@@ -373,7 +336,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
         _ = Assert(x <= X + W + 1);
     }
 
-    // Frame times as a line over the last count frames, max ms at the top; guides at 60 and 30 fps when big
     public void Graph(double h, int count, System.Func<int, double> ms, bool guides, double maxMs = 40, bool fpsLine = true)
     {
         if (!Assert(count > 1) || !NotNull(ms)) return;
@@ -394,15 +356,13 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
 
             (double, double) Point(int i) =>
                 Index(i, count) && double.IsFinite(ms(i)) ? (x + w * i / (count - 1), ToY(ms(i))) : (x + w * i / (count - 1), double.NaN);
-            canvas.Area(count, Point, At(y), At(y) + h, Accent with { A = 0.42 });
-            canvas.Polyline(count, Point, Rgba.White(0.92), Math.Max(1, Px(1.2)));
+            canvas.Graph(count, Point, (At(y), At(y) + h), Accent with { A = 0.42 }, (Rgba.White(0.92), Math.Max(1, Px(1.2))));
             Peaks(count, ms, Point, fpsLine ? 1000 / 30.0 : maxMs * 0.6);
         }
 
         Y += h;
     }
 
-    // A red dot on each frame over limit that is the highest of its neighbours
     private void Peaks(int count, System.Func<int, double> ms, System.Func<int, (double X, double Y)> at, double limit)
     {
         if (!NotNull(ms) || !Assert(limit > 0)) return;
@@ -411,7 +371,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
                 canvas.Circle(px, py, Px(2.4), Err);
     }
 
-    // A small pin mark (a filled dot with a short stem) at the start of a row
     public void Pin(double x, double y, double h)
     {
         if (!Finite(x) || !Assert(h > 0)) return;
@@ -428,7 +387,7 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
         canvas.Triangle(x, At(y) + (h - Px(9)) / 2, Px(10), Warn);
     }
 
-    // A caret, a check mark and a dot, centred in a row of height h: the game's fonts lack ▸ ▾ ✓ ●
+    // Caret, check mark and dot drawn: the game's fonts lack ▸ ▾ ✓ ●
     public double Caret(double x, double y, double h, bool down, Rgba? color = null)
     {
         if (!Finite(x) || !Assert(h > 0)) return 0;
@@ -455,7 +414,6 @@ internal sealed class HudUi(HudCanvas canvas, HudUiFonts fonts, (double X, doubl
         return 2 * r;
     }
 
-    // A close cross and a gear, drawn: the game's fonts lack the glyphs
     public void Cross(double x, double y, double size, Rgba color)
     {
         if (!Finite(x) || !Assert(size > 0)) return;

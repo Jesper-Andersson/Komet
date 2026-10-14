@@ -2,6 +2,8 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using HarmonyLib;
+using Komet.Api;
+using Komet.Core;
 using Vintagestory.API.Client.Tesselation;
 using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
@@ -10,15 +12,11 @@ using static Komet.Tessellation.TessSeams;
 
 namespace Komet.Tessellation;
 
-// ChunkTesselator.CalculateVisibleFaces runs an 11-way switch on FaceCullMode per face of every non-air cell. For Default - almost
-// every terrain block - that reduces to one bit formula over six field reads (Cull). Every other cell - another mode, or a cell whose
-// upper neighbour is JSONAndSnowLayer and opaque downward, for which the engine asks the cell's AllowSnowCoverage - goes through a
-// line-for-line port of the engine's face loop, run for those cells after the sweep in the engine's cell order, so the same virtual
-// calls reach the same blocks with the same arguments in the same order. An unknown mode sends the chunk to the engine before any
-// call is made; the engine then rewrites every byte the sweep wrote.
-//
-// What stays exact: air writes 0 even in the skipped centre; a non-air centre cell under skipChunkCenter keeps the previous chunk's
-// byte, as in the engine; the result is whether a non-air cell outside the skipped centre exists.
+// CalculateVisibleFaces runs an 11-way FaceCullMode switch per face of every non-air cell; for Default that is one bit
+// formula over six field reads (Cull). Other cells (other modes, or under a downward-opaque JSONAndSnowLayer, where
+// AllowSnowCoverage is asked) go through a line-for-line port after the sweep, in engine cell order (same virtual
+// calls). An unknown mode sends the chunk to the engine before any call. As in the engine, air writes 0 even in the
+// skipped centre and a non-air centre cell keeps its old byte; the result: any non-air cell outside it.
 internal static class VisibleFaces
 {
     private const int Water = 0x40, UpOpaqueDown = 32, Engine = -1;
@@ -37,7 +35,6 @@ internal static class VisibleFaces
     public static bool Enabled { get; set; } = true;
     public static bool Installed { get; private set; }
 
-    // Another prefix, transpiler or infix is on the method: the engine runs
     public static bool StoodDown { get; private set; }
 
     public static long Chunks => Counts.Total(ChunksCounter);
@@ -62,7 +59,7 @@ internal static class VisibleFaces
     {
         if (!Installed) return;
         StoodDown = EngineShape.Report(Logger, nameof(VisibleFaces), StoodDown,
-            EngineShape.Foreign(_target, EngineShape.Kinds.Replacing, null, typeof(VisibleFaces)));
+            EngineShape.Foreign(_target, PatchKinds.Replacing, null, typeof(VisibleFaces)));
     }
 
     internal static MethodInfo? Target()
@@ -72,7 +69,7 @@ internal static class VisibleFaces
         return NotNull(method) && Assert(method.ReturnType == typeof(bool)) ? method : null;
     }
 
-    // The bodies the sweep and the port reproduce: the method, the opposite side, and SmallBoolArray's indexer and int conversion
+    // Bodies the sweep and port reproduce: the method, GetOpposite, SmallBoolArray's indexer and int conversion
     internal static MethodBase?[] Shaped()
     {
         var bits = typeof(SmallBoolArray);
@@ -86,7 +83,6 @@ internal static class VisibleFaces
         return methods;
     }
 
-    // Harmony matches the parameters to the engine's by name
     private static bool Prefix(ChunkTesselator __instance, bool skipChunkCenter, int baseX, int baseY, int baseZ,
         ref bool __result)
     {
@@ -97,8 +93,7 @@ internal static class VisibleFaces
         return false;
     }
 
-    // 1 or 0 for the engine's result with the buffer filled as the engine fills it, or -1 when the engine has to do the chunk: then
-    // nothing was called on any block, and the buffer holds only bytes the engine writes again
+    // 1 or 0 as the engine's result, the buffer filled alike; -1: engine does the chunk (nothing called yet)
     internal static int Compute(ChunkTesselator tesselator, byte[]? draw, bool skip, int baseX, int baseY, int baseZ)
     {
         if (!NotNull(tesselator)) return Engine;
@@ -132,8 +127,7 @@ internal static class VisibleFaces
         return any ? 1 : 0;
     }
 
-    // The engine's cell loop with the Default cells answered in place and the others queued for the port, in the engine's order. False
-    // when the engine has to do the chunk, found before anything was called.
+    // Engine cell loop: Default cells in place, others queued for the port in order; false: engine, nothing called
     private static bool Sweep(Block[] blocks, Block air, byte[] draw, bool skip, int[] deferred, out bool any,
         out int fast, out int count)
     {
@@ -152,9 +146,7 @@ internal static class VisibleFaces
         return Assert(fast + count <= Cells);
     }
 
-    // One row of 32 cells along x. A row starts at least one plane and one row inside the halo, whose length Sweep checked, so every
-    // neighbour index is within it: the reads skip the bounds checks. The east and west sides roll along the row, each cell's
-    // opacity read once.
+    // A 32-cell row along x, a plane and a row inside the halo: unchecked neighbour reads; east and west roll along
     private ref struct Row(Block[] blocks, Block air, byte[] draw, int[] deferred)
     {
         private readonly ref Block _blocks = ref MemoryMarshal.GetArrayDataReference(blocks);
@@ -212,8 +204,8 @@ internal static class VisibleFaces
             EnumFaceCullMode.Callback or EnumFaceCullMode.MergeSnowLayer or EnumFaceCullMode.FlushExceptTop or
             EnumFaceCullMode.Stairs;
 
-        // Default: bit s is set when the neighbour on side s is not opaque toward the cell (toward: bit s is the neighbour's side
-        // GetOpposite(s)), or when the cell is not opaque on side s and not JSON or JSONAndSnowLayer
+        // Default: bit s set when side s's neighbour isn't opaque toward the cell (toward bit s = its side
+        // GetOpposite(s)), or the cell isn't opaque on s and not JSON or JSONAndSnowLayer
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static byte Cull(int toward, int own, EnumDrawType type)
         {
@@ -222,8 +214,8 @@ internal static class VisibleFaces
         }
     }
 
-    // ChunkTesselator.CalculateVisibleFaces for the queued cells: faces 5 to 0, shift then set, the snow rule on the top face, then the
-    // switch - the same reads and virtual calls with the same arguments, on the tesselator's game and tmpPos
+    // CalculateVisibleFaces for the queued cells: faces 5 to 0, shift then set, the top-face snow rule, then the
+    // switch: same reads and virtual calls, same arguments, on the tesselator's game and tmpPos
     private readonly struct Port(Block[] blocks, ClientMain? game, BlockPos pos)
     {
         public byte Cell(int e, int d, bool snowy, int x, int y, int z)
@@ -283,9 +275,8 @@ internal static class VisibleFaces
             return !neighbour.SideIsSolid(pos.Set(x + offset.X, y + offset.Y, z + offset.Z), opposite);
         }
 
-        // Short-circuited as the engine's: always the top; a neighbour not opaque toward the cell when it is below or holds less snow
-        // (the neighbour's level asked first); or a JSONAndSnowLayer neighbour whose own lower cell - if within the halo - does not
-        // allow snow cover at the cell's position
+        // As the engine short-circuits: always the top; a neighbour not opaque toward it when below or with less snow
+        // (level asked first); or a JSONAndSnowLayer neighbour whose lower cell, if in the halo, disallows snow there
         private bool MergeSnowLayer(Block block, Block neighbour, bool toward, int e, int s, int x, int y, int z)
         {
             if (!Index(s, Faces) || !Index(e - Origin, ExtCells - 2 * Origin) || s == Up) return true;

@@ -4,9 +4,8 @@ using Vintagestory.Server;
 
 namespace Komet.Host;
 
-// Between the click on a world and the join: waits for the in-process server a handover stopped and closes its savegame connection (a
-// stop that early leaves it open), waits for a previous child still saving, starts the child and joins once it accepts players. A child
-// that ends or does not come up in time falls back to the engine's singleplayer start.
+// Between world click and join: waits for the handed-over server and closes its savegame (early stop leaves it open),
+// waits for a previous child still saving, starts the child, joins. Child ends or times out: engine singleplayer start.
 internal sealed class HostScreen : GuiScreen
 {
     private const long MaxStartMs = 240_000;
@@ -102,7 +101,7 @@ internal sealed class HostScreen : GuiScreen
         HostLaunch.Fallback(ScreenManager, _args);
     }
 
-    // While the in-process server still stops, Cancel only marks it: its savegame connection is closed once it is gone
+    // While the in-process server stops, Cancel only marks; its savegame closes once it is gone
     private bool Cancel()
     {
         if (!Assert(_step != Step.Done)) return true;
@@ -131,10 +130,10 @@ internal sealed class HostScreen : GuiScreen
             Step.Previous => "host-previous",
             _ => "host-starting"
         };
-        ElementComposer?.GetDynamicText("text")?.SetNewText(T(key) + "\n\n" + line);
+        ElementComposer.GetDynamicText("text")?.SetNewText(T(key) + "\n\n" + line);
     }
 
-    // The client's mods, Komet's lang among them, load only after the join; the first world's handover runs before
+    // Client mods (Komet's lang) load only after the join; the first world's handover runs before
     private static string T(string key)
     {
         var text = Lang.Get("komet:" + key);

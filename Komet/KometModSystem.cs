@@ -1,4 +1,6 @@
 using HarmonyLib;
+using Komet.Api;
+using Komet.Core;
 using Vintagestory.Client.NoObf;
 
 namespace Komet;
@@ -15,9 +17,7 @@ public sealed class KometModSystem : ModSystem, IDisposable
     private FeatureContext? _context;
     private long _pool;
 
-    // Whether the game's server runs in this process: a singleplayer world, also one opened to LAN (ClientMain.IsSingleplayer, set
-    // before the mods start). Only then does Komet patch server code; on a remote server, vanilla or a fork such as Stratum, it patches
-    // the client alone and leaves everything the server decides (what it sends, how fast, in which order) to the server.
+    // Server in this process (singleplayer or LAN; set before mods start): only then are server-side patches installed
     internal static bool LocalServer { get; private set; }
 
     public override void Dispose()
@@ -43,7 +43,6 @@ public sealed class KometModSystem : ModSystem, IDisposable
     {
         if (!NotNull(api) || !NotNull(Mod.Logger)) return;
         Attach(Mod.Logger);
-        // started once, and as the id hardcoded in the stats and the bench
         if (!Assert(_context is null) || !Assert(Mod.Info.ModID == ModId)) return;
         try
         {
@@ -51,8 +50,7 @@ public sealed class KometModSystem : ModSystem, IDisposable
         }
         catch (Exception e) when (e is not OutOfMemoryException)
         {
-            // All or nothing: a feature that threw halfway through its own patches must not stay half installed.
-            // RegisterRenderer throws when another mod reserved the HUD's render order, after earlier stages went in.
+            // All or nothing. RegisterRenderer throws after earlier stages when another mod took the HUD's order.
             Mod.Logger.Error("Komet: install failed, Komet stands down: {0}", e);
             api.Event.LevelFinalize -= Features.Recheck;
             if (_context?.Overlay is { } overlay)
@@ -71,7 +69,6 @@ public sealed class KometModSystem : ModSystem, IDisposable
             : "Komet: remote server, Komet patches the client only");
         Features.Install(_context, FeatureStage.Main);
         Features.InstallQueued(_context);
-        Features.Install(_context, FeatureStage.Tail);
         api.Event.LevelFinalize += Features.Recheck;
         _pool = api.Event.RegisterGameTickListener(dt =>
         {

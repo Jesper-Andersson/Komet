@@ -2,9 +2,8 @@ using System.Runtime.InteropServices;
 
 namespace Komet.Vulkan;
 
-// An initializer stands in for a value never set, zero for the rest, as in OpenGL. Once Laid out, the mirror keeps an image of
-// each block, written as the uniforms come in, so a draw copies the block whole. GlTap keeps the Entry of every location it
-// watches, so a glUniform call on the hot path writes without a name lookup.
+// Unset values are the initializer, else zero, as in GL. Once Laid out, each block's image is written as uniforms
+// arrive, so a draw copies it whole. GlTap keeps each watched location's Entry: no hot-path name lookups.
 internal sealed class UniformMirror
 {
     private const int MaxWords = 4096, MaxNames = 512;
@@ -37,7 +36,6 @@ internal sealed class UniformMirror
     public long Packs { get; set; }
     public int Samplers { get; private set; }
 
-    // Where the draws last took each block's image: uploads, epoch, offset, the image's Changes then
     public (HostBuffer? Uploads, long Epoch, long At, int Changes)[] Uploaded { get; private set; } = [];
 
     // Made on first ask; null past MaxNames
@@ -165,8 +163,8 @@ internal sealed class UniformMirror
         }
     }
 
-    // The words of a uniform from word start on at their std140 places: as one block where std140 lays the elements out without
-    // gaps (a vector, a vec4 array, a mat4), a word per element where each has a slot (a float array), else word by word
+    // A uniform's words from word start at std140 places: one block where std140 packs elements gaplessly (vector, vec4
+    // array, mat4), a word per element where each has a slot (float array), else word by word
     internal static void Write(GlslPort.Uniform u, ReadOnlySpan<uint> source, Span<uint> words, int start) =>
         Write(u, NotNull(u) ? GlslPort.Shape(u.Type) : default, source, words, start);
 

@@ -1,15 +1,11 @@
 namespace Komet.Core;
 
-// Whether the features keep their counters, totals that only grow (readers take differences). Two owners, so neither can switch the
-// other's counting off. Hud: every counter, while the HUD shows them or runs its own bench. Bench: a scripted benchmark records; it
-// reads only the tessellation counters (TessAccounting, TessSchedule.NearWaiting), which count while On. The others stay off for it:
-// their cost falls on the feature arms alone, never on the engine arm.
+// Feature counters on: Hud (all, while shown or benching) or Bench (tessellation only, so the engine arm pays nothing).
 internal static class Counting
 {
     public static bool On { get; private set; }
 
-    // Raised each time Hud turns true. Before it the HUD's frames and the totals did not run together (the HUD-only totals stood still,
-    // or the HUD was hidden while the bench kept the tessellation totals going), so a difference across it is no rate.
+    // Raised when Hud turns true: a difference across it is no rate.
     public static int Epoch { get; private set; }
 
     public static bool Hud
@@ -40,10 +36,8 @@ internal static class Counting
     }
 }
 
-// Totals that only grow, counted on several threads at once (the tessellation threads) without an interlocked add per count: each
-// thread adds to a slot of its own, a cache line apart from the others, and a read sums the slots. Slots are handed out per thread for
-// the life of the process; the threads past the first Slots - 1 share the last slot through interlocked adds. A slot has one writer,
-// and aligned 64-bit reads and writes are atomic, so a read sees each slot before or after an add and two reads never go backwards.
+// Ever-growing totals without an interlocked add: each thread adds to its own cache-line slot, a read sums them,
+// threads past Slots - 1 share the last slot via Interlocked. Atomic 64-bit slots: two reads never go backwards.
 internal sealed class Tally
 {
     private const int MaxWidth = 16;
@@ -79,7 +73,6 @@ internal sealed class Tally
         return Assert(sum >= 0) ? sum : 0;
     }
 
-    // Only while no thread counts (a new world before its tessellation starts, or a test)
     public void Clear() => Array.Clear(_cells);
 
     private static int Claim()

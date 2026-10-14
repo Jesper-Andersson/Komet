@@ -8,7 +8,6 @@ internal static partial class Vk
     public const int SetLayoutCreateInfo = 32, WriteDescriptorSet = 35, MemoryBarrier = 46;
     public const uint HostVisible = 0x2, HostCoherent = 0x4, HostCached = 0x8, UsageUniform = 0x10, UsageStorage = 0x20;
     public const uint UsageIndex = 0x40, UsageVertex = 0x80, UsageIndirect = 0x100;
-    public const int ExternalMemoryBufferCreateInfo = 1000072000;
     public const uint StageCompute = 0x20, PushDescriptorLayout = 0x1;
     public const uint PipelineCompute = 0x800, PipelineIndirect = 0x2, AccessIndirect = 0x1, AccessShaderRead = 0x20;
     public const uint AccessShaderWrite = 0x40, AccessTransferRead = 0x800;

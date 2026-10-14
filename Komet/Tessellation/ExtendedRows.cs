@@ -2,32 +2,23 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using HarmonyLib;
+using Komet.Api;
+using Komet.Core;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
 using Vintagestory.Common;
 
 namespace Komet.Tessellation;
 
-// Replaces the five GetRange_Faster/GetRange calls of ChunkTesselator.BuildExtendedChunkData by helpers that decode a whole row at
-// once. Each layer's read lock is taken once per row in the engine's own nesting (blocks, then light2Lock, then light, then fluids).
-// What the engine decides is taken as the engine finds it:
-// - GetRange_Faster: the decoder GetBlockAsBlock holds (getBlockOne..Five and getBlockGeneralCase over the layer it was built for,
-//   which may no longer be blocksLayer, or getBlockAir), the palette table BlockChunkDataLayer.blocksByPaletteIndex (the thread's own
-//   once TessSafety made it one per thread, TessSafety.Palette) with its stale entries, the hand-over to GetRange when
-//   paletteCount != blocksArrayCount, and blockAir for a chunk without blocks.
-// - GetRange: GetUnsafe's switch on the live bitsize (0 reads 0 even with a palette; the general case takes dataBit0 as its first
-//   plane), blocksFast[value], and for a chunk without blocks the store of blocksFast[0] into blockAir before the row.
-// - Light: while light2 double-buffers, its planes with the light layer's live palette (Light2), else the light layer's Get
-//   (GetFromBits0 reads 0 even with a palette). Fluids: the fluid layer's Get, then blocksFast[value].
-// Anything else - an unknown or foreign-bound delegate, a missing or short plane, an index past a palette or table, a range that
-// leaves its row, arrays of another type or too short, a LightUtil with short tables - goes to the engine's method before anything is
-// written: whatever the engine throws, it throws itself. The two GetOne calls and the closing null fill stay the engine's.
-//
-// Holding a layer's read lock for a row (up to 32 cells) instead of a cell delays a writer by at most that row; FastRWLock readers
-// never wait on each other and every writer takes one lock (MoveToOtherLayer and AddToOtherLayer take blocks, then fluids, the order
-// used here), so no wait cycle can form. What the engine re-reads per cell and only a writer racing the copy could change (light2, the
-// layer fields, blockAir, the shared table, the palettes) is read once per row; with such a race the engine's result depends on timing
-// just the same.
+// Replaces BuildExtendedChunkData's GetRange_Faster/GetRange calls with whole-row decoders, each layer's read lock once
+// per row in the engine's nesting (blocks, light2Lock, light, fluids), reproducing what the engine finds:
+// GetBlockAsBlock's decoder (getBlockOne..Five/GeneralCase over its layer, or getBlockAir) with the per-thread
+// TessSafety.Palette table and stale entries, the GetRange hand-over when paletteCount != blocksArrayCount; GetUnsafe
+// on the live bitsize (0 reads 0 even with a palette) and its blocksFast[0] -> blockAir store; light2 planes with the
+// live light palette, else the light Get; fluids via Get and blocksFast. Anything unexpected (unknown or foreign
+// delegate, short plane or array, index past a palette, row overrun, short LightUtil) goes to the engine unwritten. A
+// row lock delays a writer by <= 32 cells; readers don't wait on each other and writers take blocks then fluids as
+// here: no cycle. Racy fields are read once per row.
 [SkipLocalsInit]
 internal static class ExtendedRows
 {
@@ -76,11 +67,10 @@ internal static class ExtendedRows
         Recheck();
     }
 
-    // Another patch on a method the rows bypass would be bypassed too
     internal static void Recheck()
     {
         if (!Rewritten) return;
-        var foreign = EngineShape.Foreign(_bypassed, EngineShape.Kinds.All, null, typeof(ExtendedRows),
+        var foreign = EngineShape.Foreign(_bypassed, PatchKinds.All, null, typeof(ExtendedRows),
             typeof(TessSafety));
         Blocked = EngineShape.Report(TessSeams.Logger, nameof(ExtendedRows), Blocked, foreign);
     }
@@ -105,7 +95,6 @@ internal static class ExtendedRows
         return methods;
     }
 
-    // What the rows read in place of the engine: light, fluids, the decoders they classify and ToRgba
     private static MethodBase?[] Seams()
     {
         var data = typeof(ChunkData);
@@ -122,8 +111,7 @@ internal static class ExtendedRows
         return seams;
     }
 
-    // The bodies the rows reproduce, the method they are rewritten into, and BuildFastBlockAccessArray, which fills the table
-    // GetBlockAsBlock reads
+    // Bodies the rows reproduce, the rewritten method, and BuildFastBlockAccessArray (fills GetBlockAsBlock's table)
     internal static MethodBase?[] Shaped()
     {
         MethodBase?[] methods =
@@ -158,8 +146,7 @@ internal static class ExtendedRows
         return Assert(table.Length <= MaxDecoders) && Assert(table[7].Kind == Decoder.Air) ? table : [];
     }
 
-    // Exactly four GetRange_Faster and one GetRange call become calls of the helpers below with the same stack, in place; any other
-    // count (another mod's transpiler went first) hands the IL back untouched
+    // Exactly four GetRange_Faster and one GetRange call become the helpers below, same stack; else the IL stays
     internal static List<CodeInstruction> Rewrite(IEnumerable<CodeInstruction> instructions)
     {
         Rewritten = false;
@@ -290,7 +277,7 @@ internal static class ExtendedRows
 
         if (!ok || !Fits(mode, table, blocksFast, solid, solidSame) ||
             !Fits(SolidMode.Values, null, blocksFast, fluid, fluidSame)) return false;
-        // Built on the stack and copied in one move: the copy marks the cards of the range once instead of once per cell
+        // Built on the stack and copied in one move: card marks once per range instead of per cell
         var (solidRow, fluidRow) = (new BlockRow(), new BlockRow());
         Span<Block> solidCells = solidRow[..n], fluidCells = fluidRow[..n];
         if (mode == SolidMode.Air) solidCells.Fill(air!);
@@ -302,8 +289,7 @@ internal static class ExtendedRows
         return true;
     }
 
-    // The solid blocks of the row: the air block (no blocks layer, or getBlockAir), palette indices into the static table
-    // (GetBlockAsBlock), or palette values into blocksFast (GetRange's GetUnsafe)
+    // Solid blocks: air (no layer, getBlockAir), table indices (GetBlockAsBlock) or blocksFast values (GetUnsafe)
     private static bool Solid(ChunkData data, BlockChunkDataLayer? layer, bool range, int row, int x0, Span<int> solid,
         out SolidMode mode, out Block? air, out Block[]? table, out bool same)
     {
@@ -342,8 +328,7 @@ internal static class ExtendedRows
         return Assert(planes <= MaxPlanes);
     }
 
-    // Light as GetRange reads it under light2Lock: the double buffer's planes with the light layer's live palette while one exists
-    // (Light2), else the light layer's Get
+    // As GetRange under light2Lock: light2 planes with the live light palette, else the light layer's Get
     private static bool LightRow(ChunkData data, int row, int x0, Span<int> values, out bool same)
     {
         _ = Assert(values.Length is > 0 and <= RowLength) && Assert(x0 + values.Length <= RowLength);
@@ -358,8 +343,7 @@ internal static class ExtendedRows
                Lookup(palette, words[..buffer.Length], x0, values, out same);
     }
 
-    // A layer's Get over the row: 0 for no layer and for GetFromBits0, else palette[index] from the planes its delegate reads. The layer's
-    // read lock is held while its words are read wherever the engine's delegate takes it (two planes and more).
+    // A layer's Get over the row: 0 for no layer or GetFromBits0, else palette[index], locked as the engine's delegate
     private static bool LayerRow(ChunkDataLayer? layer, int row, int x0, Span<int> values, out bool same)
     {
         same = false;
@@ -396,8 +380,7 @@ internal static class ExtendedRows
         return Assert(values.Length > 0);
     }
 
-    // The words of `row` in the planes a decoder reads: dataBit0..3 and dataBits[4] for one to five planes, dataBits[0..bitsize) for the
-    // general case, dataBit0 and dataBits[1..bitsize) for GetUnsafe's. False where the engine would throw: a missing or short plane.
+    // Row words of the planes a decoder reads (1-5 planes, general, GetUnsafe); false where the engine would throw
     private static bool Words(ChunkDataLayer layer, Decoder kind, int row, Span<int> words, out int count)
     {
         count = kind switch
@@ -439,8 +422,7 @@ internal static class ExtendedRows
         return true;
     }
 
-    // palette[index] per cell; false for no palette or an index past it, where the engine would throw. A palette of at least
-    // 2^planes entries (the engine's own: palette.Length is 2^bitsize) holds every index the planes can spell.
+    // palette[index]; false without palette or past it (engine throws). A 2^planes palette holds any index.
     private static bool Lookup(int[]? palette, ReadOnlySpan<int> words, int x0, Span<int> values, out bool same)
     {
         same = Indices(words, x0, values);
@@ -459,8 +441,7 @@ internal static class ExtendedRows
         return true;
     }
 
-    // The palette index of cells x0.. from the plane words: bit (x0 + x) of plane k is bit k of the index. True when every cell of the
-    // range has the same index, which is certain when every word is 0 or -1. The callers keep x0 + indices.Length within the row.
+    // Index of cells x0..: plane k's bit x0 + x is index bit k; true when all share one (sure if all words are 0 or -1)
     private static bool Indices(ReadOnlySpan<int> words, int x0, Span<int> indices)
     {
         _ = Assert(words.Length <= MaxPlanes) && Assert(x0 + indices.Length <= RowLength);
@@ -491,8 +472,7 @@ internal static class ExtendedRows
         return false;
     }
 
-    // Up to eight planes: each byte of a plane word spreads to eight bytes, one per cell, shifted to the plane's bit; the 32 bytes
-    // are the cells' indices
+    // <= 8 planes: each plane byte spreads to eight cell bytes, shifted to the plane's bit
     private static void Spread(ReadOnlySpan<int> words, int x0, Span<int> indices)
     {
         var spread = Spreads;
@@ -552,7 +532,7 @@ internal static class ExtendedRows
                 blocks[x] = lookup[values[x]];
     }
 
-    // ToRgba((ushort)light, (light >> 16) & 7) per cell, once per run of equal light values: ToRgba is a pure function of its arguments
+    // ToRgba((ushort)light, (light >> 16) & 7) per cell, once per run of equal values (ToRgba is pure)
     private static void Rgba(ColorUtil.LightUtil converter, ReadOnlySpan<int> light, bool same, Span<int> rgbs)
     {
         if (!Assert(light.Length == rgbs.Length) || !NotNull(converter)) return;
@@ -576,7 +556,7 @@ internal static class ExtendedRows
         return converter.ToRgba((ushort)light, (int)((light >> 16) & 7));
     }
 
-    // Which engine decoder a delegate calls: a scan of the table by method identity (Delegate.Method is cached in the delegate)
+    // Which engine decoder a delegate calls, by method identity (Delegate.Method is cached)
     private static Decoder Classify(Delegate get)
     {
         if (!get.HasSingleTarget) return Decoder.Unknown;
@@ -636,8 +616,7 @@ internal static class ExtendedRows
     [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "satLevels")]
     private static extern ref byte[]? SatLevels(ColorUtil.LightUtil converter);
 
-    // One..Five follow Zero in order: Solid and Words count planes by their distance from Zero. General reads dataBits[0..bitsize),
-    // UnsafeGeneral dataBit0, then dataBits[1..bitsize).
+    // One..Five follow Zero (planes counted from it). General: dataBits[0..n); UnsafeGeneral: dataBit0, dataBits[1..n)
     private enum Decoder : byte { Unknown, Zero, One, Two, Three, Four, Five, General, UnsafeGeneral, Air }
 
     private enum SolidMode : byte { Air, Table, Values }

@@ -16,13 +16,15 @@ public sealed class HeldGpuTests
     {
         using var rig = GpuRig.Open(GpuRig.Vulkan);
         rig.Backend!.Flush();
-        Assert.That(GlTap.Tap(scene: true), Is.True, GlTap.Missing);
+        Assert.That(GlTap.Tap(), Is.True, GlTap.Missing);
         try
         {
             using var renderer = TerrainRenderer.Create(rig.Device!, 64, null, out var why);
             Assert.That(renderer, Is.Not.Null, why);
-            using var scene = SceneParityGpuTests.Hooked(renderer!);
-            var (count, bytes) = (scene.Mirrors.Count, scene.Mirrors.ManagedBytes);
+            using var scene = SceneRenderer.Create(renderer!, null);
+            Assert.That(scene, Is.Not.Null);
+            GlTap.Writes = scene; // as VulkanRenderer wires it
+            var (count, bytes) = (scene!.Mirrors.Count, scene.Mirrors.ManagedBytes);
             for (var round = 0; round < Rounds; round++)
             {
                 var buffers = new int[Churned];
@@ -48,7 +50,7 @@ public sealed class HeldGpuTests
     {
         using var rig = GpuRig.Open(GpuRig.Vulkan);
         rig.Backend!.Flush();
-        Assert.That(GlTap.Tap(scene: true), Is.True, GlTap.Missing);
+        Assert.That(GlTap.Tap(), Is.True, GlTap.Missing);
         try
         {
             var (arrays, bytes) = (GlTap.Held.Arrays, GlTap.Held.Bytes);

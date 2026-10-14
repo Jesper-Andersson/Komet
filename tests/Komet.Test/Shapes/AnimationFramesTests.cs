@@ -1,3 +1,6 @@
+using Komet.Core;
+using Komet.Shapes;
+
 namespace Komet.Test.Shapes;
 
 // A cache hit hands an animator a compiled pose tree that ClientAnimator.calculateMatrices walks by position, so a descriptor that

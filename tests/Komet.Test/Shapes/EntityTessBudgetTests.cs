@@ -1,3 +1,5 @@
+using Komet.Core;
+using Komet.Shapes;
 using Vintagestory.GameContent;
 
 namespace Komet.Test.Shapes;

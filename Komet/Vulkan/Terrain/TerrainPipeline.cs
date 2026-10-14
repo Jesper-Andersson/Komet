@@ -1,7 +1,6 @@
 namespace Komet.Vulkan;
 
-// OpenGL's clip depth (-1 to 1) stays through VK_EXT_depth_clip_control, and the front face flips, as Vulkan counts
-// orientation with y down.
+// OpenGL's clip depth (-1..1) kept via VK_EXT_depth_clip_control; front face flipped, as Vulkan's y points down.
 internal sealed unsafe partial class TerrainPipeline : IDisposable
 {
     private const int MaxResources = 32, MaxAttributes = 16, MaxColors = 8;
@@ -20,7 +19,7 @@ internal sealed unsafe partial class TerrainPipeline : IDisposable
         _ = Interlocked.Increment(ref _live);
     }
 
-    // Made and not disposed yet, on any thread (builders make them, and destroy the ones whose owner dropped them)
+    // Made, not yet disposed, any thread
     public static int Live => Volatile.Read(ref _live);
 
     public readonly record struct Resource(int Binding, uint Type, uint Stages);
@@ -50,17 +49,17 @@ internal sealed unsafe partial class TerrainPipeline : IDisposable
             _pushed = (uint)ported.HotUniforms.Size, _bresenham = device.BresenhamLines, _cache = device.PipelineCache
         };
         var inputs = pipeline.Inputs(ported, attributes, out var missing);
-        why = pipeline.Layouts() ?? pipeline.Build(ported, inputs, pass) ?? missing;
+        // formatless inputs refused before the driver: RADV divides by the size (SIGFPE), e.g. old recipes without
+        // matrix columns
+        why = missing.Length > 0 ? missing : pipeline.Layouts() ?? pipeline.Build(ported, inputs, pass) ?? "";
         if (why.Length == 0) return pipeline;
         pipeline.Dispose();
         return null;
     }
 
-    // Made on a builder (Builds). What it is made of is copied here, on the engine's thread, so nothing it reads changes
-    // meanwhile: the port is never written after it was made, the device's handles and features only at its start and end
-    // (it waits for every build before it goes), and vkCreateGraphicsPipelines needs no lock on the device's pipeline
-    // cache, made without VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT. One its owner dropped meanwhile is
-    // destroyed by its builder.
+    // Built on a builder from inputs copied here: ports are immutable, device handles change only at start/end (it
+    // waits for all builds), and the pipeline cache is not EXTERNALLY_SYNCHRONIZED, so no lock. Dropped: its builder
+    // destroys it.
     public static Build<TerrainPipeline> Started(VulkanDevice device, GlslPort.Ported ported,
         TerrainPools.Attribute[] attributes, (GlTap.Fixed State, Target Target, uint Topology) pass)
     {

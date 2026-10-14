@@ -2,9 +2,8 @@ using Komet.Gpu;
 
 namespace Komet.Vulkan;
 
-// OpenGL's semantics are kept where the passes rely on them: Upload gives the buffer fresh contents (a region of the upload arena)
-// so commands recorded before still see the old ones, a Zero is ordered before the dispatches after it, and a resource a shader
-// declares but nobody bound is a placeholder, as OpenGL does not care about a binding the shader never reads.
+// OpenGL semantics the passes rely on: Upload gives fresh contents (an upload-arena region) so earlier commands see the
+// old ones; Zero is ordered before later dispatches; an unbound declared resource gets a placeholder.
 internal sealed unsafe partial class VulkanBackend : IGpuBackend, IDisposable
 {
     private const int MaxHandles = 4096, Align = 256;
@@ -56,8 +55,7 @@ internal sealed unsafe partial class VulkanBackend : IGpuBackend, IDisposable
         return at;
     }
 
-    // Empty data: storage of its own, at least minBytes, which UploadAt and Read then use. Data: fresh contents in the arena
-    // (on a frame, in the frame's uploads).
+    // Empty data: own storage of >= minBytes (UploadAt, Read). Data: fresh contents in the arena (frame uploads).
     public void Upload<T>(int buffer, ReadOnlySpan<T> data, int minBytes = 0) where T : unmanaged
     {
         if (!Index(buffer, MaxHandles) || _buffers[buffer] is not { } b || !Assert(minBytes >= 0)) return;
@@ -110,8 +108,7 @@ internal sealed unsafe partial class VulkanBackend : IGpuBackend, IDisposable
         b.View = (b.Handle, 0, b.Size);
     }
 
-    // On a frame: the frame's staging, past it a buffer of its own kept until the GPU has done the frame (FrameStaging), so no
-    // upload is lost when a frame uploads more than the staging holds (a region of rows written anew is up to 48 MB)
+    // On a frame: frame staging, past it an own buffer kept until GPU-done (FrameStaging); a rows region is up to 48 MB
     private HostBuffer? Staging(int bytes, out long at, int align = 16)
     {
         at = -1;
@@ -127,7 +124,6 @@ internal sealed unsafe partial class VulkanBackend : IGpuBackend, IDisposable
         return host;
     }
 
-
     internal (ulong Buffer, ulong Offset) Native(int buffer) =>
         Index(buffer, MaxHandles) && _buffers[buffer] is { } b && Assert(b.View.Buffer != 0)
             ? (b.View.Buffer, b.View.Offset)
@@ -138,6 +134,12 @@ internal sealed unsafe partial class VulkanBackend : IGpuBackend, IDisposable
         if (!Index(buffer, MaxHandles) || _buffers[buffer] is not { } b || !Assert(firstUint >= 0 && uints > 0)) return;
         var (target, at, size) = (b.View.Buffer, b.View.Offset + 4 * (ulong)firstUint, 4 * (ulong)uints);
         if (target == 0) return;
+        if (_frame is { } frame) // an op of its own: no closure per fill, a few dozen a frame
+        {
+            if (!frame.Fill(target, at, size)) Refused++;
+            return;
+        }
+
         Record(commands =>
         {
             VkApi.CmdFillBuffer(commands, target, at, size, 0);
@@ -145,7 +147,7 @@ internal sealed unsafe partial class VulkanBackend : IGpuBackend, IDisposable
         });
     }
 
-    // On a frame nothing waits: a read is only of what the GPU wrote frames ago, and the frame's fences have seen it done
+    // On a frame nothing waits: reads are of what the GPU wrote frames ago, already fenced
     public void Read(int buffer, int firstUint, Span<uint> into)
     {
         if (!Index(buffer, MaxHandles) || _buffers[buffer] is not { } b || !Assert(firstUint >= 0)) return;
@@ -157,7 +159,7 @@ internal sealed unsafe partial class VulkanBackend : IGpuBackend, IDisposable
         new ReadOnlySpan<uint>(source + 4 * firstUint, into.Length).CopyTo(into);
     }
 
-    // Every buffer with storage of its own is host-visible and coherent already
+    // Nothing to flush: every buffer with own storage is host-visible and coherent
     public void Readable(int buffer, int bytes)
     {
         if (!Assert(bytes > 0)) return;
@@ -187,7 +189,7 @@ internal sealed unsafe partial class VulkanBackend : IGpuBackend, IDisposable
         Record(op.Run);
     }
 
-    // Submits what was recorded and waits for it; the arena is free again. On a frame the frame submits.
+    // Waits for the GPU, which frees the arena; on a frame the frame submits instead
     public void Flush()
     {
         _ = Assert(_arenaUsed <= ArenaBytes);
@@ -230,13 +232,12 @@ internal sealed unsafe partial class VulkanBackend : IGpuBackend, IDisposable
         return fresh;
     }
 
-    // Host-visible and coherent, in device memory where the GPU offers that (resizable BAR): the GPU's atomics and indirect
-    // reads then stay off the bus
+    // Host-visible, coherent, device-local where offered (resizable BAR): atomics and indirect reads stay off the bus
     private BufferSlot? Allocate(ulong bytes)
     {
         if (!Assert(bytes > 0) || !Assert(_handle != IntPtr.Zero)) return null;
         var info = new Vk.BufferInfo { SType = Vk.BufferCreateInfo, Size = bytes, Usage = (uint)BufferUsage };
-        ulong buffer, memory;
+        ulong buffer, memory = 0;
         if (VkApi.CreateBuffer(_handle, &info, null, &buffer) != Vk.Success) return null;
         Vk.MemoryRequirements needs;
         VkApi.GetBufferRequirements(_handle, buffer, &needs);
@@ -249,6 +250,7 @@ internal sealed unsafe partial class VulkanBackend : IGpuBackend, IDisposable
             VkApi.MapMemory(_handle, memory, 0, needs.Size, 0, &mapped) != Vk.Success)
         {
             VkApi.DestroyBuffer(_handle, buffer, null);
+            VkApi.FreeMemory(_handle, memory, null); // 0 when the allocation failed
             return null;
         }
 

@@ -1,4 +1,6 @@
 using System.Runtime.Serialization;
+using Komet.Core;
+using Komet.Options;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
 using Newtonsoft.Json.Linq;
@@ -25,7 +27,7 @@ internal readonly record struct HudRange(double Min, double Max, double Step, do
 
 internal sealed class HudSettings
 {
-    private const string FileName = "komet-hud.json";
+    internal const string FileName = "komet.json", OldFileName = "komet-hud.json"; // the name before 3.0
 
     public const int SlowEvery = 4, MaxPinnedMods = 3;
     public const double ScreenMargin = 8, SnapStep = 8;
@@ -33,16 +35,14 @@ internal sealed class HudSettings
     public static readonly HudRange IntervalRange = new(0.1, 1, 0.05, 1000, "ms"), BenchRange = new(5, 120, 5, 1, "s");
     public static readonly HudRange ToastRange = new(0, 200, 5, 1, "ms");
 
-    // Before any file is loaded: the statics' own values, Komet's knobs alone
-    private static readonly int[] KnobDefaults = Knobs.Snapshot(builtIn: true);
+    // The knob part of the file (Preset, Chosen, Profiled and the knob keys below are its)
+    [JsonIgnore]
+    public KometSettings Knobs { get; } = new();
 
     [JsonExtensionData]
-    private readonly Dictionary<string, JToken> _json = []; // the knobs, as top-level keys of the file
+    internal Dictionary<string, JToken> KnobJson => Knobs.Json; // the knobs, as top-level keys of the file
 
-    // What the player chose; the bench writes the statics, not these
-    private readonly int[] _knobs = (int[])KnobDefaults.Clone();
-
-    // The compact overlay (F7); the window (Ctrl+F7) and the debug window (Ctrl+F8) are dialogs of their own
+    // Overlay (F7); the window (Ctrl+F7) and the debug window (Ctrl+F8) are dialogs of their own
     public bool Visible { get; set => Set(ref field, value); }
 
     public HudCorner Corner
@@ -54,7 +54,6 @@ internal sealed class HudSettings
     public double Opacity { get; set { if (Assert(OpacityRange.Contains(value))) Set(ref field, value); } } = 0.6;
     public double Interval { get; set { if (Assert(IntervalRange.Contains(value))) Set(ref field, value); } } = 0.25;
     public double BenchSeconds { get; set { if (Assert(BenchRange.Contains(value))) Set(ref field, value); } } = 30;
-    // What the overlay shows besides frame rate and frame time
     public bool ShowFps { get; set => Set(ref field, value); } = true;
     public bool ShowLows { get; set => Set(ref field, value); } = true;
     public bool ShowFrametime { get; set => Set(ref field, value); } = true;
@@ -62,12 +61,35 @@ internal sealed class HudSettings
     public bool ShowMods { get; set => Set(ref field, value); } = true;
     public bool ShowPins { get; set => Set(ref field, value); } = true;
 
-    // A spike over this many ms shows in the overlay for a few seconds with its cause; 0: never
+    // A spike over this many ms toasts in the overlay with its cause; 0: never
     public double ToastMs { get; set { if (Assert(ToastRange.Contains(value))) Set(ref field, value); } } = 50;
 
-    // Mods the overlay shows by name (Mods tab: a click pins); none: the dearest
     public List<string> PinnedMods { get; } = [];
-    // Where the window was left; plain properties: a drag must not end the HUD's interval on every move. Written with the rest.
+
+    public string Preset
+    {
+        get => Knobs.Preset;
+        set => Knobs.Preset = value;
+    }
+
+    public List<string> Chosen => Knobs.Chosen;
+
+    public int Profiled
+    {
+        get => Knobs.Profiled;
+        set => Knobs.Profiled = value;
+    }
+
+    public HudSettings() => Knobs.Changed += NotifyChanged;
+
+    [OnDeserializing]
+    private void Reading(StreamingContext context)
+    {
+        Knobs.Reading();
+        _ = Assert(PinnedMods.Count == 0);
+    }
+
+    // Plain properties: a drag must not end the HUD's interval on every move.
     public string WindowTab { get; set; } = "";
     public double WindowX { get; set; } = double.NaN; // NaN: centred
     public double WindowY { get; set; } = double.NaN;
@@ -76,7 +98,6 @@ internal sealed class HudSettings
     public bool UpdateAsked { get; set => Set(ref field, value); } // the opt-in dialog is shown until answered
     public double FontScale { get; set { if (Assert(ScaleRange.Contains(value))) Set(ref field, value); } } = 1.0;
 
-    // The settings pages show every knob, not only KometPages.Basic
     public bool ShowAdvanced { get; set => Set(ref field, value); }
 
     public event Action? Changed;
@@ -88,7 +109,6 @@ internal sealed class HudSettings
         Changed?.Invoke();
     }
 
-    // Pinned again: unpinned; past MaxPinnedMods the oldest goes
     public void TogglePin(string mod)
     {
         if (string.IsNullOrEmpty(mod) || !Assert(PinnedMods.Count <= MaxPinnedMods)) return;
@@ -101,12 +121,11 @@ internal sealed class HudSettings
         NotifyChanged();
     }
 
-    // The window back to the middle of the screen
     public void ResetPositions() => (WindowX, WindowY) = (double.NaN, double.NaN);
 
     private void NotifyChanged() => Changed?.Invoke();
 
-    // The display, the panels and every knob; the update notice is a consent, not a display setting
+    // The update notice is consent, not a display setting
     public void ResetDefaults()
     {
         var d = new HudSettings();
@@ -115,90 +134,67 @@ internal sealed class HudSettings
         (ShowFps, ShowLows, ShowFrametime, ShowGraph, ShowMods, ShowPins, ToastMs) =
             (d.ShowFps, d.ShowLows, d.ShowFrametime, d.ShowGraph, d.ShowMods, d.ShowPins, d.ToastMs);
         PinnedMods.Clear();
-        for (var i = 0; i < Math.Min(_knobs.Length, Knobs.MaxKnobs); i++) SetKnob(i, KnobDefaults[i]);
+        Knobs.UseDetected();
         ResetPositions();
-    }
-
-    public int Knob(int knob) =>
-        Index(knob, _knobs.Length) && Assert(_knobs.Length == Knobs.BuiltInCount) ? _knobs[knob] : 0;
-
-    public void SetKnob(int knob, int value)
-    {
-        if (!Index(knob, _knobs.Length) || !Knobs.InRange(knob, value)) return;
-        _ = Knobs.Write(knob, value);
-        Set(ref _knobs[knob], value);
-        Features.Poll();
     }
 
     public static HudSettings Load(ICoreClientAPI capi)
     {
+        HardwareProfile.Detect(capi.Logger);
         var settings = Read(capi);
-        settings.ApplyKnobs(capi.Logger);
+        settings.Knobs.Apply(capi.Logger, FileName);
         return settings;
+    }
+
+    // A komet-hud.json from before 3.0 becomes komet.json once
+    private static void Renamed(ILogger logger)
+    {
+        var (old, path) = (Path.Combine(GamePaths.ModConfig, OldFileName), Path.Combine(GamePaths.ModConfig, FileName));
+        try
+        {
+            if (!File.Exists(old) || File.Exists(path)) return;
+            File.Move(old, path);
+            logger.Notification("Komet: settings moved from {0} to {1}", OldFileName, FileName);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            logger.Warning("Komet: {0} not renamed to {1} ({2}); defaults apply", OldFileName, FileName, e.Message);
+        }
     }
 
     private static HudSettings Read(ICoreClientAPI capi)
     {
+        Renamed(capi.Logger);
         try
         {
             var loaded = capi.LoadModConfig<HudSettings>(FileName) ?? new HudSettings();
+            _ = loaded.PinnedMods.RemoveAll(string.IsNullOrEmpty); // a null pin would throw in the overlay's mod lookup every frame
             if (loaded.PinnedMods.Count > MaxPinnedMods) loaded.PinnedMods.RemoveRange(0, loaded.PinnedMods.Count - MaxPinnedMods);
             return Assert(loaded.PinnedMods.Count <= MaxPinnedMods) ? loaded : new HudSettings();
         }
         catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException)
         {
             capi.Logger.Warning("Komet HUD: {0} unreadable, using defaults ({1})", FileName, e.Message);
+            if (e is JsonException) Keep(Path.Combine(GamePaths.ModConfig, FileName)); // the next save would overwrite a hand edit's typo
             return new HudSettings();
         }
     }
 
-    // Keys of knobs that no longer exist are dropped
-    internal void ApplyKnobs(ILogger logger)
+    private static void Keep(string path)
     {
-        var knobs = Knobs.BuiltIn;
-        List<string> rejected = [];
-        for (var i = 0; i < Math.Min(knobs.Length, Knobs.MaxKnobs); i++)
+        if (!NotNull(path) || !Assert(path.Length > 0)) return;
+        try
         {
-            var value = KnobDefaults[i];
-            if (_json.TryGetValue(knobs[i].Persisted, out var token) && !TryKnob(token, i, out value))
-            {
-                rejected.Add(knobs[i].Persisted);
-                value = KnobDefaults[i];
-            }
-
-            _knobs[i] = value;
-            _ = Knobs.Write(i, value);
+            File.Copy(path, path + ".broken", true);
         }
-
-        _json.Clear();
-        if (rejected.Count > 0 && NotNull(logger))
-            logger.Warning("Komet HUD: {0} holds values out of range for {1}, their defaults apply", FileName,
-                string.Join(", ", rejected));
-    }
-
-    // A switch is written as a bool, a number as an int; either reads as the other. Json.NET reads an integer beyond long as a
-    // BigInteger, which a (long) cast throws on: anything but a long is out of range.
-    private static bool TryKnob(JToken token, int knob, out int value)
-    {
-        value = token switch
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
-            JValue { Type: JTokenType.Boolean, Value: bool on } => on ? 1 : 0,
-            JValue { Type: JTokenType.Integer, Value: long number and >= int.MinValue and <= int.MaxValue } =>
-                (int)number,
-            _ => int.MinValue
-        };
-        return NotNull(token) && Knobs.InRange(knob, value);
+            // no copy: the warning above names the file
+        }
     }
 
     [OnSerializing]
-    private void Serializing(StreamingContext context)
-    {
-        var knobs = Knobs.BuiltIn;
-        _json.Clear();
-        for (var i = 0; i < Math.Min(knobs.Length, Knobs.MaxKnobs); i++)
-            _json[knobs[i].Persisted] = knobs[i].IsSwitch ? new JValue(_knobs[i] != 0) : new JValue(_knobs[i]);
-        _ = Assert(_json.Count == _knobs.Length);
-    }
+    private void Serializing(StreamingContext context) => Knobs.Writing();
 
     public void Save(ICoreClientAPI capi)
     {
@@ -213,7 +209,6 @@ internal sealed class HudSettings
         }
     }
 
-    // F7 the overlay, Ctrl+F7 the window, Ctrl+F8 the debug window
     public void RegisterHotkeys(ICoreClientAPI capi, Action window, Action debug)
     {
         if (!NotNull(capi) || !NotNull(capi.Input) || !NotNull(window) || !NotNull(debug)) return;

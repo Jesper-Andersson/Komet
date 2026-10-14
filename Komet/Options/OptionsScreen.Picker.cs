@@ -1,9 +1,10 @@
+using Komet.Api;
+using Komet.Hud;
 using Vintagestory.API.MathTools;
 
 namespace Komet.Options;
 
-// A click in a gap does nothing, so a click that lands between two names picks neither. The names are a texture of their own,
-// composed when they change and moved under a scissor as they scroll: a scroll composes nothing.
+// Names are their own texture, moved under a scissor: scrolling composes nothing. Gap clicks pick nothing.
 internal sealed partial class OptionsScreen
 {
     private const int MaxCycled = 3, PickerGroup = 5, MaxNames = OptionPage.MaxOptions + MaxLanguagesShown;
@@ -40,7 +41,7 @@ internal sealed partial class OptionsScreen
         var height = top + view + pad / 2 - c.Top;
 
         _canvas.Fill(x, c.Top, w, height, Panel);
-        // the window's own ground: a click in a gap keeps it open, the rows under it neither lit nor described
+        // the window's ground: a click in a gap keeps it open, rows under it neither lit nor described
         _hits.Insert(0, new Hit(x, c.Top, w, height, (_, _) => { }, Group: PickerGroup));
         _hits.Insert(0, new Hit(x, c.Top, w, height, (_, _) => { }, Option: row, Row: true, Group: PickerGroup));
         Head(row, x, c.Top, w, head);
@@ -59,8 +60,7 @@ internal sealed partial class OptionsScreen
         Names(row, width, total);
     }
 
-    // Where the names scroll to, within them: NaN (the window just opened) puts the chosen name in the middle
-    internal static double Scrolled(double scroll, int chosen,
+    internal static double Scrolled(double scroll, int chosen, // NaN (just opened) centres the chosen name
         (double Cell, double Step, double View, double Total) names)
     {
         if (!Finite(names.Step) || !Finite(names.View) || !Assert(names.Cell > 0)) return 0;
@@ -144,7 +144,6 @@ internal sealed partial class OptionsScreen
         }, Glow: RowGlow, Group: PickerGroup);
     }
 
-    // true when the cursor was over the names
     private bool ScrollNames(double delta)
     {
         var (x, y, w, h) = _pickView;
@@ -156,7 +155,6 @@ internal sealed partial class OptionsScreen
         return true;
     }
 
-    // A name with a tab carries a second, quieter one after it ("Deutsch", "German"): the row shows the first, the window both
     private static (string Main, string Aside) Parts(string name)
     {
         var tab = NotNull(name) ? name.IndexOf('\t', StringComparison.Ordinal) : -1;

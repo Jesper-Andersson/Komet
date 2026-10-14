@@ -1,4 +1,5 @@
 using System.Reflection;
+using Komet.Core;
 
 namespace Komet.Api;
 
@@ -16,11 +17,8 @@ public enum FeatureState
     Failed // it threw, or its own guard gave up
 }
 
-// Komet's features and other mods' own, by id: Komet's as the README names them (FrustumSweep, ChunkBudget, ...), another mod's
-// modid:name. A mod asks for their state, holds one at the game's own behaviour while it needs that (HoldOff), follows them
-// (StateChanged) and registers features of its own, whose switch Komet then shows, holds, benchmarks and stands down for other mods'
-// patches (Register). Same rules as KometOptions: call from a class of your own, only when api.ModLoader.IsModEnabled("komet"); main
-// thread only. Komet ends every hold and drops every registration and subscription when the world closes: register again in the next.
+// Komet's features (README names) and other mods' (modid:name). Call from an own class only when IsModEnabled("komet"),
+// main thread only. Holds, registrations and subscriptions end when the world closes.
 public static class KometFeatures
 {
     // Komet's options pages a FeatureDefinition.Page may name; any other id is one of the mod's own KometOptions pages
@@ -30,7 +28,7 @@ public static class KometFeatures
     // Installed, switched, held or released, stood down or back. A handler that throws is logged once and unsubscribed.
     public static event EventHandler<FeatureStateChangedEventArgs>? StateChanged;
 
-    // Every feature in install order, Komet's first: a copy that does not follow later changes
+    // Every feature in install order, Komet's first; a copy
     public static IReadOnlyList<FeatureInfo> Snapshot()
     {
         var features = Features.Snapshot();
@@ -45,20 +43,16 @@ public static class KometFeatures
         return feature >= 0 && Assert(feature < MaxFeatures) ? Features.Evaluate(feature) : FeatureState.Unknown;
     }
 
-    // Keeps the feature at the game's own behaviour, whatever the player chose, until the handle is released or the world closes.
-    // The player's choice applies again once the last hold goes. Works before Komet started too. A feature without a switch cannot
-    // be held: the handle is then not holding, and the log says why.
+    // Engine behaviour until released or world close, also before Komet started; switchless features can't be held
     public static FeatureHold HoldOff(string id, string modId, string reason) =>
         NotNull(id) && NotNull(modId) && NotNull(reason)
             ? Features.HoldOff(id, modId, reason)
             : new FeatureHold("", "", "", -1);
 
-    // Before Komet started (another mod's Start) it is installed after Komet's own features, while Komet runs (StartClientSide) at
-    // once. false: refused, the log says why (an invalid definition, an id taken, too many features, after the world loaded).
+    // Before Komet started: installed after Komet's own; while Komet runs: at once. false = refused, logged why.
     public static bool Register(FeatureDefinition definition) => NotNull(definition) && Features.Register(definition);
 
-    // The fingerprint FeatureDefinition.Fingerprint compares, to pin in the mod's own test against the installed game; 0 when a
-    // method is missing or has no body
+    // What FeatureDefinition.Fingerprint compares, to pin in a mod's own test; 0 for a missing or bodiless method
     public static ulong Fingerprint(IReadOnlyList<MethodBase?> methods) =>
         NotNull(methods) && Assert(methods.Count <= EngineShape.MaxMethods) ? EngineShape.Of([.. methods]) : 0;
 
@@ -69,12 +63,10 @@ public static class KometFeatures
         ApiEvents.Raise(StateChanged, h => h(null, args), h => StateChanged -= h, "KometFeatures.StateChanged");
     }
 
-    // The world closes: no subscriber hears of it
     internal static void Forget() => StateChanged = null;
 }
 
-// One feature as Snapshot found it. Title: a registered feature's, Komet's id for its own. Owner: the mod id ("komet" for Komet's).
-// HeldBy and Reason: the first hold still in place, null without one.
+// One feature as Snapshot found it. Owner: mod id ("komet"). HeldBy/Reason: the first hold in place, else null.
 public sealed class FeatureInfo
 {
     internal FeatureInfo(string id, string title, string owner, FeatureState state, bool canHoldOff)
@@ -92,8 +84,7 @@ public sealed class FeatureInfo
     public string? Reason { get; internal init; }
 }
 
-// A mod's hold on a feature (KometFeatures.HoldOff). Release, or Dispose, lets go once; after that, and after the world closed, both
-// do nothing. IsHolding is false for a refused hold too. FeatureId: the feature held (ChunkBudget for UploadCap), else as given.
+// A hold from KometFeatures.HoldOff. Release/Dispose let go once, then no-op. IsHolding false for a refused hold too.
 public sealed class FeatureHold : IDisposable
 {
     internal FeatureHold(string featureId, string modId, string reason, int feature)

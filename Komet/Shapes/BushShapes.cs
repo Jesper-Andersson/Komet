@@ -1,14 +1,12 @@
 using System.Collections.Concurrent;
 using System.Reflection;
 using HarmonyLib;
+using Komet.Core;
 
 namespace Komet.Shapes;
 
-// A berry bush (BEBehaviorFruitingBushMesh, survival mod) caches its mesh by block, health, berry stage and texture variant, and
-// every miss parses the bush's shape file again (Assets.Get<Shape>: the whole JSON into a new Shape) only to tesselate it once. A
-// world full of bushes has hundreds of such keys over a dozen shape files: 450 MB of parsing garbage in the first minute of a join,
-// on the tesselation threads. The mesh builder reads the shape and never writes it (ShapeTesselator.TesselateShape), so each file is
-// parsed once per world and the same Shape handed to every miss. The rewrite replaces that one Get<Shape> call in the builder.
+// BEBehaviorFruitingBushMesh reparses the bush shape on every mesh cache miss (450 MB in a join's first minute).
+// TesselateShape never writes a shape, so each file is parsed once per world.
 internal static class BushShapes
 {
     private const int MaxInstructions = 1024, MaxNested = 64, MaxShapes = 4096;
@@ -45,9 +43,8 @@ internal static class BushShapes
     {
         var get = AccessTools.Method(typeof(BushShapes), nameof(Get));
         if (!Assert(Il.Take(instructions, MaxInstructions, out var code)) || !NotNull(get)) return code;
-        var at = Il.Single(code, c => c.operand is MethodInfo { Name: "Get", IsGenericMethod: true } m &&
-                                      m.DeclaringType == typeof(IAssetManager) && m.GetGenericArguments()[0] == typeof(Shape));
-        Rewritten = Assert(at >= 0) && Il.Substitute(code, at, get);
+        Rewritten = Assert(Il.SubstituteSingle(code, c => c.operand is MethodInfo { Name: "Get", IsGenericMethod: true } m &&
+            m.DeclaringType == typeof(IAssetManager) && m.GetGenericArguments()[0] == typeof(Shape), get));
         return code;
     }
 

@@ -1,3 +1,5 @@
+using Komet.Core;
+
 namespace Komet.Hud;
 
 internal enum HudLineKind
@@ -7,7 +9,7 @@ internal enum HudLineKind
     Title
 }
 
-// One row of the HUD's report: the bench's means and the debug protocol's HUD section read every row at the end of each interval
+// One HUD report row; the bench means and the protocol's HUD section read every row each interval
 internal sealed class HudLine
 {
     public const int MaxUnit = 2;
@@ -15,10 +17,9 @@ internal sealed class HudLine
     private double _valueSum, _percentSum;
     private bool _fresh;
 
-    // The last Read(); the bench has not taken it yet while _fresh
     private double _read = double.NaN, _readPercent = double.NaN;
 
-    // The windows each mean is over: a share can be missing where its time is not
+    // A share can be missing where its time is not
     private int _samples, _percentSamples;
 
     public HudLineKind Kind { get; init; } = HudLineKind.Text;
@@ -32,14 +33,12 @@ internal sealed class HudLine
 
     private string NumberFormat => Unit switch { "ms" => "F2", "/s" => "F1", _ => "N0" };
 
-    // A counter row's number is a Growth: it covers the span since the row was last read
     public void Read()
     {
         (_read, _readPercent, _fresh) = (Value?.Invoke() ?? double.NaN, Percent?.Invoke() ?? double.NaN, true);
         _ = Assert(Kind == HudLineKind.Text || (Value == null && Percent == null)); // only text rows carry numbers
     }
 
-    // A new baseline for the row's Growths when counting starts
     public void Prime()
     {
         Read();
@@ -47,8 +46,7 @@ internal sealed class HudLine
         _ = Assert(!_fresh);
     }
 
-    // A statistic without a window yet is not a sample, nor is a share of an empty one. Value and share are averaged over their own
-    // windows: a mod's time is known in a window whose share is not (no frame time to divide by).
+    // No window yet is not a sample; value and share average over their own windows.
     public void Accumulate()
     {
         if (!Assert(_samples >= 0) || !Assert(_percentSamples >= 0)) return;
@@ -59,14 +57,13 @@ internal sealed class HudLine
             (_percentSum, _percentSamples) = (_percentSum + _readPercent, _percentSamples + 1);
     }
 
-    // A reading from before the bench is no sample of it
     public void ResetBench()
     {
         _ = Assert(_samples >= 0) && Assert(_percentSamples >= 0);
         (_valueSum, _percentSum, _samples, _percentSamples, _fresh) = (0, 0, 0, 0, false);
     }
 
-    // The label is read once: a log row changes on a pool thread.
+    // Label read once: a log row changes on a pool thread.
     public string MeanText()
     {
         if (!Assert(_samples >= 0) || !Assert(_percentSamples >= 0)) return "";
@@ -89,8 +86,7 @@ internal sealed class HudLine
 
     private string Titled(string label) => Badge is { } badge && NotNull(label) ? $"{label} – {badge()}" : label;
 
-    // One row of a bench report: "label: 12.5 % 3.20 ms". value and percent are the numbers as formatted, null for a row without that
-    // column and "" for one that measured nothing; one with no number at all is left out instead of printing a bare "label:" or " %".
+    // "label: 12.5 % 3.20 ms"; null: no such column, "": measured nothing; a row with no number at all is left out.
     internal static string RowText(string label, bool sub, string? value, string? percent, string unit)
     {
         if (!Assert(label.Length > 0) || !Assert(unit.Length <= MaxUnit)) return "";
@@ -105,8 +101,8 @@ internal sealed class HudLine
     }
 }
 
-// A total's growth since this instance last read it. Each HUD row owns its instances, so a row covers the span since its own last
-// read. NaN on the first read, across a pause of counting (Counting.Epoch) and when the total fell (a new world started from zero).
+// Growth since this instance's last read; NaN on first read, across a counting pause (Counting.Epoch) or a fall (new
+// world).
 internal sealed class Growth(Func<double> total)
 {
     private int _epoch = -1;

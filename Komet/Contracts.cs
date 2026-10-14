@@ -4,9 +4,7 @@ using System.Runtime.InteropServices;
 
 namespace Komet;
 
-// Assertions are side effect free Boolean tests for conditions that must never occur. A failure is logged once per call site (file,
-// member and line) and handed back to the caller, which recovers explicitly (return, skip, fall back). The passing path costs one
-// branch; the caller information is compile-time constants.
+// Checks for must-never-happen conditions: logged once per call site, returned for explicit recovery; one branch.
 internal static class Contracts
 {
     private static readonly HashSet<(string File, string Member, int Line)> Reported = [];
@@ -52,7 +50,6 @@ internal static class Contracts
         return false;
     }
 
-    // 0 <= value < count
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool Index(int value, int count, [CallerArgumentExpression(nameof(value))] string expression = "",
         [CallerMemberName] string member = "", [CallerLineNumber] int line = 0, [CallerFilePath] string file = "")
@@ -62,8 +59,7 @@ internal static class Contracts
         return false;
     }
 
-    // Bounded iteration: at most max items, reported when the source holds more. Lists and arrays enumerate as spans without allocating;
-    // the IEnumerable version is an iterator and stays out of per-frame code (dictionaries there use a struct enumerator in a bounded for).
+    // At most max items, reported when more. Spans don't allocate; the IEnumerable iterator stays out of frame code.
     public static ReadOnlySpan<T> Bounded<T>(this List<T> items, int max,
         [CallerArgumentExpression(nameof(items))] string expression = "", [CallerMemberName] string member = "",
         [CallerLineNumber] int line = 0, [CallerFilePath] string file = "")
@@ -100,6 +96,36 @@ internal static class Contracts
         }
 
         if (e.MoveNext()) Report($"{expression} exceeds {max}", file, member, line);
+    }
+
+    // A dictionary's values with neither the IEnumerable iterator nor its boxed enumerator: foreach takes the struct
+    public static BoundedValues<TKey, TValue> Bounded<TKey, TValue>(this Dictionary<TKey, TValue>.ValueCollection items,
+        int max, [CallerArgumentExpression(nameof(items))] string expression = "", [CallerMemberName] string member = "",
+        [CallerLineNumber] int line = 0, [CallerFilePath] string file = "") where TKey : notnull
+    {
+        if (items.Count > max) Report($"{expression} exceeds {max}", file, member, line);
+        return new BoundedValues<TKey, TValue>(items, Math.Min(items.Count, max));
+    }
+
+    public readonly struct BoundedValues<TKey, TValue>(Dictionary<TKey, TValue>.ValueCollection items, int max)
+        where TKey : notnull
+    {
+        public Enumerator GetEnumerator() => new(items.GetEnumerator(), max);
+
+        public struct Enumerator(Dictionary<TKey, TValue>.ValueCollection.Enumerator inner, int left)
+        {
+            private Dictionary<TKey, TValue>.ValueCollection.Enumerator _inner = inner;
+            private int _left = left;
+
+            public TValue Current => _inner.Current;
+
+            public bool MoveNext()
+            {
+                if (_left <= 0) return false;
+                _left--;
+                return _inner.MoveNext();
+            }
+        }
     }
 
     private static void Report(string expression, string file, string member, int line)

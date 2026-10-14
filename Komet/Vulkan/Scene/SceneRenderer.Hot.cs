@@ -1,19 +1,20 @@
+using Komet.Diagnostics;
+
 namespace Komet.Vulkan;
 
-// Uniforms that change with nearly every draw go into push constants, so the program's often large uniform blocks stay as
-// uploaded from draw to draw. Which they are is watched over the program's first draws, then the program is ported again
-// once; ShaderCache keeps them, so at the next start the first port already pushes them.
+// Uniforms changing nearly every draw go into push constants so the large blocks stay uploaded. Found over the first
+// draws, then the program is ported once more; ShaderCache keeps them for the next start.
 internal sealed partial class SceneRenderer
 {
     private const int HotBudget = 224, MaxHot = 64, RecheckDraws = 1024, RecheckFrames = 16, MaxRounds = 2;
     private const double HotShare = 0.34;
 
-    // Draws of a program watched before its hot uniforms are settled
+    // Draws watched before hot uniforms settle
     public static int Watched { get; set; } = 96;
 
-    // A settled program whose blocks still pack anew in a quarter of its draws or more was watched over draws unlike its usual ones (the GUI program's
-    // first draws are the hotbar's, its item icons change other uniforms): it is watched again, at most MaxRounds times. Only one
-    // drawing many times a frame: a pass drawn once a frame (the sky, a post-processing step) packs anew every frame, as it must.
+    // Settled but still repacking in >= 1/4 of draws: watched over atypical draws (GUI: hotbar first, icons later), so
+    // re-watched up to MaxRounds. Only for programs drawn many times a frame; once-a-frame passes repack every frame
+    // anyway.
     private void Recheck(Drawn program)
     {
         if (!NotNull(program) || !Assert(program.Rounds >= 0) || program.Rounds >= MaxRounds || program.Next is not null || ++program.Draws < RecheckDraws) return;
@@ -27,9 +28,8 @@ internal sealed partial class SceneRenderer
             RecheckDraws);
     }
 
-    // The port again is made on a builder, then the pipelines the program drew with are made again for it (Warm); it draws
-    // with its first port meanwhile and switches over (Current) once every one is made, so no draw of it is left to OpenGL
-    // for the switch
+    // New port on a builder, then its pipelines again (Warm); the old port draws until all are made (Current), so the
+    // switch leaves no draw to OpenGL
     private void Settle(Drawn program)
     {
         if (!NotNull(program)) return;
@@ -49,7 +49,7 @@ internal sealed partial class SceneRenderer
         mirror.Drawn();
         if (mirror.Draws < Watched) return;
         program.Settled = true;
-        // the uniforms it pushes already stay pushed, ahead of the ones that change now
+        // already pushed uniforms stay pushed, ahead of the ones changing now
         var pushed = program.Program.Ported.HotUniforms.Members.Select(static u => u.Name);
         var hot = Budgeted(program.Program, [.. pushed.Concat(mirror.Hot(HotShare)).Distinct(StringComparer.Ordinal)]);
         if (hot.Count == 0) return;
@@ -74,16 +74,15 @@ internal sealed partial class SceneRenderer
             _pipelines.Warm(key => key.Program == id && key.Port == old, key => key with { Port = port }, (name, ported)));
     }
 
-    // The program as it draws now: switched over to its next port once that port's pipelines are made, as this frame counts
-    // them
+    // Switched to the next port once its pipelines are made, as this frame counts them
     private Drawn? Current(Drawn? program)
     {
         if (program?.Next is not var (ported, port, keys) || !_pipelines.Made(keys)) return program;
         var (id, name) = (program.Program.Id, program.Name);
-        Forget(id, keep: port); // the old port's pipelines go once no frame in flight uses them
+        Forget(id, keep: port);
         var next = new Drawn(_terrain.Watch(name, id, ported), ProgramPorts.Points(id, ported))
         {
-            Settled = true, Port = port, Rounds = program.Rounds
+            Settled = true, Port = port, Rounds = program.Rounds, Sources = program.Sources
         };
         _programs[id] = next;
         _ = Assert(_programs.Count <= MaxScenePrograms) && Assert(next.Port > program.Port);
@@ -111,7 +110,7 @@ internal sealed partial class SceneRenderer
         return hot;
     }
 
-    // Size and alignment in push constants (std430): a scalar 4, a vec2 8, a vec3 or vec4 16 aligned, a matrix its columns as vec4s
+    // std430 size/alignment: scalar 4, vec2 8, vec3 and vec4 16, a matrix its columns as vec4s
     private static (int Size, int Align) Std430(GlslPort.Uniform u)
     {
         var (columns, rows) = GlslPort.Shape(u.Type);

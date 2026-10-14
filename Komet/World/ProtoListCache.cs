@@ -4,11 +4,8 @@ using HarmonyLib;
 
 namespace Komet.World;
 
-// protobuf-net deserializes a collection that is not a contract of its own (every chunk's Dictionary<string, byte[]> of mod data, a
-// List<T> of block entity attributes) as an auxiliary type, and for each one asks reflection again which item type it holds
-// (TypeModel.GetListItemType: GetMethods, GetInterfaces, GetProperties) and which method adds to it (ResolveListAdd): arrays of
-// MethodInfo, ParameterInfo and Type on the network and generator threads for every chunk. Both answers depend only on the model and
-// the types, so each is worked out once and kept.
+// protobuf-net asks reflection per collection, per chunk, for its item type (GetListItemType) and add method
+// (ResolveListAdd); both depend only on model and type, so each is kept.
 internal static class ProtoListCache
 {
     private static readonly ConcurrentDictionary<(object, Type), Type?> Items = new();

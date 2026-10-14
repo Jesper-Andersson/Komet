@@ -1,13 +1,13 @@
 using System.Diagnostics;
+using Komet.Diagnostics;
 
 namespace Komet.Vulkan;
 
-// A thread of its own, so it still writes while the render thread is stuck. Every line is written through at once so it
-// survives the process; near out of memory it ends the game itself, before the kernel's OOM killer takes it and whatever
-// else runs.
+// Own thread, so it writes while the render thread is stuck. Lines are written through to survive the process; near OOM
+// it ends the game before the kernel's OOM killer takes it and more.
 internal static class VulkanWatch
 {
-    private const int PeriodMs = 1000, MaxCards = 8;
+    private const int PeriodMs = 1000, MaxCards = 8, MaxBytes = 4 << 20;
     private const string FileName = "komet-vulkan-watch.txt";
 
     private static readonly Stopwatch Clock = Stopwatch.StartNew();
@@ -44,6 +44,7 @@ internal static class VulkanWatch
     {
         if (_thread is not null || !Assert(PeriodMs > 0)) return;
         _path = Path.Join(GamePaths.Logs, FileName);
+        Rotate(_path);
         _renderTask = RenderTask();
         (_gtt, _vram) = Counters();
         var wake = _wake = new ManualResetEventSlim();
@@ -52,8 +53,7 @@ internal static class VulkanWatch
         Write($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} watching (GTT counter {(_gtt.Length > 0 ? _gtt : "none")})");
     }
 
-    // The wake ends the wait at once. A watch still inside a file or /proc read at exit is a background thread and goes with
-    // the process, so a slow join is no failure.
+    // The wake ends the wait. A watch stuck in a file or /proc read is a background thread: a slow join is fine.
     public static void Stop()
     {
         if (_thread is not { } thread || !NotNull(_wake)) return;
@@ -68,7 +68,8 @@ internal static class VulkanWatch
         {
             if (wake.Wait(PeriodMs) || !Watching()) continue;
             var (available, total) = SystemMemory();
-            var age = Clock.ElapsedMilliseconds - Volatile.Read(ref _stepAt);
+            var at = Volatile.Read(ref _stepAt); // before the clock: a step after it would make the age negative
+            var age = Clock.ElapsedMilliseconds - at;
             if (!Assert(age >= 0) || !Assert(available <= total)) continue;
             var line = $"{DateTime.Now:HH:mm:ss} frame {Volatile.Read(ref _frame)} step '{_step}' {age} ms ago, " +
                        $"GTT {Mb(_gtt)} MB, VRAM {Mb(_vram)} MB, available {available >> 20} of {total >> 20} MB, " +
@@ -96,7 +97,7 @@ internal static class VulkanWatch
         Write("where the threads wait (kernel), the render thread first:" + Environment.NewLine + Threads());
     }
 
-    private const int MaxTasks = 256;
+    private const int MaxTasks = 1024; // the game's threads, Komet's workers among them (HangWatch's report too)
     private static string _renderTask = "";
 
     // /proc/thread-self links to <pid>/task/<tid>: the calling thread's task id
@@ -118,6 +119,7 @@ internal static class VulkanWatch
         const string tasks = "/proc/self/task";
         if (!Directory.Exists(tasks)) return "  (no /proc)";
         var lines = new List<string>();
+        _ = Assert(MaxTasks > 0);
         foreach (var dir in Directory.GetDirectories(tasks).Take(MaxTasks).ToArray().Bounded(MaxTasks))
         {
             var id = Path.GetFileName(dir);
@@ -152,6 +154,21 @@ internal static class VulkanWatch
         return NotNull(stat) && Assert(stat.Length > 0) && close > 0 && close + 2 < stat.Length ? stat[(close + 2)..(close + 3)] : "?";
     }
 
+    // The game archives only *.log, and a line a second would grow this across sessions. Past MaxBytes it is moved
+    // aside, not deleted: it may hold a reported stuck render thread.
+    private static void Rotate(string path)
+    {
+        if (!Assert(path.Length > 0) || !Assert(MaxBytes > 0)) return;
+        try
+        {
+            if (new FileInfo(path) is { Exists: true, Length: > MaxBytes }) File.Move(path, Path.ChangeExtension(path, ".old.txt"), true);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            // appended to as before
+        }
+    }
+
     private static void Write(string line)
     {
         if (!NotNull(line) || !Assert(line.Length > 0) || _path.Length == 0) return;
@@ -159,7 +176,7 @@ internal static class VulkanWatch
         {
             File.AppendAllText(_path, line + Environment.NewLine);
         }
-        catch (IOException)
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) // unhandled, the watch thread ends the game
         {
             _path = ""; // a full disk or a gone folder: the watch stays quiet
         }
@@ -172,7 +189,7 @@ internal static class VulkanWatch
         {
             return long.TryParse(File.ReadAllText(file).Trim(), out var bytes) && Assert(bytes >= 0) ? bytes >> 20 : -1;
         }
-        catch (IOException)
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
             return -1;
         }
@@ -191,7 +208,7 @@ internal static class VulkanWatch
         return ("", "");
     }
 
-    // MemTotal and MemAvailable lead /proc/meminfo: one read into the stack, as the render thread's guard asks 4 times a second
+    // MemTotal and MemAvailable lead /proc/meminfo: one stack read, as the render thread's guard asks 4 times a second
     [System.Runtime.CompilerServices.SkipLocalsInit]
     public static (ulong Available, ulong Total) SystemMemory()
     {

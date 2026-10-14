@@ -2,9 +2,7 @@ using Vintagestory.Client.NoObf;
 
 namespace Komet.Vulkan;
 
-// A draw of a deferred pass that does not commute with OpenGL's work (it writes color, samples a shared image, tests other
-// than LESS or LEQUAL) is left to OpenGL after the open segment closed: taken as ordered instead, OpenGL's calls between its
-// signal and the segment's end (a shadow map cleared) would race Vulkan's.
+// A pool draw recorded in the open segment; what Vulkan cannot draw is missing from the picture (Miss).
 internal sealed partial class TerrainRenderer
 {
     private const int MaxRanges = 1 << 16, MaxSamplers = 32, LayoutDepthReadOnly = 4;
@@ -15,14 +13,23 @@ internal sealed partial class TerrainRenderer
     private readonly List<SharedImage> _sampled = [];
     private Context? _context;
 
-    // What the last draw was prepared with, taken again while OpenGL's state, the program's samplers, the pool's formats and the
-    // frame's rendering are the same: the draws of one pass differ in their pool and uniforms only
-    private sealed record Context(long Version, Program Program, int Samplers, string Layout, long Renderings,
-        TerrainPipeline Pipeline, TerrainDraw.Program Recorded, SegmentSync Sync);
+    // Last draw's preparation, reused while state, samplers, formats and rendering are unchanged (a pass's draws differ
+    // in pool and uniforms only). One instance: a draw reads its context only while recorded.
+    private sealed class Context
+    {
+        public long Version, Renderings;
+        public Program? Program;
+        public int Samplers;
+        public string Layout = "";
+        public TerrainPipeline Pipeline = null!;
+        public TerrainDraw.Program Recorded = null!;
+    }
+
+    private readonly Context _reused = new();
 
     public long TakeTicks { get; private set; } // probe: the time the draws took to record
 
-    // Another recorder (the scene) posted to the frame: the next pool draw prepares afresh
+    // Another recorder (the scene) posted: the next pool draw prepares afresh
     public void Unprepared()
     {
         _context = null;
@@ -31,22 +38,13 @@ internal sealed partial class TerrainRenderer
 
     public long Counted { get; private set; } // OcclusionCulling's draws taken
 
-    // The ranges as the engine hands them to MultiDrawElements: the starts are pointers, two ints each
-    public bool Take(VAO vao, (int[] Indices, int[] Sizes, int Count, bool Ssbo) draw, SegmentSync sync,
-        System.Func<int, Samplers.State> samplers)
+    // As MultiDrawElements takes them: starts are pointers, two ints each
+    public bool Take(VAO vao, (int[] Indices, int[] Sizes, int Count, bool Ssbo) draw, System.Func<int, Samplers.State> samplers)
     {
         var start = System.Diagnostics.Stopwatch.GetTimestamp();
-        var taken = Taken(vao, draw, sync, samplers);
-        if (!taken) Yield("a draw left to OpenGL");
+        var taken = Taken(vao, draw, samplers);
         TakeTicks += System.Diagnostics.Stopwatch.GetTimestamp() - start;
         return taken;
-    }
-
-    // OpenGL draws next, into what Vulkan's work may hold: an ordered segment closes first, so OpenGL's draw lands after it; a
-    // deferred one stays open, as whatever OpenGL draws beside it must commute with it
-    public void Yield(string why)
-    {
-        if (Frame.Open && !Frame.Pending && Assert(why.Length > 0) && Assert(Frame.Number > 0)) Frame.Close(why);
     }
 
     public bool TakeCounted(VAO vao, bool ssbo, ((ulong, ulong) Commands, (ulong, ulong) Count, int Max) counted,
@@ -56,7 +54,7 @@ internal sealed partial class TerrainRenderer
         _counted = counted;
         try
         {
-            return Take(vao, ([], [], 0, ssbo), SegmentSync.Ordered, samplers);
+            return Take(vao, ([], [], 0, ssbo), samplers);
         }
         finally
         {
@@ -66,7 +64,7 @@ internal sealed partial class TerrainRenderer
 
     private ((ulong Buffer, ulong Offset) Commands, (ulong Buffer, ulong Offset) Count, int Max)? _counted;
 
-    private bool Taken(VAO vao, (int[] Indices, int[] Sizes, int Count, bool Ssbo) draw, SegmentSync sync,
+    private bool Taken(VAO vao, (int[] Indices, int[] Sizes, int Count, bool Ssbo) draw,
         System.Func<int, Samplers.State> samplers)
     {
         var program = _programs.GetValueOrDefault(GlTap.Program);
@@ -78,42 +76,41 @@ internal sealed partial class TerrainRenderer
         if (pool is null) return Leave(why);
         if (_context is { } c && c.Version == GlTap.Version && ReferenceEquals(c.Program, program) &&
             c.Samplers == program.Mirror.Samplers && c.Layout == pool.Layout && c.Renderings == Frame.Renderings &&
-            Frame.Open && (c.Sync == SegmentSync.Deferred || !Frame.Pending))
+            Frame.Open)
             return Recorded(c, pool, draw);
         _context = null;
         var state = GlTap.State;
-        var target = Target(state, out why, foreign: true); // Komet's distant shadow map: through the copy of its depth
+        var target = _into ?? Target(state, out why, foreign: true); // the far cache's layer; Komet's distant shadow map: its copy
         if (target is null) return Leave(why);
         var recorded = Textures(program, target, samplers, out why);
+        var fed = recorded is not null && Fed(target, _sampled); // a feedback draw: from snapshots, never kept
+        if (fed) recorded = Snapshotted(program, recorded!, target, out why);
         if (recorded is null) return Leave(why);
         var pipeline = Pipeline(program, pool, target, state, out var waiting);
-        if (pipeline is null) return !waiting && Leave($"no pipeline for {program.Name} in this state (see the log)");
-        if (sync == SegmentSync.Deferred && !Commuting(target, state, _sampled))
-        {
-            Frame.Close("a draw that does not commute");
-            return Leave($"a {program.Name} draw that does not commute with OpenGL's");
-        }
-
-        if (!Segment(target, sync, _sampled, out why)) return Leave(why);
+        if (pipeline is null && waiting) MissWaiting();
+        if (pipeline is null) return !waiting && Leave(Reason("no pipeline for {0} in this state (see the log)", program.Name));
+        if (!Segment(target, _sampled, out why)) return Leave(why);
         Frame.Viewport(GlTap.Viewport);
         Frame.Scissor((state.Caps & (uint)GlTap.Caps.Scissor) != 0 ? GlTap.Scissor : null); // a tile of the distant map
-        var context = new Context(GlTap.Version, program, program.Mirror.Samplers, pool.Layout, Frame.Renderings, pipeline,
-            recorded, sync);
-        Frame.Wrote(target, sync == SegmentSync.Deferred);
+        var context = _reused;
+        (context.Version, context.Program, context.Samplers, context.Layout, context.Renderings) =
+            (GlTap.Version, program, program.Mirror.Samplers, pool.Layout, Frame.Renderings);
+        (context.Pipeline, context.Recorded) = (pipeline, recorded);
         Drawn(target);
         if (!Recorded(context, pool, draw)) return false;
-        _context = context;
+        _context = fed ? null : context; // the next draw snapshots anew what this one drew
         return true;
     }
 
     private bool Recorded(Context context, TerrainPools.Pool pool, (int[] Indices, int[] Sizes, int Count, bool Ssbo) draw)
     {
         if (!NotNull(context) || !Assert(draw.Count <= MaxRanges) || Frame.Uploads is not { } uploads) return false;
+        var (pipeline, program) = (context.Pipeline, context.Recorded);
         for (var i = 0; i < Math.Min(draw.Count, MaxRanges); i++) _starts[i] = draw.Indices[2 * i];
         var recorded = _counted is { } counted
-            ? Recorder.Counted(Frame, uploads, (context.Pipeline, pool), context.Recorded,
+            ? Recorder.Counted(Frame, uploads, (pipeline, pool), program,
                 (draw.Ssbo, counted.Commands, counted.Count, counted.Max))
-            : Recorder.Draw(Frame, uploads, (context.Pipeline, pool), context.Recorded,
+            : Recorder.Draw(Frame, uploads, (pipeline, pool), program,
                 (_starts, draw.Sizes, draw.Count, draw.Ssbo));
         if (!recorded)
         {
@@ -122,109 +119,69 @@ internal sealed partial class TerrainRenderer
         }
 
         if (_counted is not null) Counted++;
-        if (_intoOwn) OwnDraws++;
         Draws++;
         return true;
     }
 
-    // A pool not adopted in Prepare (made since): adopting copies it with OpenGL, so an open ordered segment closes first
+    // Pool made since Prepare: adopted with no OpenGL work
     private TerrainPools.Pool? Adopted(VAO vao, bool classic, out string why)
     {
-        if (Frame.Open && !Frame.Pending) Frame.Close("a pool to adopt");
         using var quiet = GlTap.Quietly();
         var pool = Pools.Adopt(vao, classic, out why);
-        _ = Assert(pool is not null || why.Length > 0) && Assert(!Frame.Open || Frame.Pending);
+        _ = Assert(pool is not null || why.Length > 0);
         _context = null;
         return pool;
     }
 
-    // A depth-only draw that tests and writes the nearest depth, reading no image a framebuffer holds: the same before or after
-    // OpenGL's depth-only draws into the same depth, so it may wait in a segment OpenGL has not signalled yet
-    internal bool Commuting(VulkanFrame.Target target, GlTap.Fixed state, List<SharedImage> sampled)
-    {
-        if (!NotNull(target) || target.Depth is null || target.DepthReadOnly || !target.DepthOnly)
-            return false;
-        if (state.DepthCompare is not (1 or 3)) return false;
-        foreach (var image in sampled.Bounded(MaxSamplers))
-            if (Targets.Find(image.Texture) is not null)
-                return false;
-        return true;
-    }
-
-    // One opened before an image was new closes first. Begin keeps an open segment's images, so what it held it still holds.
-    // The images sampled are marked used in this frame: no copy of them makes room for another in it. render: the target's
-    // rendering begins (a blit moves the images itself), while Owning on Komet's depth (Owned); whole: with a clear of every
-    // texel of the depth, which then needs no copy in.
-    public bool Segment(VulkanFrame.Target target, SegmentSync sync, List<SharedImage> sampled, out string why,
-        bool render = true, bool whole = false)
+    // A segment older than a new image closes first; Begin keeps held images. Sampled images are marked used this
+    // frame. render: begin the target's rendering.
+    public bool Segment(VulkanFrame.Target target, List<SharedImage> sampled, out string why, bool render = true)
     {
         why = "";
         if (!NotNull(target) || !NotNull(sampled) || !Assert(sampled.Count <= MaxSamplers)) return false;
         foreach (var image in sampled.Bounded(MaxSamplers)) image.Used = Frame.Number;
-        var into = render ? Current(target) : target;
-        if (!Touching(into, sampled)) return Refuse(out why, "the draw samples the depth it draws into");
-        var owning = render && ReferenceEquals(into, target) && Ownable(target); // Komet's depth to take over: not Again
-        if (!owning && Again(into, sync, sampled)) return Into(into, target);
-        if (!Frame.Open && Copies.Stale) Refreshed();
-        var held = Frame.Open && Held(into, sampled);
-        if (Frame.Open && !held) Frame.Close("an image new since the segment opened"); // Komet's depth went back as it closed
-        if (!held) into = render ? Current(target) : target;
-        if (!Frame.Begin(sync, out why)) return false;
-        if (!held && !Held(into, sampled)) return Refuse(out why, "an image the draw uses is not shared");
+        if (Again(target, sampled)) return Assert(Frame.Open);
+        Holding(target, sampled);
+        var held = Frame.Open && Held(target, sampled);
+        if (Frame.Open && !held) Frame.Close("an image new since the segment opened");
+        if (!Frame.Begin(out why)) return false;
+        if (!held) Holding(target, sampled);
+        if (!held && !Held(target, sampled)) return Refuse(out why, "an image the draw uses is not held");
         if (!render) return Assert(Frame.Open);
-        if (ReferenceEquals(into, target)) into = Owned(target, whole);
-        if (!Frame.Prepare(into, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(sampled)))
+        if (!Frame.Prepare(target, System.Runtime.InteropServices.CollectionsMarshal.AsSpan(sampled)))
             return Refuse(out why, "the draw samples what it draws into");
-        Prepared(into, sync, sampled);
-        return Into(into, target);
-    }
-
-    private bool Into(VulkanFrame.Target into, VulkanFrame.Target target)
-    {
-        _intoOwn = !ReferenceEquals(into, target);
-        return Assert(Frame.Open) && Assert(!_intoOwn || ReferenceEquals(into.Depth, _own));
+        Prepared(target, sampled);
+        return Assert(Frame.Open);
     }
 
     private const int MaxPrepared = 64;
 
-    // The segment, rendering, target and sync Prepare last ran for, and the images sampled through it since: each was held and
-    // moved for sampling then, and stays so while the rendering does (every layout move ends it first, which counts)
-    private (long Serial, long Renderings, VulkanFrame.Target? Target, SegmentSync Sync, int Count) _prepared;
+    // State of Prepare's last run plus images sampled since: held and in sampling layout while the rendering lasts
+    private (long Serial, long Renderings, VulkanFrame.Target? Target, int Count) _prepared;
     private readonly SharedImage[] _preparedImages = new SharedImage[MaxPrepared];
 
-    private void Prepared(VulkanFrame.Target target, SegmentSync sync, List<SharedImage> sampled)
+    private void Prepared(VulkanFrame.Target target, List<SharedImage> sampled)
     {
-        var (serial, renderings, last, was, count) = _prepared;
-        var same = serial == Frame.Serial && renderings == Frame.Renderings && ReferenceEquals(last, target) && was == sync;
+        var (serial, renderings, last, count) = _prepared;
+        var same = serial == Frame.Serial && renderings == Frame.Renderings && ReferenceEquals(last, target);
         if (!same || count + sampled.Count > MaxPrepared) count = 0;
         foreach (var image in sampled.Bounded(MaxSamplers))
             if (Array.IndexOf(_preparedImages, image, 0, count) < 0)
                 _preparedImages[count++] = image;
-        _prepared = (Frame.Serial, Frame.Renderings, target, sync, count);
+        _prepared = (Frame.Serial, Frame.Renderings, target, count);
         _ = Assert(count <= MaxPrepared) && Assert(Frame.Open);
     }
 
-    // Into the target Prepare last ran for, sampling only images sampled through it since, in the same segment and rendering:
-    // Begin, Held and Prepare would change nothing
-    private bool Again(VulkanFrame.Target target, SegmentSync sync, List<SharedImage> sampled)
+    // Same target, segment and rendering, sampling only images already sampled: nothing to do
+    private bool Again(VulkanFrame.Target target, List<SharedImage> sampled)
     {
-        var (serial, renderings, last, was, count) = _prepared;
+        var (serial, renderings, last, count) = _prepared;
         if (!Frame.Open || serial != Frame.Serial || renderings != Frame.Renderings || !ReferenceEquals(last, target) ||
-            was != sync || Frame.Fault.Length > 0 || (sync == SegmentSync.Ordered && Frame.Pending)) return false;
+            Frame.Fault.Length > 0) return false;
         foreach (var image in sampled.Bounded(MaxSamplers))
             if (Array.IndexOf(_preparedImages, image, 0, count) < 0)
                 return false;
         return Assert(count <= MaxPrepared);
-    }
-
-    // Copies changed while no segment was open (an upload with none open) are refreshed before one opens, as a draw sampling
-    // one would refresh them all anyway, but only after closing the segment it opened
-    private void Refreshed()
-    {
-        using var quiet = GlTap.Quietly();
-        Copies.Refresh(Frame.Number);
-        if (Copies.PacksWaiting) _ = Frame.Late();
-        _ = Assert(!Frame.Open) && Assert(!Copies.Stale);
     }
 
     private bool Held(VulkanFrame.Target target, List<SharedImage> sampled)
@@ -246,8 +203,7 @@ internal sealed partial class TerrainRenderer
         return false;
     }
 
-    // readOnly: the depth is only tested, not written; foreign: a framebuffer object that is not the engine's is drawn into
-    // through copies of its textures (the scene's)
+    // readOnly: depth tested, not written; foreign: a non-engine framebuffer, drawn via texture copies
     public VulkanFrame.Target? Target(GlTap.Fixed state, out string why, int into = -1, bool? depthReadOnly = null,
         bool foreign = false)
     {
@@ -258,7 +214,7 @@ internal sealed partial class TerrainRenderer
             changes == GlTap.BufferChanges && lastReadOnly == readOnly) return last;
         var ours = Ours(fbo);
         if (!ours && (!foreign || fbo == 0))
-            return None<VulkanFrame.Target>(out why, "draws into a framebuffer that is not shared");
+            return None<VulkanFrame.Target>(out why, "draws into a framebuffer Vulkan does not stand for");
         var buffers = GlTap.DrawBuffersOf(fbo);
         var key = (fbo, Packed(buffers), readOnly);
         if (_targets.TryGetValue(key, out var made))
@@ -273,7 +229,7 @@ internal sealed partial class TerrainRenderer
         return Remembered(key, made, readOnly);
     }
 
-    // Five bits per output: its attachment plus one (DrawBuffersOf gives -1 to 15)
+    // Five bits per output: attachment + 1 (DrawBuffersOf gives -1 to 15)
     private static ulong Packed(int[] buffers)
     {
         var packed = 0UL;
@@ -292,7 +248,7 @@ internal sealed partial class TerrainRenderer
         return made;
     }
 
-    // A mod's framebuffer object (FluffyClouds' cloud map): the copies of its level-0 2D attachments as the target
+    // Mod framebuffer (FluffyClouds' cloud map): its textures' images, any level/layer(s)
     private VulkanFrame.Target? Foreign(int fbo, int[] buffers, bool readOnly, out string why)
     {
         why = "";
@@ -300,64 +256,101 @@ internal sealed partial class TerrainRenderer
         var attached = Asked(fbo);
         var outputs = Array.FindLastIndex(buffers, b => b >= 0) + 1;
         var (images, stands) = (new SharedImage?[outputs], new List<int>());
+        var (width, height, layers) = (int.MaxValue, int.MaxValue, 0);
+        var (views, at) = (new ulong[outputs], new (int Level, int Layer)[outputs]);
         for (var i = 0; i < Math.Min(outputs, GlTap.MaxBuffers); i++)
         {
             if (buffers[i] is < 0 or >= GlFramebuffer.Colors || attached[buffers[i]].Texture == 0) continue;
-            if (Stand(attached[buffers[i]], out why) is not { } image) return null;
-            (images[i], stands) = (image, [.. stands, attached[buffers[i]].Texture]);
+            var a = attached[buffers[i]];
+            if (Stand(a, out why) is not { } image) return null;
+            if (Viewed(image, a) is not var (view, w, h, l) || (layers > 0 && l != layers))
+                return None<VulkanFrame.Target>(out why, "draws past the image's levels or layers, or into layers unalike");
+            (images[i], views[i], at[i], layers) = (image, view, (a.Level, a.Layer), l);
+            stands.Add(a.Texture);
+            (width, height) = (Math.Min(width, w), Math.Min(height, h));
         }
 
-        SharedImage? depth = null;
-        if (attached[GlFramebuffer.Depth] is { Texture: > 0 } d && (depth = Stand(d, out why)) is null) return null;
-        if (depth is not null) stands.Add(attached[GlFramebuffer.Depth].Texture);
-        var sized = images.Append(depth).OfType<SharedImage>().ToArray();
-        if (sized.Length == 0) return None<VulkanFrame.Target>(out why, "a framebuffer with nothing attached");
-        return new VulkanFrame.Target(++_targetKeys, images, depth, readOnly, sized.Min(s => s.Width),
-            sized.Min(s => s.Height)) { Views = new ulong[outputs], Stands = [.. stands] };
+        var (depth, depthView) = ((SharedImage?)null, 0UL);
+        if (attached[GlFramebuffer.Depth] is { Texture: > 0 } d)
+        {
+            if (Depth(d, out why) is not var (image, view, w, h, l)) return null;
+            if (layers > 0 && l != layers) return None<VulkanFrame.Target>(out why, "a depth of other layers than the colors'");
+            (depth, depthView, layers) = (image, view, l);
+            stands.Add(d.Texture);
+            (width, height) = (Math.Min(width, w), Math.Min(height, h));
+        }
+
+        if (width == int.MaxValue) return None<VulkanFrame.Target>(out why, "a framebuffer with nothing attached");
+        return new VulkanFrame.Target(++_targetKeys, images, depth, readOnly, width, height)
+        {
+            Views = views, Stands = [.. stands], At = at, DepthView = depthView, Layers = Math.Max(layers, 1)
+        };
     }
 
-    // The image a blit reads from the framebuffer's attachment (GlFramebuffer.Depth for the depth): the shared one, or in a
-    // framebuffer of no one Vulkan knows, the texture's copy
-    public SharedImage? Read(int fbo, int attachment, out string why)
+    // A view of the attached level/layer(s)
+    private (SharedImage Image, ulong View, int Width, int Height, int Layers)? Depth(GlFramebuffer.Attached attached,
+        out string why)
     {
-        why = "";
+        var depth = Stand(attached, out why);
+        if (depth is null || !Assert(attached.Texture > 0)) return null;
+        if ((depth.Format.Aspect & Vk.AspectDepth) == 0)
+        {
+            why = "draws into a depth of a color format";
+            return null;
+        }
+
+        if (Viewed(depth, attached) is var (view, width, height, layers)) return (depth, view, width, height, layers);
+        why = "draws into a depth past its levels or layers";
+        return null;
+    }
+
+    // The target's image, or for unknown framebuffers the texture's (GlFramebuffer.Depth for depth)
+    public SharedImage? Read(int fbo, int attachment, out string why) => ReadAt(fbo, attachment, out _, out why);
+
+    // at: attached level and layer
+    public SharedImage? ReadAt(int fbo, int attachment, out (int Level, int Layer) at, out string why)
+    {
+        (why, at) = ("", default);
         if (!Assert(fbo > 0) || !Index(attachment, GlFramebuffer.Colors + 1)) return null;
         var attached = Asked(fbo)[attachment];
         if (attached.Texture == 0) return None<SharedImage>(out why, "reads no attachment");
-        if (attached.Level != 0 || attached.Layered || attached.Layer > 0)
-            return None<SharedImage>(out why, "reads a layer or a mipmap level");
-        if (Ours(fbo)) return Attachment(attached, out why);
-        return GlTap.TargetOf((uint)attached.Texture) == 0x0DE1
-            ? Copy(attached.Texture, out why)
-            : None<SharedImage>(out why, "reads no 2D texture");
+        at = (attached.Level, attached.Layer);
+        if (attached.Layered) return None<SharedImage>(out why, "reads every layer at once");
+        var image = Ours(fbo) ? Attachment(attached, out why) : Copy(attached.Texture, out why);
+        if (image is not null && (attached.Level >= image.Levels || attached.Layer >= image.Layers))
+            return None<SharedImage>(out why, "reads past the image's levels or layers");
+        return image;
     }
 
+    // Any level/layer of any kind, or all layers (via views)
     private SharedImage? Stand(GlFramebuffer.Attached attached, out string why)
     {
         _ = Assert(attached.Texture > 0) && Assert(attached.Level >= 0);
-        if (attached.Level != 0 || attached.Layered || attached.Layer > 0 ||
-            GlTap.TargetOf((uint)attached.Texture) != 0x0DE1)
-            return None<SharedImage>(out why, "draws into a layer, a mipmap level or no 2D texture");
         return Copy(attached.Texture, out why, stand: true);
     }
 
-    // Vulkan drew into the target: the copies of a foreign framebuffer are ahead of their GL textures now
+    // 0: the image's own view; layers: all of a layered attachment
+    private static (ulong View, int Width, int Height, int Layers)? Viewed(SharedImage image, GlFramebuffer.Attached attached)
+    {
+        if (attached.Level >= image.Levels || attached.Layer >= image.Layers || !Assert(attached.Level >= 0) ||
+            !Assert(attached.Layer >= 0)) return null;
+        var (width, height) = (Math.Max(image.Width >> attached.Level, 1), Math.Max(image.Height >> attached.Level, 1));
+        if (attached.Layered) return (image.LayeredView(attached.Level), width, height, image.Layers);
+        var view = image.Levels > 1 || image.Layers > 1 ? image.LevelView(attached.Level, attached.Layer) : 0;
+        return (view, width, height, 1);
+    }
+
+    // Foreign framebuffers' images are now ahead of their GL textures
     public void Drawn(VulkanFrame.Target target)
     {
         if (!NotNull(target) || !Assert(Frame.Open) || target.Stands.Length == 0) return;
-        foreach (var texture in target.Stands.Bounded(GlFramebuffer.Colors + 1)) Copies.Wrote(texture);
+        foreach (var texture in target.Stands.Bounded(GlFramebuffer.Colors + 1)) Images.Wrote(texture);
         _ = Assert(target.Stands.Length <= GlFramebuffer.Colors + 1);
     }
 
-    // OpenGL is about to read or write the texture: what Vulkan drew into its copy goes back first, after the open segment
-    // (which may still draw into the copy) closed
-    public void WriteBack(int texture)
-    {
-        if (!Assert(texture >= 0) || !Copies.Written(texture)) return;
-        Frame.Close("OpenGL reads what Vulkan drew for it");
-        using var quiet = GlTap.Quietly();
-        Copies.WriteBack(texture);
-    }
+    // The image a texture is sampled from: a target's, else the texture's own
+    internal SharedImage? SampledFind(int texture) =>
+        Assert(texture >= 0) ? Targets.Find(texture) ?? Images.Find(texture) : null;
 
     private (int Fbo, long Changes, bool ReadOnly, VulkanFrame.Target? Target) _lastTarget;
 
@@ -369,17 +362,6 @@ internal sealed partial class TerrainRenderer
         return _attached[fbo] = attached;
     }
 
-    private (int[] Colors, int Depth) Attachments(int fbo)
-    {
-        if (!Assert(fbo > 0) || !Assert(_attached.Count <= MaxTargets * 4)) return ([], 0);
-        if (_textures.TryGetValue(fbo, out var known)) return known;
-        var attached = Asked(fbo);
-        known = ([.. attached.Take(GlFramebuffer.Colors).Select(a => a.Texture)], attached[GlFramebuffer.Depth].Texture);
-        _textures[fbo] = known;
-        return known;
-    }
-
-    private readonly Dictionary<int, (int[] Colors, int Depth)> _textures = [];
 
     private VulkanFrame.Target? Made(int fbo, int[] buffers, bool readOnly, out string why)
     {
@@ -389,48 +371,50 @@ internal sealed partial class TerrainRenderer
         var attached = Asked(fbo);
         var outputs = Array.FindLastIndex(buffers, b => b >= 0) + 1;
         if (!Assert(outputs <= GlTap.MaxBuffers) || !Assert(attached.Length == GlFramebuffer.Colors + 1)) return null;
-        var (images, views) = (new SharedImage?[outputs], new ulong[outputs]);
+        var (images, views, at) = (new SharedImage?[outputs], new ulong[outputs], new (int Level, int Layer)[outputs]);
         var (width, height) = (int.MaxValue, int.MaxValue);
         for (var i = 0; i < Math.Min(outputs, GlTap.MaxBuffers); i++)
         {
             if (buffers[i] is < 0 or >= GlFramebuffer.Colors || attached[buffers[i]].Texture == 0) continue;
             if (Attachment(attached[buffers[i]], out why) is not { } image) return null;
             if (_replaced) return None<VulkanFrame.Target>(out why, "an attachment was replaced"); // names moved: ask again
-            (images[i], views[i]) = (image, image.Layers > 1 ? image.LayerView(attached[buffers[i]].Layer) : 0);
-            (width, height) = (Math.Min(width, image.Width), Math.Min(height, image.Height));
+            if (Viewed(image, attached[buffers[i]]) is not var (view, w, h, _))
+                return None<VulkanFrame.Target>(out why, "draws past the image's levels or layers");
+            (images[i], views[i], at[i]) = (image, view, (attached[buffers[i]].Level, attached[buffers[i]].Layer));
+            (width, height) = (Math.Min(width, w), Math.Min(height, h));
         }
 
         SharedImage? depth = null;
+        if (attached[GlFramebuffer.Depth] is { Texture: > 0, Level: > 0 })
+            return None<VulkanFrame.Target>(out why, "draws into a mipmap level of a depth");
         if (attached[GlFramebuffer.Depth].Texture != 0 &&
             (depth = Attachment(attached[GlFramebuffer.Depth], out why)) is null) return null;
         if (_replaced) return None<VulkanFrame.Target>(out why, "an attachment was replaced");
         if (depth is not null) (width, height) = (Math.Min(width, depth.Width), Math.Min(height, depth.Height));
         if (width == int.MaxValue) return None<VulkanFrame.Target>(out why, "a framebuffer with nothing attached");
-        return new VulkanFrame.Target(++_targetKeys, images, depth, readOnly, width, height) { Views = views };
+        return new VulkanFrame.Target(++_targetKeys, images, depth, readOnly, width, height) { Views = views, At = at };
     }
 
     private readonly Dictionary<int, GlFramebuffer.Attached[]> _attached = [];
     private bool _replaced; // an attachment was replaced while a target was made: the names it had read may be stale
 
-    // The shared image of an attachment, the texture replaced by one first if it has none (its owner told the new name).
-    // OpenGL's work, so the open segment goes to the GPU before it
+    // An image made for the texture first if needed (TerrainTargets.Share)
     private SharedImage? Attachment(GlFramebuffer.Attached attached, out string why)
     {
         why = "";
-        if (attached.Level != 0) return None<SharedImage>(out why, "draws into a mipmap level");
         if (attached.Layered) return None<SharedImage>(out why, "draws into every layer at once");
         if (Targets.Find(attached.Texture) is { } known) return known;
-        Frame.Close("a texture to share");
+        Frame.Close("a texture to stand for");
         SharedImage? image;
         using (GlTap.Quietly()) image = Targets.Share(attached.Texture, out why);
         ForgetTargets(); // the attachments changed under every target made
         _replaced = image is not null;
         if (image is not null)
-            _logger?.Notification("Komet: Vulkan shares texture {0} ({1}x{2}, {3} layers)", attached.Texture, image.Width,
+            _logger?.Notification("Komet: Vulkan stands for texture {0} ({1}x{2}, {3} layers)", attached.Texture, image.Width,
                 image.Height, image.Layers);
-        else if (why != TerrainTargets.Waits && _refusedSwaps.Add(-attached.Texture))
-            _logger?.Notification("Komet: Vulkan leaves drawing into texture {0} to OpenGL: {1}", attached.Texture, why);
-        return image ?? None<SharedImage>(out why, why.Length > 0 ? why : "no shared image for it");
+        else if (_refusedSwaps.Add(-attached.Texture))
+            _logger?.Notification("Komet: Vulkan cannot draw into texture {0}: {1}", attached.Texture, why);
+        return image ?? None<SharedImage>(out why, why.Length > 0 ? why : "no image for it");
     }
 
     private int _targetKeys;
@@ -461,9 +445,9 @@ internal sealed partial class TerrainRenderer
             }
 
             if (gl <= 0) return Missing(out why, program, sampler.Name, "the engine bound no texture to it");
-            var image = Targets.Find(gl) ?? Copy(gl, out why);
+            var image = SampledFind(gl) ?? Copy(gl, out why);
             if (image is null) return Missing(out why, program, sampler.Name, why);
-            var state = samplerObject > 0 ? samplers(samplerObject) : Targets.Sampling(gl) ?? Copies.SamplingOf(gl);
+            var state = samplerObject > 0 ? samplers(samplerObject) : Targets.Sampling(gl) ?? SamplingOf(gl);
             if (state is null) return Missing(out why, program, sampler.Name, $"texture {gl} has no known sampling");
             var layout = image == target.Depth ? LayoutDepthReadOnly : Vk.LayoutShaderRead;
             _resolved[i] = new TerrainDraw.Texture(image.Sampled, Sampling.Get(state.Value), layout);
@@ -476,52 +460,15 @@ internal sealed partial class TerrainRenderer
     private const int MaxSets = 1024;
     private readonly TerrainDraw.Texture[] _resolved = new TerrainDraw.Texture[MaxSamplers];
 
-    // A texture no framebuffer holds, as its copy. Filling a new one is OpenGL's work: beside a deferred segment, which takes
-    // the copy over in its setup, else between segments - a private copy's fill also after the open segment's signal, which
-    // OpenGL then gives once more as the segment closes; refreshing one OpenGL changed since, after the open segment (which may
-    // have read the old contents) closed. stand: Vulkan draws into it, so it must be exported.
-    public SharedImage? Copy(int texture, out string why, bool stand = false)
-    {
-        why = "";
-        if (!Assert(texture > 0)) return null;
-        if (stand && Copies.Movable(texture)) Exporting(texture);
-        var (known, dirty) = (Copies.Has(texture), Copies.Dirty(texture));
-        if (known && !dirty) return Copies.Get(texture, out why, frame: Frame.Number);
-        var seeded = !known && !stand && !Copies.Exports(texture, false) && Seedable(texture); // no OpenGL work for it
-        if (Frame.Open && (dirty || (!seeded && !Frame.Pending && (Copies.Exports(texture, stand) || !Frame.Late()))))
-            Frame.Close(dirty ? $"copied texture {texture} changed" : "a texture to copy");
-        using var quiet = GlTap.Quietly();
-        var copy = Copies.Get(texture, out why, stand, Frame.Number);
-        if (copy is null) return null;
-        if (seeded) _ = Seeded(texture, copy);
-        if (!Frame.Open) Copies.Refresh(Frame.Number);
-        else if (!Copies.Refresh(texture, Frame.Number, out var refused))
-            return None<SharedImage>(out why, refused.Length > 0 ? refused : $"texture {texture} not copied");
-        if (Copies.Dirty(texture)) return None<SharedImage>(out why, $"texture {texture} not copied: no staging");
-        if (Copies.PacksWaiting) _ = Frame.Late();
-        Filled();
-        if (Frame.Open) _ = Frame.Take(new VulkanFrame.Shared(copy, Vk.LayoutShaderRead, GlInterop.LayoutShaderRead));
-        return copy;
-    }
-
-    // A private copy a framebuffer of the scene's own draws into: made again exported, as OpenGL takes back what Vulkan drew
-    private void Exporting(int texture)
-    {
-        Frame.Close("a copy to export");
-        Copies.Forget(texture, Frame.Number);
-        _ = Assert(!Copies.Has(texture)) && Assert(!Frame.Open);
-    }
-
     private static TerrainDraw.Program? Missing(out string why, Program program, string sampler,
         string reason)
     {
-        why = $"{program.Name} reads {sampler}: {reason}";
+        why = Reason("{0} reads {1}: {2}", program.Name, sampler, reason);
         _ = Assert(why.Length > 0) && NotNull(program);
         return null;
     }
 
-    // Made on a builder; meanwhile the pool stays OpenGL's (waiting), but a counted draw, which OpenGL would not draw,
-    // waits for it
+    // Built on a builder and waited for: a draw left out would be missing from the picture
     private TerrainPipeline? Pipeline(Program program, TerrainPools.Pool pool, VulkanFrame.Target target, GlTap.Fixed state,
         out bool waiting)
     {
@@ -535,47 +482,67 @@ internal sealed partial class TerrainRenderer
         return _pipelines.TryMade(key, out var made) ? made : Build(key, program, pool.Attributes, (state, formats.Target), out waiting);
     }
 
-    // Its own method: the lambda's captures would otherwise be allocated on every call of Pipeline, found or not
+    // Separate method: the lambda's captures would otherwise allocate on every Pipeline call
     private TerrainPipeline? Build(PipelineKey key, Program program, TerrainPools.Attribute[] attributes,
         (GlTap.Fixed State, TerrainPipeline.Target Target) made, out bool waiting)
     {
         var device = Device;
         _ = Assert(made.Target.Colors.Length <= GlTap.MaxBuffers) && NotNull(program);
+        if (program.Sources.Length > 0 && !_pipelines.Knows(key)) // kept for the next start, which begins it ahead (Warm)
+            ShaderCache.Remember(program.Sources, PipelineRecipes.Packed((PipelineRecipes.Terrain + key.Layout, key.Formats,
+                Vk.TopologyTriangles), key.State, attributes, made.Target));
         return _pipelines.Get(key, (program.Name, program.Ported),
             ported => TerrainPipeline.Started(device, ported, attributes, (made.State, made.Target, Vk.TopologyTriangles)),
-            _counted is not null, out waiting);
+            true, out waiting); // a draw left out would be missing from the picture
+    }
+
+    // Pipelines an earlier start used, begun when the port is taken
+    public void Warm(Program program)
+    {
+        if (!NotNull(program) || program.Sources.Length == 0) return;
+        var (device, ported) = (Device, program.Ported);
+        foreach (var recipe in ShaderCache.Recipes(program.Sources).Bounded(MaxPipelines))
+        {
+            if (!recipe.Inputs.StartsWith(PipelineRecipes.Terrain, StringComparison.Ordinal) ||
+                PipelineRecipes.Unpacked(recipe) is not var (state, attributes, target)) continue; // the scene's
+            var key = new PipelineKey(program.Id, recipe.Inputs[PipelineRecipes.Terrain.Length..], recipe.Target, state);
+            _pipelines.Start(key, (program.Name, ported),
+                p => TerrainPipeline.Started(device, p, attributes, (state, target, Vk.TopologyTriangles)));
+        }
+
+        _ = Assert(_pipelines.Count <= MaxPipelines);
     }
 
     public long PipelineWaits => _pipelines.Waits;
+    public long PipelinesStarted => _pipelines.Started;
 
-    // The target's formats as a pipeline is made for them, and the state with the alpha writes masked where a color is RGB
-    // (alpha reads 1): worked out once per target, as a pool's draw asks again whenever OpenGL's state changed
+    // Formats plus state with alpha writes masked for RGB colors (alpha reads 1); cached per target
     internal (TerrainPipeline.Target Target, string Key) Formats(VulkanFrame.Target target, ref GlTap.Fixed state)
     {
         if (!NotNull(target)) return (new TerrainPipeline.Target([], 0), "");
-        if (!ReferenceEquals(_formats.Of, target))
+        if (!_formats.TryGetValue(target, out var formats))
         {
-            uint[] colors = [.. target.Colors.Select(c => c?.Format.Vulkan ?? 0)];
+            uint[] colors = [.. target.Colors.Select(static c => c?.Format.Vulkan ?? 0)];
             var depth = target.Depth?.Format.Vulkan ?? 0;
-            bool[]? opaque = target.Colors.Any(c => c?.OpaqueAlpha == true)
-                ? [.. target.Colors.Select(c => c?.OpaqueAlpha == true)]
+            bool[]? opaque = target.Colors.Any(static c => c?.OpaqueAlpha == true)
+                ? [.. target.Colors.Select(static c => c?.OpaqueAlpha == true)]
                 : null;
-            _formats = (target, new TerrainPipeline.Target(colors, depth), $"{string.Join(',', colors)}/{depth}", opaque);
+            if (_formats.Count >= 2 * MaxTargets) _formats.Clear();
+            _formats[target] = formats = (new TerrainPipeline.Target(colors, depth), $"{string.Join(',', colors)}/{depth}", opaque);
         }
 
-        if (_formats.Opaque is { } masked) state = GlTap.WithoutAlpha(state, masked);
-        _ = Assert(_formats.Target.Colors.Length == target.Colors.Length);
-        return (_formats.Target, _formats.Key);
+        if (formats.Opaque is { } masked) state = GlTap.WithoutAlpha(state, masked);
+        _ = Assert(formats.Target.Colors.Length == target.Colors.Length);
+        return (formats.Target, formats.Key);
     }
 
-    private (VulkanFrame.Target? Of, TerrainPipeline.Target Target, string Key, bool[]? Opaque) _formats;
+    // By target: passes alternate (shadow maps, screen, scene); a single remembered one was rebuilt every turn
+    private readonly Dictionary<VulkanFrame.Target, (TerrainPipeline.Target Target, string Key, bool[]? Opaque)> _formats =
+        new(ReferenceEqualityComparer.Instance);
 
     private bool Leave(string why)
     {
-        Left++;
-        if (NotNull(why) && why.Length > 0 && Reasons.Count < 16 && Reasons.Add(why))
-            _logger?.Warning("Komet: Vulkan terrain leaves a pool to OpenGL: {0}", why);
-        _ = Assert(Left > 0);
-        return false;
+        if (NotNull(why)) Miss(why);
+        return !Assert(why.Length > 0) && !Assert(Missed > 0);
     }
 }

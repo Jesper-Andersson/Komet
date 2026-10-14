@@ -1,3 +1,4 @@
+using Komet.Rendering;
 using OpenTK.Graphics.OpenGL;
 
 namespace Komet.Test.Gpu;
@@ -10,8 +11,8 @@ public sealed class GlQueryCacheGpuTests
     [Test]
     public void AnswersAsTheDriver()
     {
-        using var window = OcclusionGpuTests.Context();
-        if (window is null) Assert.Ignore("no OpenGL 4.6 context here: " + OcclusionGpuTests.Why);
+        using var window = GlContext.Context();
+        if (window is null) Assert.Ignore("no OpenGL 4.6 context here: " + GlContext.Why);
         GlQueryCache.Install();
         var (a, b) = (GL.GenFramebuffer(), GL.GenFramebuffer());
         GL.BindFramebuffer(FramebufferTarget.Framebuffer, a);

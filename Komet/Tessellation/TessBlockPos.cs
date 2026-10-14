@@ -2,16 +2,16 @@ using System.Collections.Concurrent;
 using System.Reflection;
 using System.Reflection.Emit;
 using HarmonyLib;
+using Komet.Core;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
 
 namespace Komet.Tessellation;
 
-// ChunkTesselator builds a new BlockPos for every IDrawYAdjustable block (each plant, crop and dead crop) it asks how far to lower:
-// 1.8 MB/s of garbage while chunks tesselate. The vanilla answers never read the position (they look at the block below in
-// chunkExtBlocks), so the call gets the thread's own BlockPos when the implementation it reaches is proven, once per block type, never
-// to load the position but to read one of its fields; any other type, and every call while switched off, gets a new BlockPos as
-// before.
+// ChunkTesselator allocates a BlockPos for every IDrawYAdjustable block (plants, crops) it asks how far to lower: 1.8
+// MB/s of garbage while tessellating. Vanilla answers never read the position (they check the block below in
+// chunkExtBlocks), so calls get the thread's own BlockPos where the reached implementation is proven, once per type,
+// only to read its fields; other types, and all calls while off, get a new one.
 internal static class TessBlockPos
 {
     private const int MaxInstructions = 8192, MaxBody = 4096, BlockBit = 1, DecorBit = 2, AllBits = 3;
@@ -40,8 +40,7 @@ internal static class TessBlockPos
         _ = NotNull(harmony.Patch(decor, transpiler: new HarmonyMethod(Rewrite)));
     }
 
-    // Each AdjustYPosition call whose position is a new BlockPos(x, y, z) consumed right there: the constructor becomes At, the call
-    // Adjust. Any other shape keeps the engine's IL.
+    // AdjustYPosition calls taking a fresh new BlockPos(x, y, z): ctor -> At, call -> Adjust; else the IL stays
     internal static List<CodeInstruction> Rewrite(IEnumerable<CodeInstruction> instructions, MethodBase original)
     {
         var bit = original?.Name == "TesselateBlock" ? BlockBit : DecorBit;
@@ -68,8 +67,7 @@ internal static class TessBlockPos
         return pos;
     }
 
-    // Stands in for target.AdjustYPosition(pos, ...): the thread's position only for an implementation that cannot keep it, else a new
-    // one built from the same x, y, z. A null target throws as the engine's callvirt did.
+    // Replaces AdjustYPosition(pos, ...): the thread's position only where proven, else a new one (null throws alike)
     internal static float Adjust(IDrawYAdjustable target, BlockPos pos, Block[] blocks, int index)
     {
         var type = target.GetType();
@@ -80,8 +78,7 @@ internal static class TessBlockPos
         return target.AdjustYPosition(pos, blocks, index);
     }
 
-    // The method a call on this type reaches: the interface's implementation, and the type's own override of it when that is virtual.
-    // Each one may load its position argument only to read a field of it.
+    // Implementation a call on this type reaches, plus its override if virtual: each may only read position fields
     internal static bool Confined(Type type)
     {
         if (!NotNull(type) || !typeof(IDrawYAdjustable).IsAssignableFrom(type)) return false;
@@ -95,12 +92,12 @@ internal static class TessBlockPos
         return Reads(target) && (ReferenceEquals(derived, target) || Reads(derived));
     }
 
-    // Argument 1 (the position of an instance method) is only ever loaded for an ldfld; a body that cannot be read counts as keeping it
+    // Argument 1 (the position) is only loaded for an ldfld; an unreadable body counts as keeping it
     private static bool Reads(MethodInfo method)
     {
         // a body another mod patches may do anything with it
         if (!NotNull(method) || method.IsStatic || method.GetMethodBody() is null ||
-            Harmony.GetPatchInfo(method) is not null)
+            EngineShape.Patched(method))
             return false;
         List<CodeInstruction> code;
         try
@@ -123,7 +120,7 @@ internal static class TessBlockPos
         return true;
     }
 
-    // Any instruction naming argument 1: a load, its address or a store (the operand an index or the ParameterInfo at position 0)
+    // Any instruction naming argument 1: load, address or store (operand an index or ParameterInfo at position 0)
     private static bool Position(CodeInstruction code)
     {
         var op = code.opcode;

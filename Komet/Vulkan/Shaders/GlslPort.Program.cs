@@ -18,8 +18,7 @@ internal static partial class GlslPort
         public required int[] Outputs { get; init; }
     }
 
-    // attributes: the locations bound with glBindAttribLocation, for inputs whose source names none. hot: loose uniforms that
-    // change with (nearly) every draw, put into push constants
+    // attributes: glBindAttribLocation locations; hot: loose uniforms changing nearly every draw, pushed
     public static Ported? Build(string name, string vertex, string fragment,
         IReadOnlyDictionary<string, int>? attributes, out string error, IReadOnlySet<string>? hot = null)
     {
@@ -70,7 +69,7 @@ internal static partial class GlslPort
         return pushed;
     }
 
-    // The push constant block both stages declare, on one line, the same in each (members either stage leaves unread too)
+    // One line, identical in both stages (members a stage leaves unread too)
     private static string HotDeclaration(List<Uniform> pushed)
     {
         if (!NotNull(pushed) || pushed.Count == 0) return "";

@@ -14,8 +14,7 @@ internal static partial class Vk
     public const uint ResultAvailability = 4;
     public const int OcclusionQueryPrecise = 23, PipelineStatisticsQuery = 24, ShaderFloat64 = 39;
 
-    // VK_QUERY_TYPE_PIPELINE_STATISTICS counting vertex shader invocations, clipping invocations and primitives, fragment shader
-    // invocations: written in this order
+    // Pipeline statistics, written in order: VS invocations, clipping invocations, clipping primitives, FS invocations
     public const uint QueryPipelineStatistics = 1, CountedStatistics = 0x4 | 0x20 | 0x40 | 0x80;
 
     public struct PushRange { public uint Stages, Offset, Size; }
@@ -51,6 +50,18 @@ internal static partial class Vk
         public Layers Target;
         public int TargetX0, TargetY0, TargetZ0, TargetX1, TargetY1, TargetZ1;
     }
+
+    // VkImageCopy: same-sized regions between two images of compatible formats, texel for texel
+    public struct ImageCopy
+    {
+        public Layers Source;
+        public int SourceX, SourceY, SourceZ;
+        public Layers Target;
+        public int TargetX, TargetY, TargetZ;
+        public uint Width, Height, Depth;
+    }
+
+    public const uint StageHost = 0x4000, AccessHostRead = 0x2000;
 
     // VkClearAttachment: the value is a VkClearValue - four floats for a color, depth and stencil for a depth
     public struct ClearAttachment

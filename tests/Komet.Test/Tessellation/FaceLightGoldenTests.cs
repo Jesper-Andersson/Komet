@@ -1,3 +1,5 @@
+using Komet.Core;
+using Komet.Tessellation;
 using Vintagestory.GameContent;
 
 namespace Komet.Test.Tessellation;

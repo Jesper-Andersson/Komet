@@ -1,8 +1,7 @@
 namespace Komet.Vulkan;
 
-// On a frame the passes record into the frame's open segment, posted to its recording thread like the draws around them, so
-// compute and the draws it feeds share one command buffer and no handoff. Deleting waits for the GPU, which only a world's end or
-// a switch does.
+// On a frame passes record into the frame's open segment on its recording thread, sharing one command buffer with the
+// draws. Deleting waits for the GPU (only at world end or a switch).
 internal sealed unsafe partial class VulkanBackend
 {
     private const int MaxOutside = 16;
@@ -25,11 +24,10 @@ internal sealed unsafe partial class VulkanBackend
         if (commands != IntPtr.Zero) record(commands);
     }
 
-    // Work the frame had no segment for, or an upload no memory was left for: its result is missing (a pyramid level, a pass)
+    // Work the frame had no segment or upload memory for: its result is missing (a pyramid level, a pass)
     public long Refused { get; private set; }
 
-    // An engine texture as this backend names it: on a frame, the frame's shared image of it (0 without one); otherwise the
-    // name is taken as this backend's own, as the tests hand theirs in
+    // Engine texture: on a frame its shared image (0 without one); else this backend's own name (tests)
     public int Engine(int texture)
     {
         if (!Assert(texture >= 0) || _shared is null) return texture;
@@ -37,7 +35,7 @@ internal sealed unsafe partial class VulkanBackend
         if (_outside.TryGetValue(image, out var known) && _images[known]?.Shared == image) return known;
         if (_outside.Count >= MaxOutside) // the frame's framebuffers were made anew: the handles of the old ones go
         {
-            foreach (var old in _outside.Values.ToArray().Bounded(MaxOutside)) _images[old] = null;
+            foreach (var old in _outside.Values.Bounded(MaxOutside)) _images[old] = null;
             _outside.Clear();
         }
 

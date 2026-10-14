@@ -2,10 +2,10 @@
   "_comment": [
     "Komet benchmark profiles for scripts/bench.sh. The script merges world + profiles.<name>, adds output, modDir, revision and",
     "env, and hands the result to the game as KOMET_BENCH. Only overrides belong here: the defaults and ranges live in",
-    "Komet/Bench/BenchConfig.cs. Arm knobs are the names in Komet/Core/Features.cs, with their ranges; flags take true/false.",
+    "Komet.Bench/BenchConfig.cs. Arm knobs are the names in Komet/Core/Features/Features.cs, with their ranges; flags take true/false.",
     "\"engine\": true starts the arm from every knob's engine value. Laps must be a multiple of the arm count.",
     "sandbox is read by the script only: window size, windowMode (0 windowed, 1 fullscreen), vsync, fps cap, view distance,",
-    "boot timeout, extra environment for the game process, and hud: keys merged into komet-hud.json (e.g. Visible)."
+    "boot timeout, extra environment for the game process, and hud: keys merged into komet.json (e.g. Visible)."
   ],
   "world": {
     "save": "testwelt",
@@ -113,25 +113,14 @@
       "warmupLaps": 0
     },
     "vulkan": {
-      "_comment": "the terrain drawn by OpenGL (gl), by Vulkan with every pass (vk), the opaque pass only (vk-opaque) and the depth passes only (vk-depth: shadow maps, liquid depth), with a screenshot where every measured lap starts: the frames must look alike, the times say what each pass costs or saves",
+      "_comment": "the world drawn by OpenGL (gl) and by Vulkan alone (vk), with a screenshot where every measured lap starts: the frames must look alike, the times say what Vulkan costs or saves",
       "settle": { "seconds": 60, "lapSeconds": 5 },
       "shots": true,
       "warmupLaps": 2,
       "laps": 4,
       "arms": [
-        { "name": "gl", "set": { "VulkanCore": true, "VulkanTerrain": false } },
-        {
-          "name": "vk",
-          "set": { "VulkanCore": true, "VulkanTerrain": true, "VulkanOpaque": true, "VulkanShadows": true, "VulkanLiquidDepth": true }
-        },
-        {
-          "name": "vk-opaque",
-          "set": { "VulkanCore": true, "VulkanTerrain": true, "VulkanOpaque": true, "VulkanShadows": false, "VulkanLiquidDepth": false }
-        },
-        {
-          "name": "vk-depth",
-          "set": { "VulkanCore": true, "VulkanTerrain": true, "VulkanOpaque": false, "VulkanShadows": true, "VulkanLiquidDepth": true }
-        }
+        { "name": "gl", "set": { "VulkanOnly": false } },
+        { "name": "vk", "set": { "VulkanOnly": true } }
       ]
     }
   }

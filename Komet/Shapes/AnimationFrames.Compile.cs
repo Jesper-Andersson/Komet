@@ -1,36 +1,31 @@
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet.Core;
 using Vintagestory.API.MathTools;
 using ResolvedTable = Vintagestory.API.Datastructures.FastSmallDictionary<Vintagestory.API.Common.ShapeElement,
     Vintagestory.API.Common.AnimationKeyFrameElement>;
 
 namespace Komet.Shapes;
 
-// The compile the cache cannot answer. Animation.GenerateAllFrames is O(K² · E · m): for every keyframe, element and flag
-// getTwoKeyFramesElementForFlag runs seekRightKeyFrame over all K keyframes and seekLeftKeyFrame back, and every probe is
-// AnimationKeyFrame.GetKeyFrameElement, a linear FastSmallDictionary scan over the m elements a keyframe moves. This produces the same
-// PrevNextKeyFrameByFrame in O(K · E).
-//
-// The same output is every float bit, the RotShortestDistance flags, ForElement and child order of every pose, FrameNumber, and which
-// AnimationFrame objects PrevNextKeyFrameByFrame shares; the golden tests compare all of it with the engine. Where the engine would
-// throw, or an input is not the shape this was verified on, Compile declines and the engine compiles, so its exceptions keep type and
-// message. It writes only the result, published with one store, and the inverse transforms the engine initialises first (not
-// jointsDone, which only GenerateFrame reads), and keeps no statics, since the singleplayer server thread compiles through it too.
+// The compile the cache cannot answer: GenerateAllFrames is O(K² · E · m) (keyframe seeks with linear element scans),
+// this builds the same PrevNextKeyFrameByFrame in O(K · E), bit for bit (golden tests). Unverified or throwing inputs
+// are declined to the engine. Writes only the result (one store) and inverse transforms; no statics, as the
+// singleplayer server compiles too.
 internal static partial class AnimationFrames
 {
     // EngineShape of Shaped() in Vintage Story 1.22.7
     internal const ulong Fingerprint = 0xB8270BD36EBB9B8EUL;
     private const int MaxKeys = 4096, MaxPairs = 4096, MaxFrames = 1 << 16, Flags = 3, WarmUps = 3, SeamCount = 10;
 
-    // A keyframe's resolved table and the Frame AnimationKeyFrame.Resolve stamps on an element; ShapeInitMemo reads them too
+    // A keyframe's resolved table and the Frame Resolve stamps on an element; ShapeInitMemo reads them too
     [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "ElementsByShapeElement")]
     internal static extern ref IDictionary<ShapeElement, AnimationKeyFrameElement> Resolved(AnimationKeyFrame key);
 
     [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "Frame")]
     internal static extern ref int At(AnimationKeyFrameElement element);
 
-    // Animation.GenerateAllFrames, or false where the engine has to. A shape past one of the limits is declined, not cut short.
+    // Animation.GenerateAllFrames, or false where the engine must; a shape past a limit is declined, not cut short
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     internal static bool Compile(Animation animation, ShapeElement[]? roots,
         Dictionary<int, AnimationJoint>? jointsById, bool recursive = true)
@@ -45,7 +40,7 @@ internal static partial class AnimationFrames
         var tables = Tables(keys, q);
         if (tables is null || !Flatten(roots, recursive, out var order, out var parent)) return false;
         if (!Rows(tables, order, out var slotAt, out var rows) || !Sets(rows, keys.Length, out var sets)) return false;
-        // Every element is known non-null by now, so this throws only where the engine's own first statement would
+        // Elements are known non-null here, so this throws only where the engine's first statement would
         for (var i = 0; i < Math.Min(roots.Length, ElementWalk.MaxElements); i++)
             roots[i].CacheInverseTransformMatrixRecursive();
         var frames = Poses(keys, order, parent, slotAt, rows, sets, q);
@@ -54,9 +49,7 @@ internal static partial class AnimationFrames
         return true;
     }
 
-    // Each keyframe's resolved table, or null to decline: GenerateFrame throws on a keyframe at or past QuantityFrames, and
-    // GetKeyFrameElement on one never resolved. Anything but the FastSmallDictionary AnimationKeyFrame.Resolve builds is a table
-    // whose lookup this cannot vouch for.
+    // Each keyframe's resolved table; null declines (frame past QuantityFrames, unresolved, not Resolve's table)
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static ResolvedTable[]? Tables(AnimationKeyFrame[] keys, int q)
     {
@@ -73,9 +66,8 @@ internal static partial class AnimationFrames
         return tables;
     }
 
-    // GenerateFrame's visit order: parent[i] is the index of the pose whose ChildElementPoses receive pose i, -1 for a root.
-    // GenerateFrame hands its own recursion the default, so recursive only ever stops the first level; the walk still covers the
-    // whole tree, which CacheInverseTransformMatrixRecursive walks too and throws on a null anywhere in.
+    // GenerateFrame's visit order: parent[i] receives pose i, -1 for a root; the whole tree, as the engine's walk
+    // throws on a null in it
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static bool Flatten(ShapeElement[] roots, bool recursive, out ShapeElement[] order, out int[] parent)
     {
@@ -92,9 +84,9 @@ internal static partial class AnimationFrames
                 return !walk.Failed && Assert(order.Length == parent.Length);
             }
 
-            // A subclass could override Equals, which FastSmallDictionary looks elements up by
+            // FastSmallDictionary looks elements up by Equals, which a subclass could override
             if (element is null || element.GetType() != typeof(ShapeElement)) return false;
-            // the model-matrix walk nobody reads still runs for every parent GenerateFrame visits, and throws on these
+            // the unread model-matrix walk still runs for every parent GenerateFrame visits, and throws on these
             if (recursive && element.Children is not null &&
                 (element.From is not { Length: >= 3 } || element.RotationOrigin is { Length: < 3 }))
                 return false;
@@ -106,9 +98,8 @@ internal static partial class AnimationFrames
         return !Assert(walk.Failed); // Next stops after MaxElements
     }
 
-    // Element → dense slot, by reference as FastSmallDictionary's lookup with ShapeElement's inherited Equals; an element the tree holds
-    // twice shares a slot. rows[slot][keyframe] is what GetKeyFrameElement would return there: the first entry for the element, since
-    // TryGetValue scans in insertion order. A null value is one AnimationKeyFrame.Resolve cannot have made.
+    // Element → dense slot by reference; twice-held elements share one. rows[slot][keyframe] is GetKeyFrameElement's
+    // first entry.
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static bool Rows(ResolvedTable[] tables, ShapeElement[] order, out int[] slotAt,
         out AnimationKeyFrameElement?[]?[] rows)
@@ -137,9 +128,7 @@ internal static partial class AnimationFrames
         return Assert(rows.Length <= order.Length);
     }
 
-    // sets[slot * Flags + flag]: the ascending keyframe indices at which the element has that flag set, null for none, which is
-    // getTwoKeyFramesElementForFlag's no-left case where the engine leaves that part of the pose at its default. A flag set on one
-    // axis only makes lerpKeyFrameElement throw on another axis's Nullable.Value, so it declines instead.
+    // sets[slot * Flags + flag]: ascending keyframes with the flag set, null for none; a one-axis flag declines
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static bool Sets(AnimationKeyFrameElement?[]?[] rows, int k, out int[]?[] sets)
     {
@@ -184,8 +173,7 @@ internal static partial class AnimationFrames
             _ => element.StretchX.HasValue && element.StretchY.HasValue && element.StretchZ.HasValue
         };
 
-    // GenerateFrame for every keyframe, the tree flattened: each pose is added to its parent's ChildElementPoses (or the frame's
-    // RootElementTransforms) right after it is made, and pre-order makes that the engine's order of Add calls.
+    // GenerateFrame per keyframe, flattened; pre-order adds each pose to its parent in the engine's Add order
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static AnimationFrame[] Poses(AnimationKeyFrame[] keys, ShapeElement[] order, int[] parent, int[] slotAt,
         AnimationKeyFrameElement?[]?[] rows, int[]?[] sets, int q)
@@ -208,7 +196,7 @@ internal static partial class AnimationFrames
         return frames;
     }
 
-    // GenerateFrameForElement for one element and keyframe, seekRightKeyFrame and seekLeftKeyFrame answered from the set
+    // GenerateFrameForElement for one element and keyframe, seeks answered from the set
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void Pose(ElementPose pose, AnimationKeyFrameElement?[] row, int[]?[] sets, int at,
         AnimationKeyFrame[] keys, int frameNumber, int q)
@@ -227,7 +215,7 @@ internal static partial class AnimationFrames
                 break;
             }
 
-            // seekLeftKeyFrame: the set keyframe before it, cyclically, which is right itself when it is the only one
+            // seekLeftKeyFrame: the set keyframe before it, cyclically (right itself when it is the only one)
             var next = row[set[right]]!;
             var prev = row[set[right == 0 ? set.Length - 1 : right - 1]]!;
             Lerp(pose, prev, next, flag, Progress(prev, next, frameNumber, q));
@@ -237,8 +225,7 @@ internal static partial class AnimationFrames
         }
     }
 
-    // GenerateFrameForElement's t, from the frames AnimationKeyFrame.Resolve stamped on the elements, not the keyframes' own, which
-    // differ once one element object is shared by two keyframes. Division by zero included.
+    // t from the frames Resolve stamped on the elements (not the keyframes'); division by zero included
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float Progress(AnimationKeyFrameElement prev, AnimationKeyFrameElement next, int frameNumber, int q)
     {
@@ -249,7 +236,7 @@ internal static partial class AnimationFrames
         return (float)GameMath.Mod(frameNumber - left, q) / (right + (q - left));
     }
 
-    // lerpKeyFrameElement, expression for expression: the same casts, the same division by 16, the same GameMath.Lerp
+    // lerpKeyFrameElement expression for expression: same casts, division by 16, GameMath.Lerp
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Lerp(ElementPose pose, AnimationKeyFrameElement prev, AnimationKeyFrameElement next, int flag,
         float t)
@@ -275,8 +262,7 @@ internal static partial class AnimationFrames
         }
     }
 
-    // getLeftRightResolvedFrame in closed form: left is the highest index whose FrameNumber is at most the frame, right the one after
-    // it cyclically; with none, the last and the first. The engine scans down from the end, this up, keeping the last hit.
+    // getLeftRightResolvedFrame in closed form: left the last FrameNumber at most the frame, right the next cyclically
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static AnimationFrame[][] Pairs(AnimationFrame[] frames, int q)
     {
@@ -294,8 +280,7 @@ internal static partial class AnimationFrames
         return result;
     }
 
-    // Everything the engine compile runs through, [0] being the patched method. Each lookup names the signature this was verified
-    // against, so an overload an engine update adds cannot make it ambiguous, and a changed signature is a missing seam.
+    // Everything the compile runs through, [0] patched; lookups name verified signatures, so a change is a missing seam
     private static MethodBase?[] Seams()
     {
         Type pose = typeof(ElementPose).MakeByRefType(), element = typeof(AnimationKeyFrameElement).MakeByRefType();
@@ -333,8 +318,7 @@ internal static partial class AnimationFrames
         return Assert(shaped.Length <= EngineShape.MaxMethods) ? shaped : [];
     }
 
-    // [AggressiveOptimization] compiles each method straight to optimized code on its first call, so three compiles of a two-element
-    // shape with every flag set, built from public API only, move the JIT out of the first frame that compiles an animation.
+    // Three public-API compiles JIT the [AggressiveOptimization] code before the first animating frame
     private static bool WarmUp()
     {
         var (parent, child) = WarmTree();
@@ -348,7 +332,7 @@ internal static partial class AnimationFrames
                Assert(animation.PrevNextKeyFrameByFrame.Length == 4);
     }
 
-    // The two-element tree of every warm-up, ShapeInitMemo's too: a parent and one child, linked as ResolveReferences links them
+    // The two-element warm-up tree (ShapeInitMemo's too), linked as ResolveReferences links them
     internal static (ShapeElement Parent, ShapeElement Child) WarmTree()
     {
         var child = new ShapeElement

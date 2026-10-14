@@ -2,27 +2,22 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using HarmonyLib;
+using Komet.Api;
+using Komet.Core;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.Datastructures;
 using ResolvedTable = Vintagestory.API.Datastructures.FastSmallDictionary<Vintagestory.API.Common.ShapeElement,
     Vintagestory.API.Common.AnimationKeyFrameElement>;
+using ResolvedArrays = Komet.Shapes.ShapeInitMemo.Arrays<Vintagestory.API.Common.ShapeElement,
+    Vintagestory.API.Common.AnimationKeyFrameElement>;
 
 namespace Komet.Shapes;
 
-// Every animal without gear re-runs Shape.InitForAnimations on the shape its whole entity type shares, on every tesselation:
-// Entity.OnTesselation hands an uncloned shape to AnimManager.LoadAnimatorCached, and AnimationCache.InitManager inits it before it
-// looks the type up in its cache. That init allocates a FastSmallDictionary per keyframe and new AnimationJoint objects and zeroes
-// every JointId before setting it again, all inside esr-tesseleateshape, once per animal.
-//
-// For the same shape object, the same arguments and an unchanged tree the init is idempotent, so a completed init is remembered per
-// Shape (main thread only) and compared by reference. A skip still writes what the engine would write again, because Shape.Clone
-// shares these objects with every clone and the clone's init points them at its own elements: ForElement and Frame of every keyframe
-// entry, ParentElement of every attachment point (ShapeElement.Clone copies the array, not the points), and CacheInvTransforms.
-//
-// What stays different: the remembered resolved tables and AnimationJoint objects stay in place where the engine would allocate equal
-// new ones, and warnings the engine logs on every init of a flawed shape are logged by the first init only. The skip also closes an
-// engine race: the pool thread building another entity's mesh reads JointId from the shared shape while the init has it zeroed.
-// This class owns the one InitForAnimations patch, and asks InitOnce's window about the local player's duplicate init first.
+// Every gearless animal re-inits its type's shared shape per tesselation (AnimationCache.InitManager inits before its
+// lookup), allocating per keyframe and zeroing JointId, a race with the pool thread reading it. For the same shape,
+// arguments and tree the init is idempotent, so it is remembered per Shape (main thread); a skip still rewrites what
+// clones share (ForElement, Frame, ParentElement, CacheInvTransforms). Warnings of a flawed shape log once. Owns the
+// one InitForAnimations patch; asks InitOnce first.
 internal static class ShapeInitMemo
 {
     // EngineShape of Shaped() in Vintage Story 1.22.7
@@ -31,51 +26,39 @@ internal static class ShapeInitMemo
     private const int MaxPoints = 4096, MaxNames = 256, SeamCount = 11, InsideCount = 9, Repeats = 2, MaxSeen = 64;
     private static readonly ConditionalWeakTable<Shape, Memo> Memos = [];
     private static readonly int[] Seen = new int[MaxSeen]; // identity hashes of shapes inited once, most of them clones
-    private static MethodBase?[] _seams = [];
-    private static ILogger? _logger;
-    private static bool _shaped, _installed, _foreign;
+    private static readonly SeamGuard Guard = new(nameof(ShapeInitMemo), PatchKinds.All, [typeof(ShapeInitMemo)],
+        unblocked: true);
+    private static bool _installed;
     private static int _seen;
 
     public static bool Enabled { get; set; } = true;
 
-    // Another mod patches the init or something it calls, or the engine's is not the one verified: every init runs
-    public static bool Blocked { get; private set; }
+    // Another mod patches the init or its callees, or the engine differs: every init runs
+    public static bool Blocked => Guard.Blocked;
 
-    public static bool Matched => _shaped; // the engine's bodies are the ones verified
+    public static bool Matched => Guard.Matched; // the engine's bodies are the ones verified
 
-    // Inits on the main thread answered from the memo, a total while Counting.Hud
+    // Features.Recheck asks again on LevelFinalize, when every mod has started
+    internal static Action Recheck { get; } = static () => Guard.Recheck();
+
+    // Main-thread inits answered from the memo, a total while Counting.Hud
     public static long Skipped { get; private set; }
 
-    private static (ShapeElement[] Keys, AnimationKeyFrameElement[] Values) ArraysOf(ResolvedTable table) =>
-        (Arrays<ShapeElement, AnimationKeyFrameElement>.Keys(table),
-            Arrays<ShapeElement, AnimationKeyFrameElement>.Values(table));
-
-    // The patch goes on whatever the memo decides, since InitOnce's skip rides on it
+    // Patched whatever the memo decides: InitOnce's skip rides on it
     public static void Install(Harmony harmony, ILogger? logger, ulong fingerprint = Fingerprint)
     {
-        (_installed, _shaped, Blocked, _seen, _seams) = (false, false, true, 0, Seams());
-        (_logger, _foreign) = (logger, false);
+        (_installed, _seen) = (false, 0);
+        var seams = Guard.Reset(Seams(), logger);
         Memos.Clear();
         Array.Clear(Seen);
-        if (!NotNull(harmony) || !Assert(_seams.Length == SeamCount)) return;
-        _shaped = EngineShape.Matches(Shaped(), fingerprint, nameof(ShapeInitMemo), logger);
-        var warm = _shaped && WarmUp(); // before the patch: the engine's init, never remembered
-        if (_seams[0] is { } init) _ = NotNull(harmony.Patch(init, new HarmonyMethod(Check), new HarmonyMethod(Done)));
+        if (!NotNull(harmony) || !Assert(seams.Length == SeamCount)) return;
+        var warm = Guard.Match(Shaped(), fingerprint) && WarmUp(); // before the patch: the engine's init, never remembered
+        if (seams[0] is { } init) _ = NotNull(harmony.Patch(init, new HarmonyMethod(Check), new HarmonyMethod(Done)));
         Recheck();
         _installed = warm;
     }
 
-    // Harmony patches are process wide: KometModSystem asks again on LevelFinalize, when every mod has started
-    internal static void Recheck()
-    {
-        var seamed = _shaped && Assert(_seams.Length == SeamCount);
-        _foreign = EngineShape.Report(_logger, nameof(ShapeInitMemo), _foreign,
-            seamed && EngineShape.Foreign(_seams, EngineShape.Kinds.All, null, typeof(ShapeInitMemo)));
-        Blocked = !seamed || _foreign;
-    }
-
-    // The checks are [AggressiveOptimization]: the engine assemblies and Komet carry no ReadyToRun code. Their JIT happens here, at
-    // mod load, not in the first frame a herd comes into view. A shape of its own, never in the table.
+    // The [AggressiveOptimization] checks JIT here at mod load, not when a herd appears; a shape of its own
     private static bool WarmUp()
     {
         var (parent, child) = AnimationFrames.WarmTree();
@@ -92,8 +75,7 @@ internal static class ShapeInitMemo
         return Assert(same) && Assert(child.JointId > 0);
     }
 
-    // [0] is patched; [1] to [9] are Inside(); [10] decides between the cached and the uncached init. Every lookup names its
-    // parameters, so an overload an engine update adds cannot make it ambiguous.
+    // [0] patched; [1]-[9] are Inside(); [10] picks cached or uncached init
     private static MethodBase?[] Seams()
     {
         var shape = typeof(Shape);
@@ -111,8 +93,8 @@ internal static class ShapeInitMemo
         return Assert(seams.Length == SeamCount) ? seams : [];
     }
 
-    // What runs inside InitForAnimations, which the memo's skip and InitOnce's leave out: another mod's patch there would miss that
-    // call ([7], the private per-keyframe ResolveReferences, writes ForElement, which the memo's skip writes itself)
+    // What InitForAnimations runs, which both skips leave out ([7] ResolveReferences writes ForElement; the skip does
+    // too)
     internal static MethodBase?[] Inside()
     {
         var shape = typeof(Shape);
@@ -143,8 +125,7 @@ internal static class ShapeInitMemo
         return Assert(inside.Length == InsideCount) ? inside : [];
     }
 
-    // The bodies the memo's proof rests on: the seams and the table insert AnimationKeyFrame.Resolve fills the resolved table with,
-    // whose keys and values arrays the memo reads
+    // The proof's bodies: the seams and the table insert whose keys and values arrays the memo reads
     internal static MethodBase?[] Shaped()
     {
         MethodBase?[] shaped = [.. Seams(), AccessTools.PropertySetter(typeof(ResolvedTable), "Item")];
@@ -186,13 +167,11 @@ internal static class ShapeInitMemo
         InitOnce.Completed(__instance, disableElements, requireJointsForElements);
         if (__state is not { } memo || !__runOriginal || !NotNull(__instance)) return;
         memo.Inits = Math.Min(memo.Inits + 1, Repeats);
-        // Blocked: nothing will be skipped, so nothing is worth remembering
         if (Enabled && !Blocked && memo.Inits >= Repeats)
             memo.Valid = Record(memo, __instance, requireJointsForElements);
     }
 
-    // A clone is inited once and thrown away, so a shape gets a memo only on its second init: the first leaves its identity hash
-    // in a small ring, which costs no allocation and no GC handle per clone. A collision only records a shape that did not repeat.
+    // A shape gets a memo on its second init (clones are inited once); the first leaves its hash in a ring
     private static bool SeenBefore(Shape shape)
     {
         var hash = RuntimeHelpers.GetHashCode(shape);
@@ -203,7 +182,6 @@ internal static class ShapeInitMemo
         return false;
     }
 
-    // Every read of the init and everything it writes, against the live objects
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static bool Same(Memo memo, Shape shape, string[]? disable, string[]? joints)
     {
@@ -213,8 +191,7 @@ internal static class ShapeInitMemo
                SameJoints(memo, shape.JointsById);
     }
 
-    // The same joint list by content; a disable list only matters for keys that resolve to nothing: under null, or one that names
-    // them, the engine leaves their ForElement alone, under any other it mints a new placeholder element for each
+    // Same joints by content; a disable list matters only for unresolved keys (others mint placeholders)
     private static bool SameArguments(Memo memo, string[]? disable, string[]? joints)
     {
         if (joints is null || !Assert(memo.Required.Length <= MaxNames) ||
@@ -226,8 +203,7 @@ internal static class ShapeInitMemo
         return true;
     }
 
-    // The tree in the order CollectElements visits it. Recording appends every element, checking compares it with the one remembered
-    // at the same place.
+    // The tree in CollectElements order: recording appends each element, checking compares it at the same place
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static bool Walk(ShapeElement[] roots, Memo memo, Mode mode, Dictionary<string, ShapeElement>? names)
     {
@@ -267,9 +243,7 @@ internal static class ShapeInitMemo
         return true;
     }
 
-    // An attachment point's ParentElement is written back rather than compared, like ForElement: ShapeElement.Clone copies the
-    // AttachmentPoints array but not the points in it, and the clone's ResolveReferences points the shared ones at its own
-    // elements.
+    // ParentElement is written back, not compared: Clone shares the points, and the clone's resolve repoints them
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static bool SameNode(Memo memo, int n, ShapeElement element, int depth, ref int points)
     {
@@ -308,7 +282,6 @@ internal static class ShapeInitMemo
         return true;
     }
 
-    // An array keeps its length, not its content
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static bool SameKeyArray(Memo memo, in Anim anim)
     {
@@ -342,7 +315,7 @@ internal static class ShapeInitMemo
         var resolved = AnimationFrames.Resolved(key.Item);
         if (!ReferenceEquals(resolved, key.Fast)) return false;
         if (resolved is not ResolvedTable fast || fast.Count != key.ResolvedCount) return false;
-        var (elements, values) = ArraysOf(fast);
+        var (elements, values) = (ResolvedArrays.Keys(fast), ResolvedArrays.Values(fast));
         if (elements is null || values is null || elements.Length < key.ResolvedCount ||
             values.Length < key.ResolvedCount) return false;
 
@@ -382,9 +355,7 @@ internal static class ShapeInitMemo
         return true;
     }
 
-    // What the engine writes again on an unchanged shape: ForElement of every resolved entry and Frame of every entry, in its
-    // order, so an entry object two keyframes share ends as the engine leaves it; the attachment points' ParentElement as it left
-    // them; then the lazy inverse transforms it starts with
+    // What the engine rewrites: ForElement and Frame in its order, attachment parents, then the lazy inverse transforms
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void Restore(Memo memo, Shape shape)
     {
@@ -408,11 +379,8 @@ internal static class ShapeInitMemo
         shape.CacheInvTransforms();
     }
 
-    // After a completed init: everything Same compares. False when the shape is not one the memo can answer for. The disable list
-    // that init had does not matter: what it did to keys without an element is in the entries, and SameArguments asks whether the
-    // next init's list would leave them alone. Record runs about once per entity type, never often enough to tier up, so it is
-    // [AggressiveOptimization] (compiled at install by WarmUp) and sizes its lists up front: a big animal's grown copies would land
-    // on the large object heap.
+    // After a completed init: everything Same compares; false where the memo cannot answer. Runs about once per type,
+    // so [AggressiveOptimization] (warmed by WarmUp) with lists sized up front, off the LOH.
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static bool Record(Memo memo, Shape shape, string[]? joints)
     {
@@ -434,7 +402,6 @@ internal static class ShapeInitMemo
         return Assert(memo.Anims.Count == animations.Length) && Assert(memo.Keys.Count <= MaxKeys);
     }
 
-    // Room for every keyframe and entry at once; false for a shape too large to remember
     private static bool Reserve(Memo memo, Animation[] animations)
     {
         var (keys, entries) = (0, 0);
@@ -470,11 +437,8 @@ internal static class ShapeInitMemo
         return Assert(memo.Anims.Count > 0);
     }
 
-    // The entries as the engine resolved them, kept only where the memo knows what the engine does: its table holds exactly the
-    // resolved ones in that order (not so for a mod's element type with its own Equals, say), and since the write-back resolves
-    // ForElement by the memo's own name lookup, the init that has just completed left exactly that on every resolved entry and this
-    // keyframe's Frame on every entry (not so for an entry object two keys share, or a patch on the per-keyframe resolve applied
-    // after the recheck).
+    // The resolved entries, kept only where the engine's table holds exactly them in order and the init left the memo's
+    // ForElement and Frame on each (not with shared entries or a later resolve patch)
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static bool KeepKey(Memo memo, AnimationKeyFrame? key, Dictionary<string, ShapeElement> names,
         HashSet<string> unresolved)
@@ -484,7 +448,7 @@ internal static class ShapeInitMemo
 
         if (table.Count > MaxPerKey || memo.Entries.Count + table.Count > MaxEntries || !NotNull(names)) return false;
         var (first, resolved) = (memo.Entries.Count, 0);
-        var (elements, values) = ArraysOf(fast);
+        var (elements, values) = (ResolvedArrays.Keys(fast), ResolvedArrays.Values(fast));
         using var entries = table.GetEnumerator();
         for (var i = 0; i < MaxPerKey && entries.MoveNext(); i++)
         {
@@ -508,7 +472,7 @@ internal static class ShapeInitMemo
         return Assert(memo.Entries.Count - first == table.Count) && resolved == fast.Count;
     }
 
-    // Every joint's element must be in the tree: the engine's SetJointId pass writes down from each of them
+    // Every joint's element must be in the tree: SetJointId writes down from each
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static bool KeepJoints(Memo memo, Dictionary<int, AnimationJoint> table)
     {
@@ -547,8 +511,8 @@ internal static class ShapeInitMemo
 
     private readonly record struct Joint(int Id, AnimationJoint Item, int JointId, ShapeElement Element);
 
-    // FastSmallDictionary's arrays: an accessor into a generic type is declared on the open definition
-    private static class Arrays<TKey, TValue>
+    // An accessor into a generic type is declared on the open definition
+    internal static class Arrays<TKey, TValue>
     {
         [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "keys")]
         public static extern ref TKey[] Keys(FastSmallDictionary<TKey, TValue> table);
@@ -557,7 +521,7 @@ internal static class ShapeInitMemo
         public static extern ref TValue[] Values(FastSmallDictionary<TKey, TValue> table);
     }
 
-    // One shape's last completed init; Inits counts them up to Repeats, so a shape is remembered from its second on
+    // One shape's last completed init; Inits counts to Repeats, so a shape is remembered from its second
     private sealed class Memo
     {
         public readonly List<Anim> Anims = [];

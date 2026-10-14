@@ -2,18 +2,15 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet.Core;
 using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 using Vintagestory.Client.NoObf;
 
 namespace Komet.World;
 
-// Interpolated climate maps are cached per map region, ten entries deep (ClientWorldMap.LerpedClimateMaps). A region is 512 blocks
-// and its map holds one int per block, so every miss allocates a megabyte straight into the large object heap. The tesselator reaches
-// (2 * viewDistance / 512 + 1)^2 regions - 49 at view distance 1536 - and the cache evicts in insertion order, not by use, so past ten
-// regions every lookup misses and the megabytes become a steady stream. Sizing the cache after the view distance turns that into a
-// one time cost. The engine's dictionary itself says what it was sized for, so nothing here outlives the world, and switched off the
-// next call puts the engine's ten back.
+// LerpedClimateMaps keeps ten 1 MiB region maps, evicting by insertion: past ten regions (49 at view distance 1536)
+// every lookup misses into the LOH. Sized after the view distance; switched off, ten again.
 internal static class ClimateCache
 {
     public const int EngineCapacity = 10, MaxCapacity = 144; // one entry is a MiB, so the ceiling is the memory budget
@@ -34,6 +31,7 @@ internal static class ClimateCache
         var (maps, gate) = (AccessTools.Field(typeof(ClientWorldMap), "LerpedClimateMaps"),
             AccessTools.Field(typeof(ClientWorldMap), "LerpedClimateMapsLock"));
         var capacity = AccessTools.Field(typeof(LimitedDictionary<long, int[]>), "capacity");
+        _world++; // what any thread remembers is the closed world's
         if (!NotNull(harmony) || !NotNull(load) || !NotNull(maps) || !NotNull(gate) || !NotNull(capacity) ||
             !Assert(maps.FieldType == typeof(LimitedDictionary<long, int[]>) && capacity.FieldType == typeof(int)))
             return; // the accessors would throw at first use
@@ -43,22 +41,20 @@ internal static class ClimateCache
             _ = NotNull(harmony.Patch(find, new HarmonyMethod(Recent), new HarmonyMethod(Remember)));
     }
 
-    // TryLoadLerpedClimateMap takes the engine's lock for one dictionary read, and every climate lookup goes through it: the
-    // tesselation threads per chunk and per GetClimateAt, the cloud renderer per tile - one of the most contended locks of a world
-    // join (trace, 2026-10-08). Each thread remembers the last Remembered regions it found; consecutive chunks and cloud tiles nearly
-    // always lie in one of the few 512-block regions around them. A remembered map the engine has since evicted is the same data a
-    // new one would be (made from the region's climate map, never written afterwards); the placeholder is never in the cache, so
-    // never remembered.
+    // TryLoadLerpedClimateMap locks per climate lookup, among the most contended on join (trace, 2026-10-08). Each
+    // thread remembers its last regions (evicted maps equal new ones), keyed by install: the main thread outlives the
+    // world.
     private const int Remembered = 4;
 
-    [ThreadStatic] private static ClientWorldMap? _lastMap;
+    private static int _world;
+    [ThreadStatic] private static int _lastWorld;
     [ThreadStatic] private static long[]? _lastKeys;
     [ThreadStatic] private static int[]?[]? _lastFound;
     [ThreadStatic] private static int _lastNext;
 
     private static bool Recent(ClientWorldMap __instance, int chunkX, int chunkZ, ref int[]? __result)
     {
-        if (!Enabled || _lastFound is not { } found || _lastKeys is not { } keys || !ReferenceEquals(_lastMap, __instance) ||
+        if (!Enabled || _lastFound is not { } found || _lastKeys is not { } keys || _lastWorld != _world ||
             !NotNull(__instance)) return true;
         var key = __instance.MapRegionIndex2DFromClientChunkCoord(chunkX, chunkZ);
         _ = Assert(keys.Length == Remembered) && Assert(found.Length == Remembered);
@@ -75,15 +71,15 @@ internal static class ClimateCache
     private static void Remember(ClientWorldMap __instance, int chunkX, int chunkZ, int[]? __result, bool __runOriginal)
     {
         if (!__runOriginal || __result is null || !NotNull(__instance)) return;
-        if (!ReferenceEquals(_lastMap, __instance) || _lastKeys is null || _lastFound is null)
-            (_lastMap, _lastKeys, _lastFound, _lastNext) = (__instance, new long[Remembered], new int[]?[Remembered], 0);
+        if (_lastWorld != _world || _lastKeys is null || _lastFound is null)
+            (_lastWorld, _lastKeys, _lastFound, _lastNext) = (_world, new long[Remembered], new int[]?[Remembered], 0);
         var slot = _lastNext;
         _lastNext = (slot + 1) % Remembered;
         (_lastKeys[slot], _lastFound[slot]) = (__instance.MapRegionIndex2DFromClientChunkCoord(chunkX, chunkZ), __result);
         _ = Assert(__result.Length > 0) && Index(slot, Remembered);
     }
 
-    // Regions the tesselator can reach along one axis, squared; clamped so an extreme view distance cannot eat the heap
+    // Reachable regions per axis, squared; clamped so an extreme view distance cannot eat the heap
     internal static int CapacityFor(int region, int distance)
     {
         if (!Assert(region > 0) || !Assert(distance > 0)) return EngineCapacity;
@@ -94,8 +90,7 @@ internal static class ClimateCache
     internal static int Wanted(bool enabled, int region, int distance) =>
         enabled ? CapacityFor(region, distance) : EngineCapacity;
 
-    // Harmony prefix, on the tesselation thread; the view distance is read only while on, and once: each read lower-cases its key
-    // (SettingsBase)
+    // Prefix on the tesselation thread; the view distance is read once, only while on (each read lower-cases its key)
     private static void Sized(ClientWorldMap __instance)
     {
         var enabled = Enabled;
@@ -103,8 +98,7 @@ internal static class ClimateCache
             Fit(__instance, Wanted(enabled, __instance.RegionSize, enabled ? ClientSettings.ViewDistance : 0));
     }
 
-    // A dictionary of the wanted capacity in place of one of another, swapped under the engine's own lock since
-    // TryLoadLerpedClimateMap reads the field under it. Entries are dropped: LimitedDictionary cannot be enumerated.
+    // Swapped under the engine's lock, which TryLoadLerpedClimateMap reads under; entries drop (not enumerable)
     internal static void Fit(ClientWorldMap map, int wanted)
     {
         var gate = MapsLock(map);
@@ -119,7 +113,7 @@ internal static class ClimateCache
         }
     }
 
-    // LimitedDictionary's capacity: an accessor into a generic type is declared on the open definition
+    // An accessor into a generic type is declared on the open definition
     private static class Limited<TKey, TValue>
     {
         [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "capacity")]
@@ -127,11 +121,7 @@ internal static class ClimateCache
     }
 }
 
-// The cloud thread refreshes every cloud tile each 40 ms and builds a fresh Vec3d for each tile's world position: with ~34k tiles
-// that is a steady 33 MB/s of garbage, half of what the client still allocates once the world has finished loading. The vector
-// never leaves the loop body, so one vector per thread serves every tile: its one local is only read for its fields or handed to the
-// weather readers (Readers), which only read X, Y and Z and keep nothing. Checked on the IL.
-// The method also runs once on the main thread for the first cloud tick, which is why the scratch is per thread and not per map.
+// The cloud thread builds a Vec3d per tile every 40 ms (~34k tiles, 33 MB/s); one per thread serves (IL-checked).
 internal static class CloudTileScratch
 {
     private const string Renderer = "FluffyClouds.CloudRendererMap", Method = "UpdateCloudTilesOffThread";
@@ -152,7 +142,7 @@ internal static class CloudTileScratch
         _ = NotNull(harmony.Patch(method, transpiler: new HarmonyMethod(Substitute)));
     }
 
-    // VSEssentials is a mod assembly Komet does not reference, so the renderer is found by name once the game has loaded it
+    // VSEssentials is not referenced: found by name once loaded
     internal static MethodInfo? Target()
     {
         var renderer = AccessTools.TypeByName(Renderer);
@@ -167,7 +157,7 @@ internal static class CloudTileScratch
         return NotNull(ctor) && Assert(ctor.DeclaringType == typeof(Vec3d)) ? ctor : null;
     }
 
-    // The methods the loop hands its vector to, as their position: each reads only its X, Y and Z and keeps no reference to it
+    // The methods the vector goes to, with its argument position: each reads only X, Y and Z
     private static MethodInfo?[] Readers()
     {
         var (reader, preload) = (AccessTools.TypeByName(Reader), AccessTools.TypeByName(PreLoad));

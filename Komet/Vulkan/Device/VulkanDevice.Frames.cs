@@ -30,7 +30,6 @@ internal sealed unsafe partial class VulkanDevice
 
     public IntPtr Allocate() => Allocate(_pool);
 
-    // A fence, signalled already when the first wait on it should not wait
     public ulong Fence(bool signalled)
     {
         if (!Assert(_device != IntPtr.Zero) || !Assert(_fence != 0)) return 0;
@@ -47,7 +46,7 @@ internal sealed unsafe partial class VulkanDevice
         return VkApi.CreateSemaphore(_device, &info, null, &semaphore) == Vk.Success ? semaphore : 0;
     }
 
-    // A query pool of the type, 0 when the driver refuses it
+    // 0 when the driver refuses it
     public ulong QueryPool(uint type, uint count, uint statistics = 0)
     {
         if (!Assert(_device != IntPtr.Zero) || !Assert(count > 0)) return 0;
@@ -82,11 +81,10 @@ internal sealed unsafe partial class VulkanDevice
         Assert(commands != IntPtr.Zero) && Assert(VkApi.EndCommandBuffer != null) &&
         VkApi.EndCommandBuffer(commands) == Vk.Success;
 
-    // Ends and submits it after the wait semaphores, signalling the semaphores and the fence; does not wait
     public bool Submit(IntPtr commands, ReadOnlySpan<ulong> wait, ReadOnlySpan<ulong> signal, ulong fence) =>
         Assert(commands != IntPtr.Zero) && Submit([commands], wait, signal, fence);
 
-    // The same for command buffers that run one after the other; ended: how many of the first ones were ended already
+    // ended: how many of the first buffers were ended already
     public bool Submit(ReadOnlySpan<IntPtr> buffers, ReadOnlySpan<ulong> wait, ReadOnlySpan<ulong> signal, ulong fence,
         int ended = 0)
     {
@@ -108,11 +106,10 @@ internal sealed unsafe partial class VulkanDevice
         }
     }
 
-    // Before a queue operation of another thread: the frame's recording thread caught up with what it was handed - the
-    // submissions it makes among them - so this one comes after them, and an idle device has run them
+    // Before another thread's queue operation: the recording thread caught up (incl. its submissions), so this follows
     public Action? CatchUp { get; set; }
 
-    // vkQueueSubmit, the queue used by one thread at a time
+    // The queue is used by one thread at a time
     private bool Queued(Vk.Submit* submit, uint count, ulong fence)
     {
         CatchUp?.Invoke();
@@ -129,7 +126,26 @@ internal sealed unsafe partial class VulkanDevice
 
     private readonly Lock _queueLock = new();
 
-    // An empty submission signalling the fence once everything submitted before it is done
+    // From a thread of its own whose work needs no order with the recording thread's beyond the queue's (FrameBridge: it
+    // reads only what an earlier present published), so without CatchUp; ended before submitting
+    public bool SubmitAlone(IntPtr commands, ulong signal, ulong fence)
+    {
+        if (!Assert(commands != IntPtr.Zero) || !Assert(signal != 0) || VkApi.EndCommandBuffer(commands) != Vk.Success) return false;
+        var stage = Vk.StageAll;
+        var submit = new Vk.Submit
+        {
+            SType = Vk.SubmitInfo, CommandBufferCount = 1, CommandBuffers = &commands, SignalCount = 1, Signals = &signal,
+            WaitStages = &stage
+        };
+        lock (_queueLock) return Assert(_queue != IntPtr.Zero) && VkApi.QueueSubmit(_queue, 1, &submit, fence) == Vk.Success;
+    }
+
+    public int PresentAlone(Vk.PresentInfo* info)
+    {
+        if (!Assert(info != null) || !Assert(_queue != IntPtr.Zero)) return -1;
+        lock (_queueLock) return VkApi.QueuePresent(_queue, info);
+    }
+
     public bool Signal(ulong fence)
     {
         if (!Assert(fence != 0) || !Assert(_queue != IntPtr.Zero)) return false;
@@ -143,7 +159,7 @@ internal sealed unsafe partial class VulkanDevice
         lock (_queueLock) return VkApi.DeviceWaitIdle(_device) == Vk.Success;
     }
 
-    // Waits up to timeout nanoseconds for the fence; true when it is signalled, and then it is reset
+    // Resets the fence once signalled
     public bool Wait(ulong fence, ulong timeout = Forever)
     {
         if (!Assert(fence != 0) || !Assert(_device != IntPtr.Zero)) return false;

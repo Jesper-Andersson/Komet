@@ -2,6 +2,8 @@ using System.Collections.Concurrent;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet.Api;
+using Komet.Core;
 using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 using Vintagestory.API.Util;
@@ -9,16 +11,13 @@ using Vintagestory.Client.NoObf;
 
 namespace Komet.World;
 
-// Work the survival mod's block entities redo per instance for what is the same for every one of a kind, each kept where it is made:
-// - Ignitable: BlockEntityGroundStorage.UpdateIgnitable, in every ground storage's Initialize, parses the storable behaviour's whole
-//   properties JSON (propertiesAtString) to read one number. The parse is kept per string, and only indexed and read.
-// - Meshes: BlockEntityFirepit.getOrCreateMesh looks into its "firepit-meshes" cache but never stores into it, so every tessellation of
-//   a firepit parses and tessellates the firepit shape again. The mesh depends on the block at the position (its textures) and the
-//   shape file named by burn and content state, so it is kept by block id and state; the terrain mesher only copies it, as it does a
-//   block's own shared mesh. What the engine's dictionary holds still comes first.
-// - Pot shapes: PotInFirepitRenderer parses the pot and the lid shape for every pot that goes on a firepit, only to tessellate them;
-//   the tessellator reads a shape and never writes it, so each file is parsed once.
-// GPU meshes are never shared. A shape or texture reload and a world leave empty every cache.
+// Survival block entities redo per instance what is the same per kind; kept once instead:
+// - Ignitable: BlockEntityGroundStorage.UpdateIgnitable parses the whole properties JSON per Initialize for one number,
+//   kept per string, only indexed and read.
+// - Meshes: BlockEntityFirepit.getOrCreateMesh never fills its "firepit-meshes" cache; kept by block id and state,
+//   after the engine's dictionary.
+// - Pot shapes: PotInFirepitRenderer parses pot and lid per pot; tessellation never writes a shape, so once per file.
+// GPU meshes are never shared. Shape/texture reload and world leave empty every cache.
 internal static class BlockEntityCaches
 {
     // EngineShape of each part's Seams() in Vintage Story 1.22.7
@@ -45,7 +44,7 @@ internal static class BlockEntityCaches
 
     public static bool Enabled { get; set; } = true;
 
-    // The survival mod's types are there / every part's bodies are the ones verified / another mod patches one, which stands down
+    // Survival types present / bodies verified / a part another mod patches stands down
     internal static bool Survival { get; private set; }
     internal static bool Matched => Array.TrueForAll(Shaped, shaped => shaped);
     internal static bool Blocked => Array.Exists(Foreign, foreign => foreign);
@@ -62,14 +61,14 @@ internal static class BlockEntityCaches
         Shaped[Ignitable] = EngineShape.Matches(Bodies[Ignitable], IgnitableFingerprint, nameof(BlockEntityCaches), logger);
         Shaped[Meshes] = EngineShape.Matches(Bodies[Meshes], MeshFingerprint, nameof(BlockEntityCaches), logger);
         Shaped[Pots] = EngineShape.Matches(Bodies[Pots], PotFingerprint, nameof(BlockEntityCaches), logger);
-        if (Shaped[Ignitable]) _ = NotNull(harmony.Patch(Bodies[Ignitable][0], transpiler: Own(nameof(RewriteIgnitable))));
-        if (Shaped[Meshes] && Bodies[Meshes] is [{ } mesh] && Assert(Il.Binds(mesh, Own(nameof(Mesh)).method)))
+        if (Shaped[Ignitable]) _ = NotNull(harmony.Patch(Bodies[Ignitable][0], transpiler: new(Method(nameof(RewriteIgnitable)))));
+        if (Shaped[Meshes] && Bodies[Meshes] is [{ } mesh] && Method(nameof(Mesh)) is { } prefix && Assert(Il.Binds(mesh, prefix)))
         {
-            _ = NotNull(harmony.Patch(mesh, Own(nameof(Mesh))));
+            _ = NotNull(harmony.Patch(mesh, new HarmonyMethod(prefix)));
             Rewritten[Meshes] = true;
         }
 
-        if (Shaped[Pots]) _ = NotNull(harmony.Patch(Bodies[Pots][0], transpiler: Own(nameof(RewritePots))));
+        if (Shaped[Pots]) _ = NotNull(harmony.Patch(Bodies[Pots][0], transpiler: new(Method(nameof(RewritePots)))));
         if (api?.Event is { } events)
         {
             events.ReloadShapes += Clear;
@@ -79,8 +78,7 @@ internal static class BlockEntityCaches
         Recheck();
     }
 
-    // Another transpiler or infix on a rewritten body, or a patch on what a kept result skips: that part stands down. KometModSystem
-    // asks again on LevelFinalize, when every mod has patched.
+    // A foreign transpiler/infix on a rewritten body, or a patch on what a kept result skips, stands that part down
     internal static void Recheck()
     {
         var was = Blocked;
@@ -91,18 +89,18 @@ internal static class BlockEntityCaches
             typeof(string[])
         ]);
         var own = typeof(BlockEntityCaches);
-        Foreign[Ignitable] = Rewritten[Ignitable] && EngineShape.Foreign(Bodies[Ignitable], EngineShape.Kinds.Body, null, own);
-        // All kinds: a postfix that edits the result in place would edit the one kept mesh again on every call
+        Foreign[Ignitable] = Rewritten[Ignitable] && EngineShape.Foreign(Bodies[Ignitable], PatchKinds.Body, null, own);
+        // A postfix editing the result in place would re-edit the one kept mesh on every call
         Foreign[Meshes] = Rewritten[Meshes] &&
-                          (EngineShape.Foreign(Bodies[Meshes], EngineShape.Kinds.All, null, own) ||
-                           EngineShape.Foreign([tryGet, tesselate], EngineShape.Kinds.All, null, own));
-        Foreign[Pots] = Rewritten[Pots] && (EngineShape.Foreign(Bodies[Pots], EngineShape.Kinds.Body, null, own) ||
-                                            EngineShape.Foreign([tryGet], EngineShape.Kinds.All, null, own));
+                          (EngineShape.Foreign(Bodies[Meshes], PatchKinds.All, null, own) ||
+                           EngineShape.Foreign([tryGet, tesselate], PatchKinds.All, null, own));
+        Foreign[Pots] = Rewritten[Pots] && (EngineShape.Foreign(Bodies[Pots], PatchKinds.Body, null, own) ||
+                                            EngineShape.Foreign([tryGet], PatchKinds.All, null, own));
         _ = EngineShape.Report(_logger, nameof(BlockEntityCaches), was, Blocked);
         _ = Assert(Foreign.Length == Parts) && Assert(!Blocked || Array.Exists(Rewritten, rewritten => rewritten));
     }
 
-    // At world leave and on a shape or texture reload: a kept mesh holds the atlas positions of its time
+    // World leave, shape or texture reload: a kept mesh holds the atlas positions of its time
     public static void Clear()
     {
         Parsed.Clear();
@@ -121,9 +119,6 @@ internal static class BlockEntityCaches
         return method;
     }
 
-    private static HarmonyMethod Own(string name) => new(Method(name));
-
-    // Each part's body: the one it rewrites or replaces
     internal static MethodBase?[] Seams(int part)
     {
         var (firepit, storage, renderer) =
@@ -142,9 +137,7 @@ internal static class BlockEntityCaches
     private static MethodInfo? TryGet() =>
         AccessTools.DeclaredMethod(typeof(Shape), nameof(Shape.TryGet), [typeof(ICoreAPI), typeof(string)]);
 
-    // ---- Ignitable
-
-    // UpdateIgnitable's one JsonObject.FromJson becomes Parse, its result only indexed (and the entry read): else the engine's IL
+    // UpdateIgnitable's one JsonObject.FromJson becomes Parse (result only indexed); else the engine's IL
     internal static List<CodeInstruction> RewriteIgnitable(IEnumerable<CodeInstruction> instructions)
     {
         var (from, parse) = (AccessTools.DeclaredMethod(typeof(JsonObject), nameof(JsonObject.FromJson), [typeof(string)]),
@@ -166,8 +159,6 @@ internal static class BlockEntityCaches
         _ = Assert(Parsed.TryGetValue(jsonCode, out _));
         return parsed;
     }
-
-    // ---- Firepit meshes
 
     // In place of getOrCreateMesh: the engine's body, with what it tessellates kept by block id and state
     internal static bool Mesh(BlockEntity __instance, string burnstate, string contentstate, ref MeshData? __result)
@@ -204,10 +195,7 @@ internal static class BlockEntityCaches
         return false;
     }
 
-    // ---- Pot shapes
-
-    // The constructor's two Shape.TryGet calls, each handed straight to TesselateShape as its shape, become PotShape: else the
-    // engine's IL
+    // The constructor's two Shape.TryGet calls feeding TesselateShape become PotShape; else the engine's IL
     internal static List<CodeInstruction> RewritePots(IEnumerable<CodeInstruction> instructions)
     {
         var (tryGet, kept) = (TryGet(), Method(nameof(PotShape)));

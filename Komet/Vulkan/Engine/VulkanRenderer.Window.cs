@@ -1,22 +1,18 @@
 namespace Komet.Vulkan;
 
-// A framebuffer on shared images stands in for OpenGL's window, so the final blit, AfterBlit, the GUI and Done are the
-// scene's too and the frame ends at the buffer swap. Without Present, OpenGL copies the stand-in into the real window there.
+// A framebuffer on Vulkan's images stands in for GL's window, so the final blit, AfterBlit, GUI and Done are the scene's
+// and the frame ends at the swap, shown by Vulkan's swapchain.
 internal static partial class VulkanRenderer
 {
     private static bool _windowing; // the stand-in is in place this frame
-
-    public static bool Window { get; set; } = true;
-    public static bool Present { get; set; } = true;
 
     private static (IReadOnlyList<FrameBufferRef> Framebuffers, int[] Shared) Windowing(TerrainRenderer renderer,
         IRenderAPI render)
     {
         var shared = Shared();
-        _windowing = Window && SceneOn && GlTap.Scene;
+        _windowing = SceneOn && GlTap.Scene; // only Vulkan's swapchain shows its frames
         _ = Assert(shared.Length <= EngineFramebuffers) && Assert(!_windowing || GlTap.Tapped);
         if (!NotNull(renderer) || !NotNull(render)) return (render?.FrameBuffers ?? [], shared);
-        renderer.Presenting = Present;
         if (!_windowing || renderer.Window(render.FrameWidth, render.FrameHeight) is not { } window)
         {
             renderer.Unwindowed();
@@ -24,12 +20,17 @@ internal static partial class VulkanRenderer
             return (render.FrameBuffers, shared);
         }
 
-        List<FrameBufferRef> framebuffers = [.. render.FrameBuffers, window];
-        _ = Assert(framebuffers.Count < 64);
-        return (framebuffers, [.. shared, framebuffers.Count - 1]);
+        var engine = render.FrameBuffers;
+        WindowFramebuffers.Clear();
+        for (var i = 0; i < Math.Min(engine.Count, 63); i++) WindowFramebuffers.Add(engine[i]);
+        WindowFramebuffers.Add(window);
+        var at = WindowFramebuffers.Count - 1;
+        if (!ReferenceEquals(_windowShared.Of, shared) || _windowShared.Made[^1] != at)
+            _windowShared = (shared, [.. shared, at]);
+        return (WindowFramebuffers, _windowShared.Made);
     }
 
-    private static bool Windowed(EnumRenderStage stage) =>
-        _windowing && Assert(stage >= EnumRenderStage.Before) &&
-        stage is EnumRenderStage.AfterBlit or EnumRenderStage.Ortho or EnumRenderStage.Done;
+    // Every frame the same list and array while nothing changes: Start takes them for the frame only
+    private static readonly List<FrameBufferRef> WindowFramebuffers = [];
+    private static (int[]? Of, int[] Made) _windowShared = (null, [-1]);
 }

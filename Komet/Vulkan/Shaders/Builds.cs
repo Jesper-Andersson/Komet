@@ -2,11 +2,8 @@ using System.Diagnostics;
 
 namespace Komet.Vulkan;
 
-// Shader ports and pipelines are made off the engine's thread: shaderc, the driver's compiler and the disk cache take up to
-// tens of ms each, a stutter wherever a draw first needs one. The engine's thread starts a build and asks on later draws
-// whether it is done; those draws stay OpenGL's until then. At most Workers builds run at once, on the thread pool, beside
-// the engine's own threads. Thread-safety: Running and the totals are guarded by Gate, each build's result by its own lock
-// (Build).
+// Ports and pipelines build off the engine's thread (each up to tens of ms); draws stay OpenGL's until done. At most
+// Workers at once. Gate guards Running and totals, each Build its result.
 internal static class Builds
 {
     public enum Kind
@@ -16,18 +13,20 @@ internal static class Builds
     }
 
     private const int Workers = 2, Kinds = 2, MaxRunning = 1 << 16;
+
+    // A driver taking longer is hung
+    public const int LongestSeconds = 30;
     private static readonly TaskScheduler Scheduler =
         new ConcurrentExclusiveSchedulerPair(TaskScheduler.Default, Workers).ConcurrentScheduler;
     private static readonly Lock Gate = new();
     private static readonly HashSet<Task> Running = [];
     private static readonly Tally Tallied = new(["ports", "pipelines"]);
 
-    // Tests: the engine's thread waits for each build it starts, so a frame draws as if it were made in place
+    // Tests: each build is waited for, so a frame draws as if made in place
     public static bool Waited { get; set; }
 
     private static long _started;
 
-    // Builds started so far
     public static long Started
     {
         get
@@ -36,7 +35,7 @@ internal static class Builds
         }
     }
 
-    // Listed before it starts, so its end never comes before it is listed
+    // Listed before it starts, so its end never precedes the listing
     public static Task Run(Action build)
     {
         var task = new Task(build);
@@ -55,8 +54,7 @@ internal static class Builds
         return task;
     }
 
-    // Every build started so far is done (or the time ran out): the device goes only after its builds, the tests draw after
-    // them
+    // All builds done (or timeout): the device goes only after them, tests draw after them
     public static bool Wait(TimeSpan timeout)
     {
         Task[] running;
@@ -86,11 +84,8 @@ internal static class Builds
     }
 }
 
-// One build's result, handed over once. Thread-safety: the worker stores what it made under _gate and the engine's thread
-// takes it under _gate; a result whose owner dropped it before taking it is freed by whichever comes second - the worker as
-// it finishes, or Drop - so never twice and never while the other still holds it. A build dropped before its worker began
-// makes nothing (cancelled). What make reads must not change while it runs: it captures copies, or objects nobody writes
-// after they were made.
+// One result, handed over once under _gate. Dropped before taken: freed by whichever comes second (worker or Drop),
+// never twice. Dropped before start: nothing made. make reads only captured copies or immutable objects.
 internal sealed class Build<T> where T : class
 {
     private readonly Lock _gate = new();
@@ -110,7 +105,6 @@ internal sealed class Build<T> where T : class
 
     public bool Done => _task.IsCompleted;
 
-    // How long it took on its worker
     public long Ticks { get; private set; }
 
     private void Made(Builds.Kind kind, Func<(T? Made, string Why)> make)
@@ -143,7 +137,7 @@ internal sealed class Build<T> where T : class
         _ = Assert(ticks >= 0);
     }
 
-    // The engine's thread, once Done: what was made, now the caller's; null with why it was not
+    // Once Done: the result, now the caller's; null with why
     public T? Take(out string why)
     {
         lock (_gate)
@@ -155,7 +149,7 @@ internal sealed class Build<T> where T : class
         }
     }
 
-    // The owner no longer wants it: not begun, it never is; made and not taken, it is freed
+    // Not begun: never begins; made and not taken: freed
     public void Drop()
     {
         T? made;
@@ -168,6 +162,16 @@ internal sealed class Build<T> where T : class
         _ = Assert(_made is null);
     }
 
-    // The engine's thread waits for it: where leaving its draws to OpenGL is no option
+    // For where leaving the draws to OpenGL is no option
     public bool Wait(TimeSpan timeout) => Assert(timeout > TimeSpan.Zero) && NotNull(_task) && _task.Wait(timeout);
+
+    // Waits as long as a build may take, booked as a stutter of its kind
+    public bool Awaited(Hitches.Kind kind)
+    {
+        if (Done || !Assert(kind is Hitches.Kind.Port or Hitches.Kind.Pipeline)) return Done;
+        var at = Hitches.Now;
+        _ = Wait(TimeSpan.FromSeconds(Builds.LongestSeconds));
+        Hitches.Since(kind, at);
+        return Assert(at > 0) && Done;
+    }
 }

@@ -1,3 +1,5 @@
+using Komet.Core;
+using Komet.World;
 using Vintagestory.GameContent;
 
 namespace Komet.Test.World;

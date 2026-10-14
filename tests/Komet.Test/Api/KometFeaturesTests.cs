@@ -1,3 +1,11 @@
+using Komet.Api;
+using Komet.Chunks;
+using Komet.Core;
+using Komet.Hud;
+using Komet.Options;
+using Komet.Rendering;
+using Komet.Tessellation;
+
 namespace Komet.Test.Api;
 
 [NonParallelizable]
@@ -112,7 +120,7 @@ public sealed class KometFeaturesTests
             Features.Poll();
             KometFeatures.StateChanged += (_, e) => seen.Add($"{e.Id} {e.Previous}>{e.State}");
             KometFeatures.HoldOff("MenuBlur", "mymod", "test").Release();
-            new HudSettings().SetKnob(Knobs.Find("MenuBlur"), 0);
+            new HudSettings().Knobs.SetKnob(Knobs.Find("MenuBlur"), 0);
             Assert.That(string.Join(", ", seen),
                 Is.EqualTo("MenuBlur Active>HeldOff, MenuBlur HeldOff>Active, MenuBlur Active>Off"));
         }
@@ -188,7 +196,7 @@ public sealed class KometFeaturesTests
     [Test]
     public void PatchKindsAreEngineShapesKinds()
     {
-        var kinds = Enum.GetValues<EngineShape.Kinds>().Select(k => (k.ToString(), (int)k));
+        var kinds = Enum.GetValues<PatchKinds>().Select(k => (k.ToString(), (int)k));
         Assert.That(Enum.GetValues<PatchKinds>().Select(k => (k.ToString(), (int)k)), Is.EqualTo(kinds));
     }
 
@@ -196,7 +204,8 @@ public sealed class KometFeaturesTests
     public void ThePageIdsAreKometsPages()
     {
         GameLang.EnsureLoaded();
-        var pages = new KometPages(new HudSettings(), () => { }, _ => { }, () => { }, () => { }, () => { }).Build().Select(p => p.Id);
+        var pages = new KometPages(new HudSettings { ShowAdvanced = true }, () => { }, _ => { }, () => { }, () => { }, () => { })
+            .Build().Select(p => p.Id);
         string[] ids = [KometFeatures.RenderPage, KometFeatures.ChunksPage, KometFeatures.MiscPage];
         Assert.That(pages, Is.SupersetOf(ids));
     }

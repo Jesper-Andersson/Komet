@@ -1,0 +1,18 @@
+{
+  "$schema": "https://moddbcdn.vintagestory.at/schema/modinfo.latest.json",
+  "type": "Code",
+  "side": "Client",
+  "requiredOnClient": false,
+  "requiredOnServer": false,
+  "modid": "kometbench",
+  "name": "Komet Bench",
+  "authors": [
+    "xToast"
+  ],
+  "description": "Komet's developer benchmark for scripts/bench.sh; not for players.",
+  "version": "3.0.0-pre.2",
+  "dependencies": {
+    "game": "1.22.0",
+    "komet": "*"
+  }
+}

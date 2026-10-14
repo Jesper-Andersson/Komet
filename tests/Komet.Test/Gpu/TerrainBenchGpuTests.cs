@@ -1,4 +1,4 @@
-using Komet.Vulkan;
+using Komet.Rendering;
 using OpenTK.Graphics.OpenGL;
 
 namespace Komet.Test.Gpu;
@@ -6,13 +6,7 @@ namespace Komet.Test.Gpu;
 // The GPU time of the terrain's culling and its draws from rows.comp's commands on TerrainWorld (radius 320, six pools), by
 // OpenGL's timer: the far shadow map (4096, chunkshadowmap's alpha test) as the engine culls it and with the casters the view
 // cannot see left out; the camera's view (2560x1366, four RGBA16F outputs, a fragment shader as heavy as chunkopaque's) as
-// written and sorted near to far. Rounds alternate the variants; the medians are printed. Run it alone, as FrameBenchGpuTests.
-// Dense foliage: the same screen in Vulkan, the engine's chunkopaque on 48 layers of waving leaves (the opaque pass not
-// culled, as RenderOpaque draws leaves), on the engine's depth and on Komet's own: the opaque terrain's GPU time (the depth's
-// copies in and back included) and fragment shader invocations. Dense foliage in a shadow map: the far map's size (4096), the
-// engine's chunkshadowmap (its alpha test) on the same leaves in OcclusionCulling's counted draws, the map cleared by Vulkan
-// (the scene on, as the shadow passes are Komet's only then), on the engine's depth and on Komet's own (taken over by the
-// clear, written back at the pass's end): the pass's GPU time and fragment shader invocations. Faces facing away: the camera's
+// written and sorted near to far. Rounds alternate the variants; the medians are printed. Run it alone. Faces facing away: the camera's
 // view of the world sorted as the tessellator sorts (FaceSorting), drawn with back faces culled as RenderOpaque draws, whole,
 // with the directions facing away left out and with their parts past the splits too: the culling's and the draw's GPU time, the
 // draw's vertex shader invocations, primitives and primitives after clipping (ARB_pipeline_statistics_query).
@@ -84,8 +78,8 @@ public sealed class TerrainBenchGpuTests
                 var lines = samples.Select(s => string.Create(CultureInfo.InvariantCulture,
                     $"{MedianOf(s, 0):0.000} ms, {MedianOf(s, 1) / 1e6:0.00} M vertex shader invocations, " +
                     $"{MedianOf(s, 2) / 1e6:0.00} M primitives, {MedianOf(s, 3) / 1e6:0.00} M after clipping")).ToArray();
-                TestContext.Out.WriteLine($"yaw {yaw}: whole {lines[0]}; directions facing away left out {lines[1]}; " +
-                                          $"their parts past the splits too {lines[2]}");
+                TestContext.Out.WriteLine($"yaw {yaw}: whole {lines[0]}; directions facing away and their parts past the " +
+                                          $"splits left out {lines[1]}");
             }
         }
         finally
@@ -98,16 +92,16 @@ public sealed class TerrainBenchGpuTests
     private const int VertexShaderInvocations = 0x82F0, PrimitivesSubmitted = 0x82EF, ClippingOutputPrimitives = 0x82F7;
 
     // The culling's and the draw's GPU time, then the draw's statistics
-    private static double[] Facing(TerrainWorld world, TerrainView view, (bool BackFaces, bool Splitting) how,
+    private static double[] Facing(TerrainWorld world, TerrainView view, bool backFaces,
         (int Program, DepthTarget Screen, int[] Queries) with)
     {
-        var culling = Timed(with.Queries[0], () => FaceSplitsGpuTests.Run(world, view, how));
+        var culling = Timed(with.Queries[0], () => FaceSplitsGpuTests.Run(world, view, backFaces));
         with.Screen.Begin();
         FaceSplitsGpuTests.BackCulled();
         int[] targets = [VertexShaderInvocations, PrimitivesSubmitted, ClippingOutputPrimitives];
         for (var q = 0; q < targets.Length; q++) GL.BeginQuery((QueryTarget)targets[q], with.Queries[q + 1]);
         var drawing = Timed(with.Queries[0],
-            () => world.DrawCulled(with.Program, view.CameraMvp, view.Camera, false, false, how.BackFaces ? 4 : 1));
+            () => world.DrawCulled(with.Program, view.CameraMvp, view.Camera, false, false, backFaces ? 4 : 1));
         foreach (var target in targets) GL.EndQuery((QueryTarget)target);
         GL.Disable(EnableCap.CullFace);
         var result = new double[4];
@@ -122,149 +116,6 @@ public sealed class TerrainBenchGpuTests
     }
 
     private static double MedianOf(List<double[]> samples, int at) => Median([.. samples.Select(s => s[at])]);
-
-    [Test]
-    public void DenseFoliageOnKometsDepth()
-    {
-        GameInstall.RequireAssets();
-        using var rig = GpuRig.Open(GpuRig.Vulkan);
-        rig.Backend!.Flush();
-        var foliage = Foliage.Layers(Layers, Across, 11, false);
-        var quads = foliage.Faces.Length;
-        (int, int)[] draws = [.. Enumerable.Range(0, Pools).Select(p => (p * quads / Pools, quads / Pools))];
-        using var scene = new TerrainScene(rig.Device!, true, "chunkopaque", foliage) { Counts = rig.Backend };
-        scene.Set("alphaTest", [0.25f]);
-        scene.Set("frameSize", [Width, Height]);
-        var screen = OwnDepthParityGpuTests.Framebuffer(Width, Height);
-        var measuring = VulkanFrame.Measuring;
-        (VulkanFrame.Measuring, Builds.Waited) = (true, true);
-        Assert.That(GlTap.Tap(), Is.True);
-        try
-        {
-            using var capture = TerrainRenderer.Create(rig.Device!, quads, null, out var why);
-            Assert.That(capture, Is.Not.Null, why);
-            _ = capture!.Watch(scene.Name, scene.Program, scene.Ported);
-            var section = VulkanFrame.SectionOf("bench opaque terrain");
-            capture.Frame.Counted = section;
-            List<double>[] ms = [[], []], fragments = [[], []];
-            for (var round = 0; round < 2 * FoliageRounds; round++)
-                for (var f = 0; f < RoundFrames; f++)
-                {
-                    var on = round % 2 == 1;
-                    Frame(capture, scene, (screen, draws), (round * RoundFrames + f, on));
-                    if (f < RoundFrames / 2) continue; // what LastMs and LastStatistic read is this round's frames
-                    ms[on ? 1 : 0].Add(capture.Frame.LastMs(section));
-                    fragments[on ? 1 : 0].Add(capture.Frame.LastStatistic(1));
-                }
-
-            Assert.That(capture.Left, Is.Zero, string.Join("; ", capture.Reasons));
-            Assert.That(capture.OwnCopies, Is.EqualTo(2 * FoliageRounds * RoundFrames), "copied in and back each frame on");
-            var pixels = (double)Width * Height;
-            TestContext.Out.WriteLine($"{quads} leaf quads in {Layers} layers, {Pools} pool draws, {Width}x{Height}: opaque " +
-                                      "terrain " +
-                                      $"on the engine's depth {Median(ms[0]):0.000} ms GPU, " +
-                                      $"{Median(fragments[0]) / 1e6:0.0} M fragment shader invocations " +
-                                      $"({Median(fragments[0]) / pixels:0.0} a pixel); on Komet's {Median(ms[1]):0.000} ms, " +
-                                      $"{Median(fragments[1]) / 1e6:0.0} M ({Median(fragments[1]) / pixels:0.0} a pixel)");
-        }
-        finally
-        {
-            GlTap.Untap();
-            VulkanFrame.Measuring = measuring;
-            Parity.Delete(screen);
-        }
-    }
-
-    private const int Layers = 48, Across = 10, Pools = 8, FoliageRounds = 6, RoundFrames = 40;
-
-    [Test]
-    public void DenseFoliageShadowOnKometsDepth()
-    {
-        GameInstall.RequireAssets();
-        using var rig = GpuRig.Open(GpuRig.Vulkan);
-        rig.Backend!.Flush();
-        var foliage = Foliage.Layers(Layers, Across, 11, false);
-        var quads = foliage.Faces.Length;
-        (int, int)[] draws = [.. Enumerable.Range(0, Pools).Select(p => (p * quads / Pools, quads / Pools))];
-        using var scene = new TerrainScene(rig.Device!, true, "chunkshadowmap", foliage) { Counts = rig.Backend, Counted = true };
-        var map = ShadowOwnDepthGpuTests.Map(Map);
-        var measuring = VulkanFrame.Measuring;
-        (VulkanFrame.Measuring, Builds.Waited) = (true, true);
-        Assert.That(GlTap.Tap(scene: true), Is.True, GlTap.Missing);
-        try
-        {
-            using var capture = TerrainRenderer.Create(rig.Device!, quads, null, out var why);
-            Assert.That(capture, Is.Not.Null, why);
-            _ = capture!.Watch(scene.Name, scene.Program, scene.Ported);
-            using var drawer = SceneParityGpuTests.Hooked(capture);
-            var section = VulkanFrame.SectionOf("bench shadow map");
-            capture.Frame.Counted = section;
-            List<double>[] ms = [[], []], fragments = [[], []];
-            for (var round = 0; round < 2 * FoliageRounds; round++)
-                for (var f = 0; f < RoundFrames; f++)
-                {
-                    var on = round % 2 == 1;
-                    ShadowFrame(capture, scene, (map, draws), (round * RoundFrames + f, on));
-                    if (f < RoundFrames / 2) continue;
-                    ms[on ? 1 : 0].Add(capture.Frame.LastMs(section));
-                    fragments[on ? 1 : 0].Add(capture.Frame.LastStatistic(1));
-                }
-
-            Assert.That(capture.Left + drawer.Left, Is.Zero, string.Join("; ", capture.Reasons.Concat(drawer.Reasons)));
-            Assert.That((capture.OwnClears, capture.OwnCopies), Is.EqualTo(((long)FoliageRounds * RoundFrames,
-                (long)FoliageRounds * RoundFrames)), "taken over by the clear and written back each frame on");
-            var texels = (double)Map * Map;
-            TestContext.Out.WriteLine($"{quads} leaf quads in {Layers} layers, {Pools} counted draws, a {Map}x{Map} map: " +
-                                      $"on the engine's depth {Median(ms[0]):0.000} ms GPU, " +
-                                      $"{Median(fragments[0]) / 1e6:0.0} M fragment shader invocations " +
-                                      $"({Median(fragments[0]) / texels:0.0} a texel); on Komet's {Median(ms[1]):0.000} ms " +
-                                      $"(the copy back included), {Median(fragments[1]) / 1e6:0.0} M " +
-                                      $"({Median(fragments[1]) / texels:0.0} a texel)");
-            capture.Release(map);
-        }
-        finally
-        {
-            GlTap.Untap();
-            VulkanFrame.Measuring = measuring;
-            Parity.Delete(map);
-        }
-    }
-
-    // The pass's clear is in its time, as is the map's copy back on Komet's depth
-    private static void ShadowFrame(TerrainRenderer capture, TerrainScene scene, (FrameBufferRef Map, (int, int)[] Draws) into,
-        (int Number, bool On) frame)
-    {
-        Assert.That(capture.Start([into.Map], [0], out var why), Is.True, why);
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, into.Map.FboId);
-        GL.Viewport(0, 0, Map, Map);
-        ShadowOwnDepthGpuTests.Depth();
-        OwnDepthParityGpuTests.Wind(scene, frame.Number);
-        capture.Frame.Section(VulkanFrame.SectionOf("bench shadow map"));
-        capture.Owning = frame.On;
-        var one = 1f;
-        GL.ClearBuffer(ClearBuffer.Depth, 0, ref one);
-        Assert.That(scene.DrawCall(capture, into.Draws, false, kept: true), Is.True, string.Join("; ", capture.Reasons));
-        capture.Disown();
-        capture.Frame.Section(VulkanFrame.SectionOf("bench rest"));
-        capture.Frame.Close("the bench's frame");
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
-    }
-
-    private static void Frame(TerrainRenderer capture, TerrainScene scene, (FrameBufferRef Screen, (int, int)[] Draws) into,
-        (int Number, bool On) frame)
-    {
-        Assert.That(capture.Start([into.Screen], [0], out var why), Is.True, why);
-        Parity.Clear(into.Screen, [0.5f, 0.6f, 0.7f, 1f]);
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, into.Screen.FboId);
-        GL.Viewport(0, 0, Width, Height);
-        OwnDepthParityGpuTests.Engine(false, true);
-        OwnDepthParityGpuTests.Wind(scene, frame.Number);
-        capture.Frame.Section(VulkanFrame.SectionOf("bench opaque terrain"));
-        Assert.That(scene.DrawCall(capture, into.Draws, frame.On), Is.True, string.Join("; ", capture.Reasons));
-        capture.Frame.Section(VulkanFrame.SectionOf("bench rest"));
-        capture.Frame.Close("the bench's frame");
-        GL.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
-    }
 
     private static double Shadow(TerrainWorld world, TerrainView view, FrustumCulling? casters,
         (int Program, DepthTarget Map, float[] Mvp, int Query) with)

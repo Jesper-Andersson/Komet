@@ -3,19 +3,46 @@ using Vintagestory.Client.NoObf;
 
 namespace Komet.Vulkan;
 
-// Adopting a pool moves each of its buffers into a SharedBuffer of the same size; the VAO's bindings and the engine's VAO
-// fields name the new buffers, so the engine goes on filling them and drawing them with OpenGL. The engine's pools are
-// persistently mapped (since 1.22) and written through the VAO's pointers, never the buffer names, so such a pool moves into
-// mapped shared buffers and its pointers move with it once the copy of what it held is done on the GPU (a write through the
-// new pointer must not be overwritten by the copy). Releasing leaves the engine's fields at zero, so its own dispose deletes
-// nothing twice.
-internal sealed class TerrainPools(VulkanDevice device) : IDisposable
+// Adopting gives each pool buffer a Vulkan buffer of its own (Stood) named by its GL buffer; OpenGL keeps its own,
+// nothing is rebound, copied or awaited. Persistently mapped pools (since 1.22) are written through Vulkan's mapping
+// (PersistentMaps), or OpenGL's mapping's engine pointer moves to Vulkan's until the pool goes.
+internal sealed unsafe class TerrainPools(VulkanDevice device) : IDisposable
 {
-    private const int MaxAttributes = 16, MaxPools = 4096;
-    private const int BindingOffset = 0x82D7, BindingStride = 0x82D8, AttributeBuffer = 0x889F, Enabled = 0x8622;
-    private const int GlSize = 0x8623, GlType = 0x8625, GlNormalized = 0x886A, GlInteger = 0x88FD, GlDivisor = 0x88FE;
+    // SSBO face data packed (CompactFaces); fixed while pools exist, as ports and pools must agree
+    public bool Compact { get; private set; } = CompactFaces.Enabled;
+
+    // TerrainRebuild: packing may change only with no pool held
+    public bool Repack(bool compact)
+    {
+        if (_pools.Count > 0 || !Assert(_moving.Count == 0)) return false;
+        Compact = compact;
+        return Assert(Compact == compact);
+    }
+
+    private const int MaxAttributes = 16, MaxPools = 4096, MaxRetired = 1024;
 
     private readonly Dictionary<int, Pool> _pools = [];
+    private readonly List<Moving> _moving = []; // Adopt's: it runs every frame
+    private readonly Dictionary<int, SharedBuffer> _byName = []; // each pool buffer by its GL buffer
+    private readonly List<(VAO Vao, int Slot, nint Gl)> _repointed = []; // OpenGL's mappings moved to Vulkan's
+    private readonly Retired<SharedBuffer> _retired = new(MaxRetired, static buffer => buffer.Dispose()); // released pools'
+
+    // GL buffer the engine writes through a Vulkan mapping (PersistentMaps.Of)
+    public System.Func<uint, (ulong Buffer, nint Pointer, long Size)?>? Mapped { get; set; }
+
+    // Read back from OpenGL once (made before Vulkan, or not adopted at creation)
+    public long Readbacks { get; private set; }
+
+    public SharedBuffer? BufferOf(int gl) => Assert(gl >= 0) && _byName.TryGetValue(gl, out var b) ? b : null;
+
+    // For BufferMirrors.Pooled
+    public (ulong Buffer, ulong Offset, ulong Size)? Range(uint gl) =>
+        gl < int.MaxValue && BufferOf((int)gl) is { } b && Assert(b.Buffer != 0) && Assert(b.Size > 0)
+            ? (b.Buffer, 0, b.Size)
+            : null;
+
+    // Told of each GL buffer a pool now holds (the scene drops its mirror)
+    public Action<uint>? Held { get; set; }
 
     public readonly record struct Attribute(int Location, int Buffer, int Size, int Type, bool Normalized, bool Integer)
     {
@@ -30,10 +57,10 @@ internal sealed class TerrainPools(VulkanDevice device) : IDisposable
         public SharedBuffer? Faces { get; } = faces;
         public SharedBuffer[] Vertices { get; } = vertices;
         public Attribute[] Attributes { get; } = attributes;
-        // The classic path's own indices; the SSBO path draws the quad pattern
+        // Classic path only; SSBO draws the quad pattern
         public SharedBuffer? Indices { get; init; }
 
-        // Cached per location list: the opaque, shadow and depth pipelines take turns drawing the pool
+        // Cached per location list: opaque, shadow and depth pipelines take turns on the pool
         public (uint Location, ulong Buffer, ulong Offset)[] Bindings(int[] locations)
         {
             if (!NotNull(locations) || !Assert(locations.Length <= MaxAttributes)) return [];
@@ -56,22 +83,39 @@ internal sealed class TerrainPools(VulkanDevice device) : IDisposable
         private readonly (int[] For, (uint, ulong, ulong)[] Bindings)[] _lists = new (int[], (uint, ulong, ulong)[])[MaxLists];
         private int _bound;
 
-        // The same for every pool with the same attributes
         public string Layout { get; } = string.Join(';', attributes.Select(a =>
             $"{a.Location}:{a.Size}:{a.Type}:{a.Normalized}:{a.Integer}:{a.Stride}:{a.Divisor}"));
     }
 
-    private uint[]? _names;
-
     public int Count => _pools.Count;
 
-    // What the adopted pools' buffers hold, for the report: the shared arena's ranges the pools have
     public ulong Bytes => Assert(_pools.Count <= MaxPools)
         ? (ulong)_pools.Values.SelectMany(Buffers).Distinct().Sum(b => (decimal)b.Size)
         : 0;
 
-    // Every adopted pool's GL buffers, for the semaphores that hand them over
-    public uint[] GlBuffers => _names ??= [.. _pools.Values.SelectMany(Buffers).Select(b => (uint)b.Gl).Distinct()];
+    // For the report: SSBO faces, their vertex buffers (colours, custom data), classic pools (liquids)
+    public string Breakdown()
+    {
+        if (!Assert(_pools.Count <= MaxPools)) return "";
+        var (faces, beside, classic, classicPools) = (0UL, 0UL, 0UL, 0);
+        foreach (var pool in _pools.Values.ToArray().Bounded(MaxPools))
+        {
+            var bytes = Buffers(pool).Aggregate(0UL, static (sum, b) => sum + b.Size);
+            if (pool.Indices is not null)
+            {
+                (classic, classicPools) = (classic + bytes, classicPools + 1);
+                continue;
+            }
+
+            var face = pool.Faces?.Size ?? 0;
+            (faces, beside) = (faces + face, beside + bytes - face);
+        }
+
+        var mode = Compact ? "packed faces" : "faces";
+        return Assert(classicPools >= 0)
+            ? $"{mode} {faces >> 20} MB, colours and custom data {beside >> 20} MB, classic (liquids) {classic >> 20} MB in {classicPools} pools"
+            : "";
+    }
 
     private static IEnumerable<SharedBuffer> Buffers(Pool pool)
     {
@@ -85,8 +129,7 @@ internal sealed class TerrainPools(VulkanDevice device) : IDisposable
 
     private sealed record Moving(VAO Vao, Attribute[] Attributes, Dictionary<int, SharedBuffer> Moved, int Indices);
 
-    // Classic: the pool is drawn with its own index buffer, which moves too. Fresh: a pool the engine has just made and not yet
-    // written (AllocateEmptyMesh stores nothing), so there is nothing to copy and no copy to wait for
+    // classic: its index buffer moves too. fresh: just made, unwritten (AllocateEmptyMesh): no copy, no wait
     public Pool? Adopt(VAO vao, bool classic, out string why, bool fresh = false)
     {
         why = "";
@@ -94,33 +137,33 @@ internal sealed class TerrainPools(VulkanDevice device) : IDisposable
         if (_pools.TryGetValue(vao.VaoId, out var known)) return known;
         var moving = Copied(vao, classic, fresh, out why);
         if (moving is null || !Assert(moving.Moved.Count > 0)) return null;
-        if (vao.Persistent && !fresh) Settle();
         return Rebound(moving);
     }
 
-    // Every copy first, one wait for all, then every pool rebound
+    // All copies first, one wait, then all pools rebound
     public int Adopt(List<(VAO Vao, bool Classic)> pools, out string why)
     {
         why = "";
         if (!NotNull(pools) || !Assert(pools.Count <= MaxPools)) return 0;
-        var moving = new List<Moving>();
+        _moving.Clear();
         for (var i = 0; i < Math.Min(pools.Count, MaxPools); i++)
         {
             var (vao, classic) = pools[i];
-            if (vao.VaoId <= 0 || _pools.ContainsKey(vao.VaoId) || Listed(moving, vao.VaoId)) continue;
-            if (Copied(vao, classic, false, out var refused) is { } made) moving.Add(made);
+            if (vao.VaoId <= 0 || _pools.ContainsKey(vao.VaoId) || Listed(vao.VaoId)) continue;
+            if (Copied(vao, classic, false, out var refused) is { } made) _moving.Add(made);
             else if (why.Length == 0) why = refused;
         }
 
-        if (moving.Exists(m => m.Vao.Persistent)) Settle();
-        foreach (var made in moving.ToArray().Bounded(MaxPools)) _ = Rebound(made);
-        return moving.Count;
+        foreach (var made in _moving.Bounded(MaxPools)) _ = Rebound(made);
+        var count = _moving.Count;
+        _moving.Clear();
+        return count;
     }
 
-    // Every pool every frame: a lambda capturing the pool made a closure for each, adopted or not
-    private static bool Listed(List<Moving> moving, int vao)
+    // Runs per pool per frame: a capturing lambda here allocated a closure each
+    private bool Listed(int vao)
     {
-        foreach (var m in moving.Bounded(MaxPools))
+        foreach (var m in _moving.Bounded(MaxPools))
             if (m.Vao.VaoId == vao)
                 return true;
         return !Assert(vao > 0);
@@ -138,7 +181,7 @@ internal sealed class TerrainPools(VulkanDevice device) : IDisposable
             .ToArray();
         foreach (var name in names.Bounded(MaxAttributes + 2))
         {
-            var shared = Moved(name, vao.Persistent, fresh, out why);
+            var shared = Stood(vao, name, fresh, !classic && name == vao.xyzVboId, out why);
             if (shared is null)
             {
                 foreach (var made in moved.Values.Bounded(MaxAttributes + 2)) made.Dispose();
@@ -156,37 +199,21 @@ internal sealed class TerrainPools(VulkanDevice device) : IDisposable
         _ = Assert(!_pools.ContainsKey(moving.Vao.VaoId));
         var pool = Rebind(moving.Vao, moving.Attributes, moving.Moved, moving.Indices);
         _pools[moving.Vao.VaoId] = pool;
-        _names = null;
         return pool;
     }
 
-    // Until every copy given to OpenGL so far is done on the GPU: a pointer handed to the engine must not be written by one
-    private static void Settle()
-    {
-        var fence = GL.FenceSync(SyncCondition.SyncGpuCommandsComplete, WaitSyncFlags.None);
-        if (!Assert(fence != IntPtr.Zero)) return;
-        var waited = GL.ClientWaitSync(fence, ClientWaitSyncFlags.SyncFlushCommandsBit, SettleNs);
-        GL.DeleteSync(fence);
-        _ = Assert(waited is WaitSyncStatus.AlreadySignaled or WaitSyncStatus.ConditionSatisfied);
-    }
-
-    private const long SettleNs = 5_000_000_000;
-
-    // Buffer is the GL name until Rebind
+    // GlTap's vertex array tracking (asked of OpenGL once for pre-tap arrays); Buffer is the GL name until Rebind
     private static Attribute[] Formats(VAO vao)
     {
         var found = new List<Attribute>();
-        if (!NotNull(vao)) return [];
+        if (!NotNull(vao) || GlTap.ArrayAt((uint)vao.VaoId) is not { } array) return [];
         for (var i = 0; i < Math.Min(vao.vaoSlotNumber, MaxAttributes); i++)
         {
-            var at = (vao.VaoId, i);
-            if (Parameter(at, Enabled) == 0) continue;
-            var offset = new long[1];
-            GL.GetVertexArrayIndexed64(vao.VaoId, i, (VertexArrayIndexed64Parameter)BindingOffset, offset);
-            found.Add(new Attribute(i, Parameter(at, AttributeBuffer), Parameter(at, GlSize), Parameter(at, GlType),
-                Parameter(at, GlNormalized) != 0, Parameter(at, GlInteger) != 0)
+            var a = array.Attributes[i];
+            if (!a.Enabled) continue;
+            found.Add(new Attribute(i, (int)a.Buffer, a.Size, (int)a.Type, a.Normalized, a.Integer)
             {
-                Stride = Parameter(at, BindingStride), Offset = offset[0], Divisor = Parameter(at, GlDivisor)
+                Stride = a.Stride, Offset = a.Offset, Divisor = (int)a.Divisor
             });
         }
 
@@ -194,27 +221,7 @@ internal sealed class TerrainPools(VulkanDevice device) : IDisposable
         return [.. found];
     }
 
-    private static int Parameter((int Vao, int Index) at, int name)
-    {
-        if (!Assert(at.Vao > 0) || !Index(at.Index, MaxAttributes)) return 0;
-        var value = new int[1];
-        GL.GetVertexArrayIndexed(at.Vao, at.Index, (VertexArrayIndexedParameter)name, value);
-        return value[0];
-    }
-
-    private SharedBuffer? Moved(int name, bool mapped, bool fresh, out string why)
-    {
-        why = "";
-        if (!Assert(name > 0)) return null;
-        GL.GetNamedBufferParameter(name, BufferParameterName.BufferSize, out int size);
-        _ = Assert(size >= 0);
-        var shared = size > 0 ? SharedBuffer.Create(device, (ulong)size, out why, mapped) : null;
-        if (shared is not null && !fresh) GL.CopyNamedBufferSubData(name, shared.Gl, IntPtr.Zero, IntPtr.Zero, size);
-        else if (why.Length == 0) why = $"buffer {name} has no storage";
-        return shared;
-    }
-
-    private static Pool Rebind(VAO vao, Attribute[] attributes, Dictionary<int, SharedBuffer> moved, int indices)
+    private Pool Rebind(VAO vao, Attribute[] attributes, Dictionary<int, SharedBuffer> moved, int indices)
     {
         var vertices = moved.Where(m => (m.Key != vao.xyzVboId && m.Key != indices) ||
                                         attributes.Any(a => a.Buffer == m.Key))
@@ -223,23 +230,101 @@ internal sealed class TerrainPools(VulkanDevice device) : IDisposable
         for (var i = 0; i < Math.Min(attributes.Length, MaxAttributes); i++)
         {
             var a = attributes[i];
-            var shared = moved[a.Buffer];
-            GL.VertexArrayVertexBuffer(vao.VaoId, a.Location, shared.Gl, new IntPtr(a.Offset), a.Stride);
-            rebound[i] = a with { Buffer = Array.IndexOf(vertices, shared) };
+            rebound[i] = a with { Buffer = Array.IndexOf(vertices, moved[a.Buffer]) };
         }
 
         var faces = moved.GetValueOrDefault(vao.xyzVboId);
         var elements = indices > 0 ? moved.GetValueOrDefault(indices) : null;
-        if (elements is not null) GL.VertexArrayElementBuffer(vao.VaoId, elements.Gl);
-        Rename(vao, name => moved.TryGetValue(name, out var shared) ? (shared.Gl, shared.Pointer) : null);
-        foreach (var old in moved.Keys.Bounded(MaxAttributes + 2)) GL.DeleteBuffer(old); // unmapped with it
+        foreach (var (name, buffer) in moved.ToArray().Bounded(MaxAttributes + 2))
+        {
+            _byName[name] = buffer;
+            Held?.Invoke((uint)name);
+        }
+
         _ = Assert(rebound.All(a => a.Buffer >= 0));
         return new Pool(vao, faces, vertices, rebound) { Indices = elements };
     }
 
-    private const int Slots = 10;
+    // The Vulkan mapping answered for it, else a buffer made here, filled unless fresh. faces: SSBO face data, packed
+    // when Compact (never mapped: the engine would write 64-byte quads through it)
+    private SharedBuffer? Stood(VAO vao, int name, bool fresh, bool faces, out string why)
+    {
+        why = "";
+        if (!Assert(name > 0) || !Assert(_pools.Count < MaxPools)) return null;
+        if (Mapped?.Invoke((uint)name) is { } mapped)
+        {
+            if (!(Compact && faces)) return SharedBuffer.Wrapping(device, mapped, name);
+            why = $"face data {name} is mapped and cannot be packed"; // the packed shaders could not read it
+            return null;
+        }
 
-    private static ref int Name(VAO vao, int slot)
+        var size = (int)GlTap.BufferSize((uint)name);
+        var mapping = MappingOf(vao, name);
+        var packed = Compact && faces && mapping.Gl == 0 && size > 0 && size % CompactFaces.Engine == 0;
+        if (Compact && faces && !packed && size > 0)
+        {
+            why = $"face data {name} cannot be packed";
+            return null;
+        }
+
+        var room = packed ? CompactFaces.PackedOf(size) : size;
+        var made = size > 0 ? SharedBuffer.Private(device, (ulong)room, name, mapping.Gl != 0, out why, packed) : null;
+        if (made is null) why = why.Length > 0 ? why : $"buffer {name} has no storage";
+        else if (!fresh && !Seeded(vao, made, mapping, size)) why = $"buffer {name} could not be read back";
+        if (why.Length > 0) made?.Dispose();
+        return why.Length > 0 ? null : made;
+    }
+
+    // OpenGL's own persistent mapping, made before Vulkan answered the engine's
+    private static (int Slot, nint Gl) MappingOf(VAO vao, int name)
+    {
+        if (!NotNull(vao) || !Assert(name > 0) || !vao.Persistent) return (-1, 0);
+        for (var slot = 0; slot < Slots; slot++)
+            if (Name(vao, slot) == name && Pointer(vao, slot) != 0)
+                return (slot, Pointer(vao, slot));
+        return (-1, 0);
+    }
+
+    // From OpenGL's mapping, whose engine pointer then moves to Vulkan's (back on Dispose), else read back via host
+    // memory and waited for (adoption is rare). size: the engine's; packed in host memory before the copy
+    private bool Seeded(VAO vao, SharedBuffer made, (int Slot, nint Gl) mapping, long size)
+    {
+        _ = Assert(size >= (long)made.Size) && Assert(made.Packed || size == (long)made.Size);
+        if (mapping.Gl != 0 && NotNull(vao) && Assert(made.Pointer != 0))
+        {
+            System.Buffer.MemoryCopy((void*)mapping.Gl, (void*)made.Pointer, size, size);
+            Pointer(vao, mapping.Slot) = made.Pointer;
+            _repointed.Add((vao, mapping.Slot, mapping.Gl));
+            return true;
+        }
+
+        if (GlTap.LeanBuffer((uint)made.Gl)) return false; // lean: OpenGL holds none of it to read back
+        var copied = (long)made.Size;
+        using var host = HostBuffer.Create(device, (ulong)(size + (made.Packed ? copied : 0)), bulk: true);
+        if (host is null || host.Take((int)size, out _, 16) is not 0) return false;
+        using (GlTap.Quietly()) GL.GetNamedBufferSubData(made.Gl, IntPtr.Zero, (int)size, (IntPtr)host.Pointer(0));
+        Readbacks++;
+        var source = 0UL;
+        if (made.Packed)
+        {
+            var at = host.Take((int)copied, out _, 16);
+            if (at < 0) return false;
+            CompactFaces.Pack(new ReadOnlySpan<byte>(host.Pointer(0), (int)size), new Span<byte>(host.Pointer(at), (int)copied));
+            source = (ulong)at;
+        }
+
+        var (from, to) = (host.Buffer, made.Buffer);
+        return Assert(size > 0) && device.Run(commands =>
+        {
+            var region = new Vk.BufferCopy { SourceOffset = source, Size = (ulong)copied };
+            VkApi.CmdCopyBuffer(commands, from, to, 1, &region);
+        }, []);
+    }
+
+
+    internal const int Slots = 10; // a VAO's buffers (PersistentMaps' too)
+
+    internal static ref int Name(VAO vao, int slot)
     {
         _ = Assert(slot is >= 0 and < Slots);
         switch (slot)
@@ -257,7 +342,7 @@ internal sealed class TerrainPools(VulkanDevice device) : IDisposable
         }
     }
 
-    private static ref nint Pointer(VAO vao, int slot)
+    internal static ref nint Pointer(VAO vao, int slot)
     {
         _ = Assert(slot is >= 0 and < Slots);
         switch (slot)
@@ -275,79 +360,57 @@ internal sealed class TerrainPools(VulkanDevice device) : IDisposable
         }
     }
 
-    private static void Rename(VAO vao, System.Func<int, (int Name, nint Pointer)?> to)
-    {
-        if (!NotNull(vao) || !NotNull(to)) return;
-        for (var slot = 0; slot < Slots; slot++)
-        {
-            ref var name = ref Name(vao, slot);
-            if (name <= 0 || to(name) is not { } moved) continue;
-            name = moved.Name;
-            if (vao.Persistent) Pointer(vao, slot) = moved.Pointer;
-        }
-
-        _ = Assert(vao.VaoId > 0);
-    }
-
-    public void Release(VAO vao)
+    // Buffers go once frame is done (Collect; -1: at once); PoolTrim deletes empty pools every few seconds
+    public void Release(VAO vao, long frame)
     {
         if (!NotNull(vao) || !Assert(_pools.Count <= MaxPools) || !_pools.Remove(vao.VaoId, out var pool)) return;
-        _ = device.WaitIdle(); // a frame in flight may still read it
-        Unhook(pool);
-        _names = null;
+        Unstood(pool, false, frame);
     }
 
-    private static void Unhook(Pool pool)
+    private void Retire(SharedBuffer buffer, long frame)
     {
-        if (!NotNull(pool) || !NotNull(pool.Vao)) return;
-        var shared = Buffers(pool).Select(b => b.Gl).Where(g => g > 0).ToHashSet();
-        Rename(pool.Vao, name => shared.Contains(name) ? (0, 0) : null);
-        foreach (var buffer in Buffers(pool).ToArray().Bounded(MaxAttributes + 2)) buffer.Dispose();
+        if (!NotNull(buffer) || !Assert(_retired.Count <= MaxRetired) || (frame >= 0 && _retired.Add(buffer, frame))) return;
+        if (frame >= 0) _ = device.WaitIdle(); // too many waiting: this one goes now
+        buffer.Dispose();
     }
 
-    // The contents copied back are done on the GPU before a pointer is handed back
+    public void Collect(long done)
+    {
+        _retired.Collect(done);
+        _ = Assert(_retired.Count <= MaxRetired) && Assert(done >= -VulkanFrame.Slots);
+    }
+
+    // Buffers go (PersistentMaps' stay theirs); back: OpenGL's mappings get the contents and pointers again
+    private void Unstood(Pool pool, bool back, long frame = -1)
+    {
+        if (!NotNull(pool) || !Assert(_repointed.Count <= MaxPools * Slots)) return;
+        var count = _repointed.Count;
+        for (var k = 0; k < Math.Min(count, MaxPools * Slots); k++)
+        {
+            var i = count - 1 - k; // from the last: removal keeps the rest where they are
+            var (vao, slot, gl) = _repointed[i];
+            if (!ReferenceEquals(vao, pool.Vao)) continue;
+            var size = GlTap.BufferSizeOf((uint)Name(vao, slot)) ?? 0;
+            if (back && size > 0) System.Buffer.MemoryCopy((void*)Pointer(vao, slot), (void*)gl, size, size);
+            Pointer(vao, slot) = gl;
+            _repointed.RemoveAt(i);
+        }
+
+        foreach (var buffer in Buffers(pool).ToArray().Bounded(MaxAttributes + 2))
+        {
+            _ = _byName.Remove(buffer.Gl);
+            Retire(buffer, frame);
+        }
+    }
+
+    // Pointers handed back once the GPU is done with the buffers
     public void Dispose()
     {
         _ = Assert(_pools.Count <= MaxPools) && device.WaitIdle();
-        var back = new Dictionary<int, (int Name, nint Pointer)>();
-        foreach (var pool in _pools.Values.ToArray().Bounded(MaxPools))
-            foreach (var buffer in Buffers(pool).ToArray().Bounded(MaxAttributes + 2))
-                back[buffer.Gl] = Fresh(buffer, pool.Vao.Persistent);
-        if (_pools.Values.Any(p => p.Vao.Persistent)) Settle();
-        foreach (var pool in _pools.Values.ToArray().Bounded(MaxPools)) Restored(pool, back);
+        _retired.Clear();
+        foreach (var pool in _pools.Values.ToArray().Bounded(MaxPools)) Unstood(pool, true);
+        _repointed.Clear();
         _pools.Clear();
-        _names = null;
-        device.Arena.Trim(); // the blocks the pools emptied
-    }
-
-    private const int PersistentStorage = 0x1C2, PersistentMap = 0xC2; // as the engine's GenArrayBuffer asks
-
-    private static (int Name, nint Pointer) Fresh(SharedBuffer shared, bool persistent)
-    {
-        if (!NotNull(shared) || !Assert(shared.Size is > 0 and <= int.MaxValue)) return (0, 0);
-        GL.CreateBuffers(1, out int buffer);
-        var size = (int)shared.Size;
-        nint pointer = 0;
-        if (persistent)
-        {
-            GL.NamedBufferStorage(buffer, size, IntPtr.Zero, (BufferStorageFlags)PersistentStorage);
-            pointer = GL.MapNamedBufferRange(buffer, IntPtr.Zero, size, (BufferAccessMask)PersistentMap);
-        }
-        else GL.NamedBufferData(buffer, size, IntPtr.Zero, BufferUsageHint.DynamicDraw);
-
-        GL.CopyNamedBufferSubData(shared.Gl, buffer, IntPtr.Zero, IntPtr.Zero, size);
-        return (buffer, pointer);
-    }
-
-    private static void Restored(Pool pool, Dictionary<int, (int Name, nint Pointer)> back)
-    {
-        if (!NotNull(pool) || !NotNull(back)) return;
-        var vao = pool.Vao;
-        foreach (var a in pool.Attributes.Bounded(MaxAttributes))
-            GL.VertexArrayVertexBuffer(vao.VaoId, a.Location, back[pool.Vertices[a.Buffer].Gl].Name, new IntPtr(a.Offset),
-                a.Stride);
-        if (pool.Indices is { } indices) GL.VertexArrayElementBuffer(vao.VaoId, back[indices.Gl].Name);
-        Rename(vao, name => back.TryGetValue(name, out var fresh) ? fresh : null);
-        foreach (var buffer in Buffers(pool).ToArray().Bounded(MaxAttributes + 2)) buffer.Dispose();
+        _byName.Clear();
     }
 }

@@ -1,3 +1,5 @@
+using Komet.Shapes;
+
 namespace Komet.Test.Shapes;
 
 // Creature items and wearables build their inventory mesh from shapes parsed without the animations: the same elements and

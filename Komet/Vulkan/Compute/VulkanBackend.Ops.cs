@@ -1,7 +1,7 @@
 namespace Komet.Vulkan;
 
-// The work a frame records later on its own thread, without a closure each (several a pool draw while the GPU culls): a dispatch
-// with its descriptors, or a buffer copy. Taken from a pool, back in it once recorded; one a frame drops goes to the collector.
+// Work a frame records later on its thread without closures: a dispatch with descriptors or a buffer copy. Pooled;
+// dropped ones go to the GC.
 internal sealed unsafe partial class VulkanBackend
 {
     private const int MaxIdle = 512;

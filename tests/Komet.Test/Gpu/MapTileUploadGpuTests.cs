@@ -15,8 +15,8 @@ public sealed class MapTileUploadGpuTests
     public void TheUploadLeavesTheTileTheEnginesDrawLeaves()
     {
         GameInstall.RequireAssets();
-        using var window = OcclusionGpuTests.Context();
-        if (window is null) Assert.Ignore("no OpenGL 4.6 context here: " + OcclusionGpuTests.Why);
+        using var window = GlContext.Context();
+        if (window is null) Assert.Ignore("no OpenGL 4.6 context here: " + GlContext.Why);
         var random = new Random(11);
         int[]?[] first = [Piece(random), null, Piece(random), null, Piece(random), null, null, Piece(random), null];
         int[]?[] second = [Piece(random), Piece(random), null, null, Piece(random), Piece(random), Piece(random), null, null];

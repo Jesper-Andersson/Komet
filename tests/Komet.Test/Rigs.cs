@@ -1,3 +1,6 @@
+using Komet.Api;
+using Komet.Core;
+using Komet.Tessellation;
 using Vintagestory.API.Client.Tesselation;
 
 namespace Komet.Test.Rigs;

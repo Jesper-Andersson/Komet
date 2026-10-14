@@ -48,8 +48,23 @@ internal static partial class GlslPort
     [GeneratedRegex(@"\bgl_(?:VertexID|InstanceID)\b", RegexOptions.CultureInvariant)]
     private static partial Regex VertexId();
 
-    // The version stays, as newer ones reserve words older sources use (sample); below 4.20 two extensions allow what the port
-    // writes (set and binding, locations between the stages), and #line puts the numbering back
+    [GeneratedRegex(@"\bvoid\s+main\s*\(\s*(?:void\s*)?\)", RegexOptions.CultureInvariant)]
+    private static partial Regex MainPattern();
+
+    // Vulkan-only: vertex stages without gl_PointSize write OpenGL's default 1 (undefined in Vulkan); cached apart.
+    public static bool PointSized { get; set; }
+
+    // main renamed and called from a one-line main appended at the end: line numbers stay
+    private static string Sized(string ported)
+    {
+        if (!Assert(ported.Length > 0) || ported.Contains("gl_PointSize", StringComparison.Ordinal)) return ported;
+        var renamed = MainPattern().Replace(ported, "void komet_main()", 1);
+        return Assert(renamed.Length > 0) && !ReferenceEquals(renamed, ported)
+            ? renamed + "\nvoid main() { komet_main(); gl_PointSize = 1.0; }\n"
+            : ported;
+    }
+
+    // Version kept (newer reserve words like sample); below 4.20 two extensions allow set/binding and stage locations
     private static string Versioned(Match version)
     {
         var number = int.Parse(version.Groups["number"].Value, CultureInfo.InvariantCulture);
@@ -148,7 +163,7 @@ internal static partial class GlslPort
         return $"location = {Math.Max(location, 0)}";
     }
 
-    // Columns of a type, rows of each: a location per column, 16 bytes per column of a matrix in std140; (0, 0) when unknown
+    // A location per column, 16 bytes per matrix column in std140; (0, 0) when unknown
     internal static (int Columns, int Rows) Shape(string type)
     {
         if (!Assert(type.Length > 0)) return (0, 0);
@@ -159,7 +174,25 @@ internal static partial class GlslPort
         return type is ['m', 'a', 't', _] && tail is >= 2 and <= 4 ? (tail, tail) : (0, 0);
     }
 
-    // The std140 size of one element: a vec3 is 12 bytes, a matrix a vec4 per column
+    // One input per matrix column, each with its own OpenGL pointer (instanced mat4 at 5 reads 5..8), or columns past
+    // the first read nothing
+    public static Attribute[] Columns(Attribute[] inputs)
+    {
+        if (!NotNull(inputs) || Array.TrueForAll(inputs, static a => Shape(a.Type).Columns <= 1)) return inputs;
+        var columns = new List<Attribute>(inputs.Length + 6);
+        foreach (var a in inputs.Bounded(MaxLocations))
+        {
+            var (count, rows) = Shape(a.Type);
+            if (count <= 1) columns.Add(a);
+            else
+                for (var c = 0; c < Math.Min(count, 4); c++)
+                    columns.Add(new Attribute($"{a.Name}[{c}]", $"vec{rows}", a.Location + c));
+        }
+
+        return [.. columns];
+    }
+
+    // std140 element size: vec3 12 bytes, a matrix a vec4 per column
     public static int Bytes(string type)
     {
         if (!Assert(type.Length > 0)) return 0;
@@ -168,7 +201,7 @@ internal static partial class GlslPort
         return columns > 1 ? 16 * columns : 4 * rows;
     }
 
-    // An initializer as floats, a component each (a matrix's diagonal for a single value), or null without one
+    // A float per component (a matrix's diagonal for a single value); null without an initializer
     private static float[]? Initial(string? init, string type, string name, Context context)
     {
         if (init is null || !Assert(name.Length > 0)) return null;

@@ -2,14 +2,13 @@ using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet.Diagnostics;
 using Vintagestory.Client.NoObf;
 
 namespace Komet.Shapes;
 
-// Many items build their inventory mesh the first time they are drawn (clutter variants, containers, clothing, creature items:
-// tesselated, textures baked, uploaded), 5 to 15 ms each. A row of the creative inventory scrolling in drew fifteen of them in one
-// frame, 150 ms. Now the creative inventory draws items it has not drawn before only while BudgetMs of this frame is left; the
-// others stay empty for the frames until their turn, slots and stack sizes drawn as before. An item drawn once is drawn every frame.
+// First-draw inventory meshes cost 5-15 ms each (a creative row: 150 ms). New items draw only while BudgetMs is left,
+// the rest stay empty until their turn.
 internal static class IconBudget
 {
     public const double BudgetMs = 6;
@@ -37,8 +36,8 @@ internal static class IconBudget
     private static bool Drawing(ItemSlot inSlot, out long __state)
     {
         __state = 0;
-        if (!Assert(_spent >= 0) || !Enabled || inSlot?.Inventory?.ClassName != Creative || Drawn.TryGetValue(inSlot, out _)) return true;
-        if (FrameClock.Completed != _frame) (_frame, _spent) = (FrameClock.Completed, 0);
+        if (!Assert(_spent >= 0) || !Enabled || FrameClock.Frames == 0 || inSlot?.Inventory?.ClassName != Creative || Drawn.TryGetValue(inSlot, out _)) return true;
+        if (FrameClock.Frames != _frame) (_frame, _spent) = (FrameClock.Frames, 0); // not Completed: it stands still without the HUD
         if (_spent >= BudgetMs * Stopwatch.Frequency / 1000 || !Assert(_spent >= 0)) return false;
         __state = Stopwatch.GetTimestamp();
         return true;

@@ -1,3 +1,6 @@
+using Komet.Chunks;
+using Komet.Core;
+
 namespace Komet.Test.Chunks;
 
 public sealed class ChunkBudgetTests
@@ -18,8 +21,7 @@ public sealed class ChunkBudgetTests
     [TearDown]
     public void Reset()
     {
-        (ChunkBudget.CapMillis, ChunkBudget.CeilingMillis, Counting.Hud, RuntimeStats.chunksAwaitingPooling) =
-            (ChunkBudget.DefaultCapMillis, ChunkBudget.DefaultCeilingMillis, false, 0);
+        (ChunkBudget.CapMillis, Counting.Hud, RuntimeStats.chunksAwaitingPooling) = (ChunkBudget.DefaultCapMillis, false, 0);
         ChunkBudget.Yield = true;
         ChunkBudget.Begin();
     }
@@ -185,11 +187,11 @@ public sealed class ChunkBudgetTests
     [Test]
     public void APriorityBurstPastTheCeilingGoesOnNextFrameAheadOfTheNormalQueue()
     {
-        (ChunkBudget.CapMillis, ChunkBudget.CeilingMillis, Counting.Hud) = (1, 2, true);
+        (ChunkBudget.CapMillis, Counting.Hud) = (1, true);
         var cuts = ChunkBudget.PriorityCuts;
         var manager = (ChunkTesselatorManager)RuntimeHelpers.GetUninitializedObject(typeof(ChunkTesselatorManager));
         ChunkBudget.Begin();
-        Busy.Spin(4);
+        Busy.Spin(ChunkBudget.CeilingMillis + 2);
         Assert.Multiple(() =>
         {
             Assert.That(ChunkBudget.Priority(5), Is.EqualTo(5), "the test in front of the first priority chunk");
@@ -209,16 +211,13 @@ public sealed class ChunkBudgetTests
         });
     }
 
-    // No ceiling, or one the frame stays within: the priority queue is the engine's, all of it in the frame, and the flag stays as
-    // the engine left it
-    [TestCase(ChunkBudget.Uncapped, 4)]
-    [TestCase(ChunkBudget.MaxCapMillis, 0)]
-    public void WithinTheCeilingThePriorityQueueGoesWhole(int ceiling, int spin)
+    // A frame within the ceiling: the priority queue is the engine's, all of it in the frame, and the flag stays as the engine
+    // left it
+    [Test]
+    public void WithinTheCeilingThePriorityQueueGoesWhole()
     {
-        ChunkBudget.CeilingMillis = ceiling;
         var manager = (ChunkTesselatorManager)RuntimeHelpers.GetUninitializedObject(typeof(ChunkTesselatorManager));
         ChunkBudget.Begin();
-        Busy.Spin(spin);
         int[] counts = [3, 2, 1, 0];
         Assert.That(counts.Select(ChunkBudget.Priority), Is.EqualTo(counts));
         ChunkBudget.End(manager);
@@ -229,10 +228,10 @@ public sealed class ChunkBudgetTests
     [Test]
     public void TheCeilingIsNeverBelowTheCapInForce()
     {
-        (ChunkBudget.CapMillis, ChunkBudget.CeilingMillis, RuntimeStats.chunksAwaitingPooling) = (6, 1, 0);
+        (ChunkBudget.CapMillis, RuntimeStats.chunksAwaitingPooling) = (ChunkBudget.CeilingMillis + 4, 0);
         ChunkBudget.Begin();
-        Busy.Spin(3);
-        Assert.That((ChunkBudget.Priority(3), ChunkBudget.Priority(2)), Is.EqualTo((3, 2)), "3 ms in, the 6 ms cap stands");
+        Busy.Spin(ChunkBudget.CeilingMillis + 1);
+        Assert.That((ChunkBudget.Priority(3), ChunkBudget.Priority(2)), Is.EqualTo((3, 2)), "past the ceiling, the cap stands");
     }
 
     // A frame's chunk work, OnBeforeFrame and what Vulkan's adoption added, booked against the cap at the next frame's start

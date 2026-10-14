@@ -1,6 +1,6 @@
 namespace Komet.Vulkan;
 
-// A large upload gets a buffer of its own, kept until the GPU has finished the frame that took it
+// A large upload gets its own buffer, kept until the GPU finishes the frame that took it
 internal sealed class FrameStaging(VulkanDevice device, VulkanFrame frame) : IDisposable
 {
     private const int MaxOwn = 64;
@@ -14,7 +14,7 @@ internal sealed class FrameStaging(VulkanDevice device, VulkanFrame frame) : IDi
         if (frame.Staging is { } uploads && (at = uploads.Take(bytes, out _, align)) >= 0) return uploads;
         if (_own.Count >= MaxOwn || HostBuffer.Create(device, (ulong)bytes, bulk: true) is not { } own) return null;
         _own.Add((own, frame.Number));
-        at = own.Take(bytes, out _, 16);
+        at = own.Take(bytes, out _, align);
         return at >= 0 ? own : null;
     }
 

@@ -1,6 +1,7 @@
-using System.Reflection;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
+using Komet.Core;
+using Komet.Rendering;
 using OpenTK.Graphics.OpenGL;
 using Vintagestory.Client.NoObf;
 using Komet.Gpu;
@@ -8,8 +9,8 @@ using static Komet.Rendering.Fields;
 
 namespace Komet.Vulkan;
 
-// Before 0.01 decides the frame; Preparing (0.993) runs after the tesselator uploaded and ahead of the liquid depth pass
-// (0.995). Every hook catches what Vulkan throws and fails the renderer instead of the game.
+// Before 0.01 decides the frame; Preparing (0.993) runs after tesselator uploads, ahead of liquid depth (0.995). Every
+// hook catches Vulkan exceptions and fails the renderer, not the game.
 internal static partial class VulkanRenderer
 {
     private const int MaxGlSamplers = 16;
@@ -35,18 +36,19 @@ internal static partial class VulkanRenderer
         _ = harmony.Patch(AccessTools.DeclaredMethod(typeof(VAO), nameof(VAO.Dispose)), Of(nameof(Disposing)));
         _ = harmony.Patch(AccessTools.DeclaredMethod(platform, nameof(ClientPlatformWindows.DisposeFrameBuffer)),
             Of(nameof(Unframing)));
-        _ = harmony.Patch(AccessTools.DeclaredMethod(platform, nameof(ClientPlatformWindows.BuildMipMaps)),
-            postfix: Of(nameof(Mipmapped)));
+        _ = harmony.Patch(AccessTools.DeclaredMethod(platform, nameof(ClientPlatformWindows.AllocateEmptyMesh)),
+            postfix: Of(nameof(MeshAllocated)));
+        foreach (var cairo in (ReadOnlySpan<string>)[nameof(ClientPlatformWindows.LoadCairoTexture),
+                     nameof(ClientPlatformWindows.LoadOrUpdateCairoTexture)])
+            if (AccessTools.DeclaredMethod(platform, cairo) is { } made) // the GUI's: never lean
+                _ = harmony.Patch(made, Of(nameof(CairoMaking)), finalizer: Of(nameof(CairoMade)));
         var opaque = AccessTools.DeclaredMethod(typeof(ChunkRenderer), nameof(ChunkRenderer.RenderOpaque), [typeof(float)]);
         _ = harmony.Patch(opaque, Of(nameof(OpaqueDrawing)));
-        // after OcclusionCulling's postfix (installed before, the same priority): its last pass records into the segment
-        foreach (var name in (ReadOnlySpan<string>)[nameof(ChunkRenderer.RenderOpaque), "RenderOIT", "RenderAfterOIT"])
+        // after OcclusionCulling's postfix (installed before, same priority): its last pass records into the segment
+        _ = harmony.Patch(opaque, postfix: new HarmonyMethod(AccessTools.Method(typeof(VulkanRenderer), nameof(OpaqueDrawn)))
         {
-            var pass = AccessTools.DeclaredMethod(typeof(ChunkRenderer), name, [typeof(float)]);
-            if (name == nameof(ChunkRenderer.RenderOpaque) || NotNull(pass)) // the opaque pass is required: none fails the install
-                _ = harmony.Patch(pass, postfix: new HarmonyMethod(AccessTools.Method(typeof(VulkanRenderer),
-                    nameof(PassDrawn))) { priority = Priority.Last });
-        }
+            priority = Priority.Last
+        });
 
         IndirectDraw.Takeover = Takeover;
         PoolUpdates.Install(harmony, _logger);
@@ -59,18 +61,12 @@ internal static partial class VulkanRenderer
     {
         if (!NotNull(events) || !Assert(Renderers.Count == 0)) return;
         Renderers.AddRange([
-            new Hook(EnumRenderStage.Before, 0.01, Starting), new Hook(EnumRenderStage.Before, PrepareOrder, Preparing),
-            new Hook(EnumRenderStage.Opaque, EarliestOrder, OpaqueBegins), new Hook(EnumRenderStage.Done, 0.99, Ended),
-            new Hook(EnumRenderStage.OIT, OitOrder, OitBegins), new Hook(EnumRenderStage.ShadowFar, EarliestOrder, Shadowing),
-            new Hook(EnumRenderStage.ShadowFarDone, EarliestOrder, Shadowed),
-            new Hook(EnumRenderStage.ShadowNear, EarliestOrder, Shadowing),
-            new Hook(EnumRenderStage.ShadowNearDone, EarliestOrder, Shadowed)
+            new Hook(EnumRenderStage.Before, EarliestOrder, StartingFirst), new Hook(EnumRenderStage.Before, 0.01, StartingThen),
+            new Hook(EnumRenderStage.Before, PrepareOrder, Preparing), new Hook(EnumRenderStage.Done, 0.99, Ended),
+            new Hook(EnumRenderStage.OIT, OitOrder, OitBegins),
+            new Hook(EnumRenderStage.Ortho, EarliestOrder, OrthoBegins), new Hook(EnumRenderStage.Ortho, LastOrder, OrthoEnds)
         ]);
-        foreach (var stage in (ReadOnlySpan<EnumRenderStage>)[EnumRenderStage.Opaque, EnumRenderStage.OIT,
-                     EnumRenderStage.AfterOIT, EnumRenderStage.AfterPostProcessing,
-                     EnumRenderStage.AfterFinalComposition, EnumRenderStage.AfterBlit])
-            Renderers.Add(new Hook(stage, LastOrder, () => _renderer?.Frame.Flush()));
-        foreach (var renderer in Renderers.Bounded(16))
+        foreach (var renderer in Renderers.Bounded(32))
             events.RegisterRenderer(renderer, ((Hook)renderer).Own, "komet-vulkan");
     }
 
@@ -80,7 +76,7 @@ internal static partial class VulkanRenderer
         Renderers.Clear();
         GlSamplers.Clear();
         (_distant, _watched, _oit) = (-1, true, (0, 0));
-        GlTap.ProgramGone = null;
+        (GlTap.ProgramGone, GlTap.Linking) = (null, null);
         _ = Assert(Renderers.Count == 0);
     }
 
@@ -97,7 +93,7 @@ internal static partial class VulkanRenderer
         }
     }
 
-    // For the per-frame hooks: a static lambda with its state allocates nothing, where a capturing one makes a closure each call
+    // Per-frame hooks: a static lambda with its state allocates nothing; a capturing one makes a closure per call
     private static void Guarded<T>(Action<T> work, T state)
     {
         if (!NotNull(work)) return;
@@ -118,13 +114,42 @@ internal static partial class VulkanRenderer
         _ = Assert(State is Phase.Failed or Phase.Off);
     }
 
+    private static bool _begunFirst; // began this frame ahead of the Before stage's renderers
+
+    // The frame begins before every Before-stage renderer: their work (first frame too) is Vulkan's with GL resting, not
+    // drawn by GL beforehand and missing from the picture
+    private static void StartingFirst()
+    {
+        _begunFirst = false;
+        if (!OnlyOn || VulkanCore.Device is null || !Assert(Renderers.Count > 0)) return; // the device starts at Before 0
+        Starting();
+        _begunFirst = State is Phase.Running or Phase.Waiting; // else Before 0.01 decides (the device's first frame)
+        _ = Assert(!_begunFirst || OnlyOn);
+    }
+
+    // Before 0.01: the frame the device started in, or after a wait
+    private static void StartingThen()
+    {
+        var first = _begunFirst;
+        _begunFirst = false;
+        if (!first) Starting();
+        _ = Assert(!_begunFirst);
+    }
+
     private static void Starting()
     {
-        var device = VulkanCore.Device;
-        if (!Enabled) (_failed, _failure) = (false, ""); // switched off after a failure: switching on tries anew
-        if (!Enabled || device is null)
+        if (GlTap.Stranded) // until the world is left: OpenGL shows the GUI over a cleared frame
         {
-            Paused(Enabled ? "waits for the Vulkan device (render settings, Vulkan)" : "");
+            if (_renderer is not null) Fail("Vulkan-only stopped: the device cannot give OpenGL the world back");
+            Overlaid();
+            return;
+        }
+
+        var device = VulkanCore.Device;
+        if (!OnlyOn) (_failed, _failure) = (false, ""); // switched off after a failure: switching on tries anew
+        if (!OnlyOn || device is null)
+        {
+            Paused(OnlyOn ? "waits for the Vulkan device (render settings, Vulkan)" : "");
             return;
         }
 
@@ -136,6 +161,12 @@ internal static partial class VulkanRenderer
             return;
         }
 
+        if (GlTap.Fault.Length > 0)
+        {
+            Fail("Vulkan stopped: " + GlTap.Fault);
+            return;
+        }
+
         Guarded(Begin, device);
     }
 
@@ -143,22 +174,26 @@ internal static partial class VulkanRenderer
     {
         if (!NotNull(device) || _api?.Render is not { } render) return;
         DecideScene();
-        if (!Tapped(AnyPart))
+        if (!Tapped())
         {
             Fail("OpenTK's GL table is not where Vulkan looks for it");
             return;
         }
 
+        Remade();
+        if (State == Phase.Failed) return; // stranded as it let go
         _renderer ??= Made(device);
         if (_renderer is not { } renderer) return;
+        renderer.Requads(ClientPlatformAbstract.singleIndexBufferSize / 24);
         Hooked(renderer, GlTap.Scene);
+        _scene?.Warming(); // the programs ported as they were linked, their known pipelines begun
         if (!_watched) renderer.Rewatch();
         _watched = true;
-        var waits = Decide(device);
+        Decide(device);
         Update(Engine(), renderer, Taking);
-        waits = Joined(waits, Unported(), SceneWaits());
+        var waits = Joined(Unported(), SceneWaits());
         var (framebuffers, shared) = Windowing(renderer, render);
-        // esr-pre held these: what ran before, then the wait for the GPU to finish the slot's frame (Frame.Next) and the start
+        // esr-pre held these: what ran before, then the GPU wait for the slot's frame (Frame.Next) and the start
         var profiler = Vintagestory.Client.ScreenManager.FrameProfiler;
         profiler?.Mark(StartingMark);
         var started = renderer.Start(framebuffers, shared, out var why);
@@ -169,23 +204,26 @@ internal static partial class VulkanRenderer
             return;
         }
 
-        _ = Distant(renderer);
-        Culling(renderer, Taking[(int)Pass.Opaque] && OcclusionCulling.Enabled, Taking[(int)Pass.Opaque]);
+        Distant(renderer);
+        Culling(renderer, Taking[(int)Pass.Opaque] && OcclusionCulling.Active);
+        IndirectDraw.Plain = true;
         if (_scene is { } scene) (scene.Framing, scene.Between) = (SceneOn, false);
         Report(waits);
+        // From now on GL runs no GPU work Vulkan leaves, nor (held by lean) while ports are awaited
+        (GlTap.Resting, GlTap.Lean) = (GlIdle || GlTap.Leaned > 0, LeanOn);
         VulkanWatch.Mark("Before: started");
     }
 
     // Most frames wait for nothing: then no array, iterator or join
-    private static string Joined(string a, string b, string c)
+    private static string Joined(string a, string b)
     {
-        if (!NotNull(a) || !NotNull(b) || !NotNull(c) || a.Length + b.Length + c.Length == 0) return "";
-        return string.Join("; ", ((string[])[a, b, c]).Where(w => w.Length > 0));
+        if (!NotNull(a) || !NotNull(b) || a.Length + b.Length == 0) return "";
+        return a.Length > 0 && b.Length > 0 ? a + "; " + b : a + b;
     }
 
     private static string SceneWaits()
     {
-        if (!AnyPart || !Assert(Parting.Length == 5)) return "";
+        if (!Assert(Parting.Length == 5)) return "";
         if (!GlTap.Scene) return $"the rest of the frame waits: OpenTK's GL table lacks {GlTap.Missing}";
         return _scene is null ? "the rest of the frame waits: no memory for it" : "";
     }
@@ -197,7 +235,7 @@ internal static partial class VulkanRenderer
         if (made is null) Fail("Vulkan terrain: " + why);
         else
         {
-            (made.Targets.Owned, made.Targets.Renamed) = (OitOwned, OitRenamed);
+            (made.Targets.Owned, made.RecordTaps) = (OitOwned, GlTap.Taps);
             made.Frame.Counted = VulkanFrame.SectionOf(Group(EnumRenderStage.Opaque) + " " + Named(Drawn.Terrain));
         }
 
@@ -205,28 +243,35 @@ internal static partial class VulkanRenderer
         return made;
     }
 
-    private static string Decide(VulkanDevice device)
+    // Every pass is Vulkan's: one left to resting OpenGL would be missing from the picture
+    private static void Decide(VulkanDevice device)
     {
-        Taking[(int)Pass.LiquidDepth] = LiquidDepth;
-        Taking[(int)Pass.Shadows] = Shadows;
-        var culling = OcclusionCulling.Enabled && !device.IndirectCount;
-        Taking[(int)Pass.Opaque] = Opaque && !culling;
-        Taking[(int)Pass.Transparent] = Transparent;
-        Taking[(int)Pass.WaterPlants] = WaterPlants;
+        Array.Fill(Taking, true);
+        Suspended(OcclusionCulling.Enabled && !device.IndirectCount); // OpenGL's culled draws would be missing
         _ = Assert(Taking.Length == 5);
-        return Opaque && culling
-            ? "the opaque pass waits: OcclusionCulling is on, and the device cannot draw with a count the GPU wrote"
-            : "";
+    }
+
+    // Vulkan-only without drawIndirectCount: OcclusionCulling rests (switch kept), the opaque pass draws unculled
+    private static void Suspended(bool suspend)
+    {
+        if (suspend == OcclusionCulling.Suspended || !Assert(!suspend || OnlyOn)) return;
+        OcclusionCulling.Suspended = suspend;
+        if (suspend)
+            _logger?.Notification("Komet: Vulkan-only draws the opaque terrain without OcclusionCulling: the device cannot " +
+                                  "draw with a count the GPU wrote (drawIndirectCount)");
+        _ = Assert(OcclusionCulling.Suspended == suspend);
     }
 
     private static string Unported()
     {
         List<string>? missing = null; // made only when one is missing: asked every frame
         for (var i = 0; i < Math.Min(Programs.Length, Ports.Length); i++)
-            if (Needed(i, Taking) && Built[i] > 0 && Ports[i] is null && Porting[i] is null) // not still being made
+            if (Needed(i, Taking) && Built[i] > 0 && Ports[i] is null && Porting[i] is null)
                 (missing ??= []).Add(Programs[i].Name);
         _ = Assert(Ports.Length == Programs.Length);
-        return missing is null ? "" : $"no SPIR-V port of {string.Join(", ", missing)}, OpenGL draws those (see the log)";
+        return missing is null
+            ? ""
+            : $"no SPIR-V port of {string.Join(", ", missing)}: Vulkan leaves them out of the picture (see the log)";
     }
 
     private static void Preparing()
@@ -261,57 +306,22 @@ internal static partial class VulkanRenderer
     private const int MaxManagers = 64, MaxPools = 4096;
     private static readonly List<(VAO, bool)> Found = [];
 
-    // The opaque stage's first renderer: the deferred segment's work goes to the GPU before the sky reads what it drew - unless
-    // the scene is on, whose Touch group closes it exactly when OpenGL reads it (the sky is Vulkan's then). The distant shadow
-    // map, redrawn in the far shadow pass just now, is copied again before the opaque terrain samples it.
-    private static void OpaqueBegins() => Guarded(() =>
-    {
-        if (_renderer is not { } renderer) return;
-        if (!SceneOn) renderer.Frame.Close("the opaque stage begins");
-        if (State != Phase.Running || !Distant(renderer)) return;
-        renderer.Frame.Close("the distant shadow map redrawn");
-        using (GlTap.Quietly()) renderer.Copies.Refresh(renderer.Frame.Number);
-    });
-
-    // The opaque terrain's draws test and write Komet's depth (TerrainRenderer.Owned) until its pass is drawn
+    // The far cache's layer is laid in while the opaque terrain draws (FarBegin), past FarRadius at large view distances
     private static void OpaqueDrawing()
     {
-        if (_renderer is { } renderer) renderer.Owning = OwnDepth && Runs(Pass.Opaque);
+        if (FarCaching && OcclusionCulling.RowsEnabled && State == Phase.Running && _renderer is not null && _scene is not null &&
+            FrameSettings.ViewDistance > TerrainRenderer.FarRadius + 64 &&
+            _api?.World?.Player?.Entity?.CameraPos is { } eye && _api.Render is { } render)
+            Guarded(static c => _renderer?.FarBegin(c.Render.CameraMatrixOriginf, c.Render.PerspectiveProjectionMat, c.Eye,
+                _scene.FarReadied), (Render: render, Eye: eye));
         _ = Assert(Taking.Length == 5);
     }
 
-    // The shadow passes' draws and clears test and write Komet's depth too, while the scene judges every OpenGL call beside them
-    // (Frame.Beside): OpenGL's entity shadows drawn beside a signalled segment would otherwise land under Komet's copy of the map
-    // and be lost as it goes back. Each map's stays Komet's until something reads it or the next map's pass takes over.
-    private static void Shadowing()
+    // RenderOpaque's postfix: the far cache's layer is done
+    private static void OpaqueDrawn() => Guarded(static () =>
     {
-        if (_renderer is { } renderer)
-            renderer.Owning = OwnDepth && Runs(Pass.Shadows) && SceneOn;
-        _ = Assert(Taking.Length == 5);
-    }
-
-    private static void Shadowed()
-    {
-        if (_renderer is { } renderer) renderer.Owning = false;
-        _ = Assert(_renderer is null || !_renderer.Owning);
-    }
-
-    // The ordered segment ends before the entities, the transparent entities and the decals draw over the terrain; with the
-    // scene on, Touch closes it where OpenGL draws next instead. Komet's depth goes back first.
-    private static void PassDrawn(MethodBase __originalMethod) => Guarded(PassClosed, __originalMethod);
-
-    private static void PassClosed(MethodBase __originalMethod)
-    {
-        if (__originalMethod?.Name == nameof(ChunkRenderer.RenderOpaque)) _renderer?.Disown();
-        if (!SceneOn && NotNull(__originalMethod) && Assert(State != Phase.Failed || _renderer is null))
-            _renderer?.Frame.Close(__originalMethod.Name switch
-            {
-                nameof(ChunkRenderer.RenderOpaque) => "the opaque terrain drawn",
-                "RenderOIT" => "the transparent terrain drawn",
-                _ => "the water plants drawn"
-            });
-        _ = Assert(!SceneOn || GlTap.Scene);
-    }
+        if (_renderer is { } renderer && _scene is { } scene) renderer.FarEnd(scene.FarLay);
+    });
 
     [UnsafeAccessor(UnsafeAccessorKind.StaticField, Name = "revealTextureId")]
     private static extern ref int Reveal(SystemRenderOITLayers? layers);
@@ -321,21 +331,12 @@ internal static partial class VulkanRenderer
 
     private static (int Reveal, int Accumulation) _oit;
 
-    // TerrainTargets.Owned and Renamed: the transparent pass's reveal texture and accumulation layers, which
-    // SystemRenderOITLayers names in its statics, may be replaced by shared ones - the statics then name those
+    // TerrainTargets.Owned: the OIT reveal texture and accumulation layers named in SystemRenderOITLayers' statics
     private static bool OitOwned(int texture) =>
         Assert(texture > 0) && (texture == Reveal(null) || texture == Accumulation(null));
 
-    private static void OitRenamed(int from, int to)
-    {
-        if (!Assert(from > 0 && to > 0)) return;
-        if (Reveal(null) == from) Reveal(null) = to;
-        if (Accumulation(null) == from) Accumulation(null) = to;
-        _oit = (Reveal(null), Accumulation(null));
-    }
-
-    // Right after the engine's BeforeOIT (order 0), which attaches its reveal texture and accumulation layers to the
-    // transparent pass's framebuffer, anew after a resize: new ones are asked for again
+    // Right after the engine's BeforeOIT (order 0), which attaches reveal and accumulation to the transparent
+    // framebuffer (anew after a resize): new ones are asked for again
     private static void OitBegins()
     {
         if (!Taking[(int)Pass.Transparent] || _renderer is not { } renderer) return;
@@ -362,26 +363,25 @@ internal static partial class VulkanRenderer
         return !Finished(renderer, __instance);
     }
 
-    // Ends the frame: shows it in the window when there is one (true once shown), else closes its last segment.
-    // Not Guarded: a closure a frame.
+    // True once shown in the window; without one, closes the last segment. Not Guarded: a closure a frame.
     private static bool Finished(TerrainRenderer renderer, OpenTK.Windowing.Desktop.NativeWindow? window)
     {
         if (!NotNull(renderer) || !Assert(window is null || _windowing)) return false;
-        if (_scene is { } scene) scene.Framing = false;
+        if (_scene is { } scene) scene.Framing = SceneOn; // what comes between frames too
         var shown = false;
         try
         {
-            _scene?.FlushEarly(); // kept from the frame's start, and no segment opened since: OpenGL clears before the frame shows
-            if (window is null) renderer.Frame.Close("the frame's end");
+            if (window is null) renderer.Frame.Close("the frame's end", endsFrame: true);
             else shown = renderer.Present(window);
-            if (_scene is { } next) next.Between = SceneOn && LazyHandoff && State == Phase.Running;
-            if (State is Phase.Running or Phase.Waiting)
+            if (renderer.Unshowable is { Length: > 0 } unshowable)
             {
-                using (GlTap.Quietly())
-                    if (_api?.Render is { } render)
-                        Probe(renderer, render.FrameBuffers);
-                if (!MemoryGuard(renderer)) Periodically(renderer);
+                Fail($"Vulkan-only needs Vulkan to show its frames, but {unshowable}: OpenGL draws the world (join the " +
+                     "world again to try once more)");
+                return false;
             }
+
+            if (_scene is { } next) next.Between = SceneOn && State == Phase.Running;
+            if ((State is Phase.Running or Phase.Waiting) && !MemoryGuard(renderer)) Periodically(renderer);
         }
         catch (Exception e) when (e is not OutOfMemoryException)
         {
@@ -400,7 +400,7 @@ internal static partial class VulkanRenderer
         Mark(Drawn.Terrain);
         try // not Guarded: a closure per draw would feed the garbage collector hundreds a frame
         {
-            return renderer.Take(vao, (indices, sizes, count, useSSBOs), SyncOf(pass), Sampler);
+            return renderer.Take(vao, (indices, sizes, count, useSSBOs), Sampler);
         }
         catch (Exception e) when (e is not OutOfMemoryException)
         {
@@ -411,11 +411,10 @@ internal static partial class VulkanRenderer
     }
 
     // The culling buffers are made anew with the backend they run on at the next frame
-    private static void Culling(TerrainRenderer renderer, bool on, bool framing = false)
+    private static void Culling(TerrainRenderer renderer, bool on)
     {
         if (!NotNull(renderer)) return;
         GpuBackends.Current = on ? renderer.Compute : GlBackend.Instance;
-        GpuBackends.Frame = framing ? renderer.Compute : null;
         OcclusionCulling.Drawer = on ? Counted : null;
         OcclusionCulling.Takes = on ? static () => Taken(out _) != Pass.None : null;
         _ = Assert(on == (OcclusionCulling.Drawer is not null));
@@ -460,6 +459,14 @@ internal static partial class VulkanRenderer
     // What Vulkan holds stays, so switching on again needs no pool adopted anew
     private static void Paused(string why)
     {
+        if (Strands(why.Length > 0 ? why : "was switched off"))
+        {
+            Fail("Vulkan-only (lean) cannot hand the world to OpenGL: join it again"); // OpenGL stays tapped and resting
+            return;
+        }
+
+        if (State == Phase.Running && _renderer is { } only) HandBack(only); // once, as it stops
+        Unpushed();
         if (_renderer is { } renderer)
         {
             renderer.Frame.Close("Vulkan switched off");
@@ -467,22 +474,32 @@ internal static partial class VulkanRenderer
             Culling(renderer, false);
         }
 
-        _windowing = false;
-
         Array.Clear(Taking);
         (State, Status) = (_failed ? Phase.Failed : Phase.Off, _failed ? _failure : why);
-        if (!GlTap.Tapped) return;
+        // the record tapped at the start stays while Vulkan is on: what it hears now Vulkan needs later
+        if (!GlTap.Tapped || (OnlyOn && GlTap.Recording && !VulkanCore.Failed)) return;
         GlTap.Untap();
         _watched = false;
         _ = Assert(!GlTap.Tapped);
     }
 
+    // Set by a running renderer, cleared on any exit: GL draws (GlTap.Resting), culls, draws indirectly, owns the
+    // window
+    private static void Unpushed()
+    {
+        (_windowing, OcclusionCulling.Suspended, IndirectDraw.Plain, GlTap.Resting) = (false, false, false, false);
+        if (_scene is { } scene) scene.Framing = false;
+        _ = Assert(!GlTap.Resting) && Assert(!IndirectDraw.Plain);
+    }
+
     private static void Fail(string why)
     {
+        var stranded = Strands(NotNull(why) ? $"failed ({why})" : "failed");
         (_failed, _failure) = (true, NotNull(why) ? why : "?");
-        _windowing = false;
+        Unpushed();
         (State, Status) = (Phase.Failed, _failure);
         Array.Clear(Taking);
+        if (!stranded && _renderer is { } only) HandBack(only);
         try
         {
             Release();
@@ -496,43 +513,33 @@ internal static partial class VulkanRenderer
             _renderer = null; // abandoned: OpenGL keeps every name it had
         }
 
-        GlTap.Untap();
+        if (!stranded) GlTap.Untap(); // stranded: tapped and resting until the world is left
         _watched = false;
         _logger?.Warning("Komet: {0}", _failure);
         _ = Assert(_failed);
     }
 
-    // Komet's distant shadow cascade redraws its map with OpenGL, nothing the engine reports: a new map makes the copy stale.
-    // The map flips in the far shadow pass, after Before's refresh: true when the copy is to be refreshed again before the
-    // opaque terrain samples it
-    private static bool Distant(TerrainRenderer renderer)
+    // Komet's distant shadow cascade redraws its map: Vulkan drew it (no change), else its image is read back on next
+    // use, unless GL rests (drew nothing more)
+    private static void Distant(TerrainRenderer renderer)
     {
         if (!NotNull(renderer) ||
-            !DistantShadows.Published(out var texture, out var version, out _, out var onTexel)) return false;
-        if (version == _distant || !Assert(onTexel.Length == 3)) return false;
+            !DistantShadows.Published(out var texture, out var version, out _, out var onTexel)) return;
+        if (version == _distant || !Assert(onTexel.Length == 3)) return;
         _distant = version;
-        if (renderer.Copies.Written(texture)) return false; // Vulkan drew the map into its copy: the copy is ahead
-        renderer.Copies.Changed(texture);
-        return true;
+        if (!GlTap.Resting) renderer.Images.Changed(texture);
     }
 
     private static void Disposing(VAO __instance)
     {
         if (_renderer is { } renderer && NotNull(__instance) && Assert(__instance.VaoId >= 0))
-            Guarded(() => renderer.Release(__instance));
+            Guarded(static s => s.renderer.Release(s.__instance), (renderer, __instance));
     }
 
     private static void Unframing(FrameBufferRef frameBuffer)
     {
         if (_renderer is { } renderer && NotNull(frameBuffer) && Assert(frameBuffer.FboId >= 0))
-            Guarded(() => renderer.Release(frameBuffer));
-    }
-
-    // With the scene on, GlTap hears glGenerateMipmap itself
-    private static void Mipmapped(int textureId)
-    {
-        if (_renderer is { } renderer && Assert(textureId >= 0) && !renderer.Copies.Trusting)
-            renderer.Copies.Changed(textureId);
+            Guarded(static s => s.renderer.Release(s.frameBuffer), (renderer, frameBuffer));
     }
 
     private static readonly System.Func<int, Samplers.State> Sampler = SamplerObject;
@@ -540,6 +547,7 @@ internal static partial class VulkanRenderer
     private static Samplers.State SamplerObject(int id)
     {
         if (!Assert(id > 0) || !Assert(GlSamplers.Count <= MaxGlSamplers)) return default;
+        if (GlTap.SamplerOf(id) is { } recorded) return recorded; // followed as it changes: no cache
         if (GlSamplers.TryGetValue(id, out var known)) return known;
         GL.GetSamplerParameter(id, SamplerParameterName.TextureMinFilter, out int min);
         GL.GetSamplerParameter(id, SamplerParameterName.TextureMagFilter, out int mag);
@@ -561,6 +569,6 @@ internal static partial class VulkanRenderer
             if (Assert(stage == Own) && Assert(deltaTime >= 0)) work();
         }
 
-        public void Dispose() => _ = Assert(Renderers.Count <= 16) && Assert(RenderRange == 0);
+        public void Dispose() => _ = Assert(Renderers.Count <= 32) && Assert(RenderRange == 0);
     }
 }

@@ -1,15 +1,15 @@
 using System.Collections.Concurrent;
 using System.Text;
 using HarmonyLib;
+using Komet.Core;
 using Vintagestory.API.Datastructures;
 
 namespace Komet.World;
 
-// Every block entity that arrives with a chunk, on the server and the client, is read by TreeAttribute.FromBytes, which reads each
-// attribute's key as a new string (BinaryReader.ReadString) only to intern it at once: a hundred megabytes of garbage in the first
-// minute of a join, all of it copies of a few hundred names. The rewrite reads the key's bytes onto the stack and looks the name up
-// among those seen before; a new one becomes a string and is interned as the engine interns it. BinaryReader.ReadString reads the
-// same 7-bit length and UTF-8 bytes (the engine's readers all use the default encoding).
+// TreeAttribute.FromBytes reads each key as a new string only to intern it (~100 MB in a join's first minute). Decoded
+// on the stack and looked up among seen names instead; same format as BinaryReader.ReadString. GetString interns every
+// read value (EntityPlayer.PlayerUID: dozens a frame, 3 % of the main thread at a join): the same string object answers
+// from a per-thread cache by identity instead, exact as interning never changes its answer.
 internal static class TreeKeys
 {
     private const int MaxInstructions = 256, MaxKey = 256, MaxKeys = 1 << 16;
@@ -19,6 +19,10 @@ internal static class TreeKeys
 
     public static bool Enabled { get; set; } = true;
     public static bool Rewritten { get; private set; }
+    public static bool Reads { get; private set; } // GetString's intern cached
+
+    private const int Slots = 64;
+    [ThreadStatic] private static (string? From, string To)[]? _interned;
 
     public static void Install(Harmony harmony)
     {
@@ -26,6 +30,31 @@ internal static class TreeKeys
         Rewritten = false;
         if (!NotNull(harmony) || !NotNull(from)) return;
         _ = NotNull(harmony.Patch(from, transpiler: new HarmonyMethod(Rewrite)));
+        var get = AccessTools.Method(typeof(TreeAttribute), nameof(TreeAttribute.GetString), [typeof(string), typeof(string)]);
+        Reads = false;
+        if (get is not null) _ = NotNull(harmony.Patch(get, transpiler: new HarmonyMethod(RewriteReads)));
+    }
+
+    // The one string.Intern of GetString, else the engine's IL
+    internal static List<CodeInstruction> RewriteReads(IEnumerable<CodeInstruction> instructions)
+    {
+        var (intern, mine) = (AccessTools.Method(typeof(string), nameof(string.Intern), [typeof(string)]),
+            AccessTools.Method(typeof(TreeKeys), nameof(Interned)));
+        if (!Assert(Il.Take(instructions, MaxInstructions, out var code)) || !NotNull(intern) || !NotNull(mine)) return code;
+        Reads = Il.SubstituteSingle(code, c => c.Calls(intern), mine);
+        return code;
+    }
+
+    // string.Intern(text), the last answers for these very objects kept per thread
+    internal static string Interned(string text)
+    {
+        if (!Enabled) return string.Intern(text);
+        if (!NotNull(text)) return text;
+        var cache = _interned ??= new (string?, string)[Slots];
+        ref var slot = ref cache[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(text) & (Slots - 1)];
+        if (ReferenceEquals(slot.From, text)) return slot.To;
+        slot = (text, string.Intern(text));
+        return Assert(slot.To.Length == text.Length) ? slot.To : text;
     }
 
     // Exactly one ReadString, the one string.Intern takes, else the engine's IL
@@ -40,7 +69,7 @@ internal static class TreeKeys
         return code;
     }
 
-    // Stands in for reader.ReadString(); string.Intern then finds it interned
+    // Replaces reader.ReadString(); string.Intern then finds it interned
     internal static string Key(BinaryReader reader)
     {
         if (!Enabled) return reader.ReadString();

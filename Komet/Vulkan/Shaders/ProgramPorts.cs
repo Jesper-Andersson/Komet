@@ -4,7 +4,7 @@ using Vintagestory.Client.NoObf;
 
 namespace Komet.Vulkan;
 
-// The stages are read back from the driver as the engine (or a mod) compiled them
+// Stages read back from the driver; while GlTap records (VulkanRenderer.OnlyOn), from what the engine gave the driver
 internal static class ProgramPorts
 {
     private const int MaxShaders = 8, MaxAttributes = 32, MaxBlocks = 32;
@@ -13,7 +13,7 @@ internal static class ProgramPorts
     private static readonly Dictionary<int, string> Names = [];
     private static readonly System.Reflection.FieldInfo? Registered = AccessTools.Field(typeof(ShaderRegistry), "shaderPrograms");
 
-    // What the driver holds of a program: read on the engine's thread (OpenGL's), never written after, so a builder ports it
+    // Read on the engine's thread and never written after, so a builder may port it
     public sealed record Stages(string Named, string Vertex, string Fragment, IReadOnlyDictionary<string, int> Bound);
 
     public static GlslPort.Ported? Port(int program, string name, out string error, IReadOnlySet<string>? hot = null,
@@ -24,8 +24,7 @@ internal static class ProgramPorts
         return source is null ? null : Made(source, out error, hot, settled);
     }
 
-    // Started on the engine's thread, which reads the stages back; shaderc and the cache run on a builder. hot and the source
-    // are the build's own: nothing else writes them.
+    // Stages read back here; shaderc and cache on a builder, which owns hot and the source
     public static Build<GlslPort.Ported>? Started(int program, string name, out string error, IReadOnlySet<string>? hot = null,
         bool settled = false)
     {
@@ -36,10 +35,22 @@ internal static class ProgramPorts
         return new Build<GlslPort.Ported>(Builds.Kind.Port, () => (Made(source, out var why, copied, settled), why));
     }
 
+    // Chunk programs' vertex stages read packed face data while the pools are packed
     public static Stages? Read(int program, string name, out string error)
+    {
+        var stages = Sources(program, name, out error);
+        _ = Assert(stages is not null || error.Length > 0) && Assert(program > 0);
+        if (stages is null || !CompactFaces.Active || !CompactFaces.Reads(name)) return stages;
+        if (CompactFaces.Patch(stages.Vertex) is { } patched) return stages with { Vertex = patched };
+        error = "the face data block of a chunk program is not the engine's: its pools cannot be read packed";
+        return null;
+    }
+
+    private static Stages? Sources(int program, string name, out string error)
     {
         error = "";
         if (!Assert(program > 0) || !Assert(name.Length > 0)) return null;
+        if (GlTap.LinkedOf(program) is { } linked) return Recorded(linked, name, out error);
         GL.GetProgram(program, GetProgramParameterName.AttachedShaders, out int count);
         var shaders = new int[Math.Clamp(count, 0, MaxShaders)];
         if (shaders.Length > 0) GL.GetAttachedShaders(program, shaders.Length, out _, shaders);
@@ -65,8 +76,17 @@ internal static class ProgramPorts
         return new Stages(name, vertex, fragment, Attributes(program));
     }
 
-    // Without hot uniforms, the ones the scene settled on for these sources at an earlier start; settled: hot are the ones the
-    // scene settled on, kept for the next. Any thread: ShaderCache and Shaderc guard what they share.
+    // Locations from glBindAttribLocation: inputs with neither these nor a layout location have no port
+    private static Stages? Recorded(GlTap.Linked linked, string name, out string error)
+    {
+        error = "";
+        if (!NotNull(linked) || !Assert(name.Length > 0)) return null;
+        if (linked.Other != 0) error = $"a stage Vulkan draws no port of (0x{linked.Other:X})";
+        else if (linked.Vertex.Length == 0 || linked.Fragment.Length == 0) error = "no vertex or fragment source";
+        return error.Length == 0 ? new Stages(name, linked.Vertex, linked.Fragment, linked.Attributes) : null;
+    }
+
+    // No hot: what the scene settled on earlier for these sources; settled: hot is kept for the next start. Any thread.
     public static GlslPort.Ported? Made(Stages source, out string error, IReadOnlySet<string>? hot = null, bool settled = false)
     {
         error = "";
@@ -117,8 +137,7 @@ internal static class ProgramPorts
         return found;
     }
 
-    // The binding point OpenGL reads each of the port's blocks from now (glUniformBlockBinding may change it), -1 for one the
-    // program does not use
+    // Current binding per block (glUniformBlockBinding may change it), -1 if unused
     public static int[] Points(int program, GlslPort.Ported ported)
     {
         if (!Assert(program > 0) || !NotNull(ported)) return [];
@@ -138,6 +157,12 @@ internal static class ProgramPorts
                 continue;
             }
 
+            if (GlTap.BlockPointOf(program, block.Name, block.GlBinding) is { } recorded)
+            {
+                points[i] = recorded;
+                continue;
+            }
+
             var uniform = GL.GetUniformBlockIndex(program, block.Name);
             points[i] = -1;
             if (uniform < 0) continue;
@@ -148,7 +173,7 @@ internal static class ProgramPorts
         return points;
     }
 
-    // The engine's name for the program (its pass name), else its number; asked of the registry once per program
+    // The engine's pass name, else the number; asked of the registry once per program
     public static string Name(int program)
     {
         if (program <= 0) return "no program";
@@ -161,7 +186,19 @@ internal static class ProgramPorts
         return Names.TryAdd(program, name) ? name : Names[program];
     }
 
-    // A program deleted: its name may come back for another
+    // Every program the registry holds linked now (id, pass name): what was linked before Vulkan-only began
+    public static (int Id, string Name)[] Linked()
+    {
+        var programs = Registered?.GetValue(null) as ShaderProgram[] ?? [];
+        if (!Assert(programs.Length < 1 << 16)) return [];
+        List<(int, string)> linked = [];
+        for (var i = 0; i < Math.Min(programs.Length, 1 << 16); i++)
+            if (programs[i] is { ProgramId: > 0, PassName: { Length: > 0 } pass } known)
+                linked.Add((known.ProgramId, pass));
+        return [.. linked];
+    }
+
+    // Its name may come back for another
     public static void Forget(int program)
     {
         if (Assert(program > 0)) _ = Names.Remove(program);

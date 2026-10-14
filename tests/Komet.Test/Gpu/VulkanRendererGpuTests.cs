@@ -1,3 +1,4 @@
+using Komet.Rendering;
 using Komet.Vulkan;
 using OpenTK.Graphics.OpenGL;
 
@@ -42,7 +43,7 @@ public sealed class VulkanRendererGpuTests
     public void TheProgramsTheDriverHoldsArePortedOncePerBuildOfAPassSwitchedOn()
     {
         GameInstall.RequireAssets();
-        using var window = OcclusionGpuTests.Context();
+        using var window = GlContext.Context();
         if (window is null) Assert.Ignore("no OpenGL 4.6 context here");
         if (!Shaderc.Load()) Assert.Ignore("libshaderc is not installed");
         // in the renderer's order: the liquid depth, the shadow map, the two opaque, the two transparent programs
@@ -63,10 +64,7 @@ public sealed class VulkanRendererGpuTests
                     Is.EqualTo(VulkanRenderer.Pass.WaterPlants), "after the transparent pass it draws the water plants");
                 Assert.That(VulkanRenderer.PassOf(programs[3]!.ProgramId, EnumRenderStage.AfterOIT),
                     Is.EqualTo(VulkanRenderer.Pass.None), "only the opaque program draws them");
-                Assert.That(VulkanRenderer.SyncOf(VulkanRenderer.Pass.WaterPlants), Is.EqualTo(SegmentSync.Ordered));
                 Assert.That(VulkanRenderer.PassOf(opaque + 1000, EnumRenderStage.Opaque), Is.EqualTo(VulkanRenderer.Pass.None));
-                Assert.That(VulkanRenderer.SyncOf(VulkanRenderer.Pass.Opaque), Is.EqualTo(SegmentSync.Ordered));
-                Assert.That(VulkanRenderer.SyncOf(VulkanRenderer.Pass.Shadows), Is.EqualTo(SegmentSync.Deferred));
             });
             Updated(programs, [true, true, true, true, true]);
             Assert.That(Port("chunkopaque"), Is.SameAs(first), "the same build: no new port");
@@ -78,7 +76,7 @@ public sealed class VulkanRendererGpuTests
             VulkanRenderer.Update(programs, null, [true, true, false, true, true]);
             Assert.That(Builds.Started, Is.EqualTo(started + 1), "ported on a builder");
             Assert.That(VulkanRenderer.PassOf(programs[2]!.ProgramId, EnumRenderStage.Opaque),
-                Is.EqualTo(VulkanRenderer.Pass.None), "OpenGL's until the port is done");
+                Is.EqualTo(VulkanRenderer.Pass.Opaque), "awaited: a pass without its port would be missing from the picture");
             Updated(programs, [true, true, false, true, true]);
             Assert.That(Port("chunkopaque"), Is.Not.SameAs(first).And.Not.Null,
                 "the engine rebuilt it, and the water plants need it without the opaque pass");

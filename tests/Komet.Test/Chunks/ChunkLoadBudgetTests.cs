@@ -1,3 +1,6 @@
+using Komet.Chunks;
+using Komet.Core;
+
 namespace Komet.Test.Chunks;
 
 // The engine's own task loop, rewritten, on a ClientMain without a game: the tasks are the engine's kinds (a ProcessPacketTask, a

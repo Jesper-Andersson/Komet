@@ -1,3 +1,8 @@
+using Komet.Core;
+using Komet.Hud;
+using Komet.Rendering;
+using Komet.Shapes;
+using Komet.Tessellation;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -46,14 +51,14 @@ public sealed class HudCornerTests
                 """{ "NearFirst": false, "PoolFragments": 0, "EntityTessBudget": 7, "UploadCap": 99, "CullGrid": true }""")
             !;
         var logger = new CapturingLogger();
-        settings.ApplyKnobs(logger);
+        settings.Knobs.Apply(logger, HudSettings.FileName);
         var file = JObject.Parse(JsonConvert.SerializeObject(settings));
         Assert.Multiple(() =>
         {
-            Assert.That((settings.Knob(schedule), settings.Knob(pool), settings.Knob(budget)), Is.EqualTo((0, 0, 7)));
+            Assert.That((settings.Knobs.Knob(schedule), settings.Knobs.Knob(pool), settings.Knobs.Knob(budget)), Is.EqualTo((0, 0, 7)));
             Assert.That((TessSchedule.Enabled, MeshPool.Enabled, EntityTessBudget.Millis),
                 Is.EqualTo((false, false, 7)), "applied");
-            Assert.That(settings.Knob(Knobs.Find("UploadCap")), Is.EqualTo(_defaults[Knobs.Find("UploadCap")]));
+            Assert.That(settings.Knobs.Knob(Knobs.Find("UploadCap")), Is.EqualTo(_defaults[Knobs.Find("UploadCap")]));
             Assert.That(logger.Lines, Has.Count.EqualTo(1).And.Some.Contains("UploadCap"));
             Assert.That(file["NearFirst"]?.Type, Is.EqualTo(JTokenType.Boolean));
             Assert.That(file["PoolFragments"]?.Type, Is.EqualTo(JTokenType.Boolean));
@@ -71,10 +76,10 @@ public sealed class HudCornerTests
             !;
         var (logger, fresh) = (new CapturingLogger(), new HudSettings());
         int[] knobs = [Knobs.Find("UploadCap"), Knobs.Find("TessSchedule"), Knobs.Find("EntityTessBudget")];
-        settings.ApplyKnobs(logger);
+        settings.Knobs.Apply(logger, HudSettings.FileName);
         Assert.Multiple(() =>
         {
-            Assert.That(knobs.Select(settings.Knob), Is.EqualTo(knobs.Select(fresh.Knob)), "the defaults apply");
+            Assert.That(knobs.Select(settings.Knobs.Knob), Is.EqualTo(knobs.Select(fresh.Knobs.Knob)), "the defaults apply");
             Assert.That(logger.Lines, Has.Count.EqualTo(1).And.Some.Contains("UploadCap").And.Some
                 .Contains("NearFirst")
                 .And.Some.Contains("EntityTessBudget"));

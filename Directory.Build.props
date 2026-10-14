@@ -21,7 +21,7 @@
 
     <!-- The shipped assembly embeds /_/-relative source paths in a release ([CallerFilePath] in Contracts, the pdb); Debug and the tests
          keep absolute ones for the debugger -->
-    <PropertyGroup Condition="'$(Configuration)' == 'Release' and '$(MSBuildProjectName)' == 'Komet'">
+    <PropertyGroup Condition="'$(Configuration)' == 'Release' and ('$(MSBuildProjectName)' == 'Komet' or '$(MSBuildProjectName)' == 'Komet.Bench')">
         <PathMap>$(MSBuildThisFileDirectory)=/_/</PathMap>
     </PropertyGroup>
 
@@ -30,21 +30,6 @@
         <Using Include="Vintagestory.API.Client"/>
         <Using Include="Vintagestory.API.Common"/>
         <Using Include="Vintagestory.API.Config"/>
-    </ItemGroup>
-
-    <!-- The mod's own namespaces, in the mod and its tests; Komet.Testing stays independent of the mod -->
-    <ItemGroup Condition="'$(MSBuildProjectName)' == 'Komet' or '$(MSBuildProjectName)' == 'Komet.Test'">
-        <Using Include="Komet.Core"/>
-        <Using Include="Komet.Rendering"/>
-        <Using Include="Komet.Chunks"/>
-        <Using Include="Komet.Tessellation"/>
-        <Using Include="Komet.Shapes"/>
-        <Using Include="Komet.World"/>
-        <Using Include="Komet.Hud"/>
-        <Using Include="Komet.Diagnostics"/>
-        <Using Include="Komet.Bench"/>
-        <Using Include="Komet.Options"/>
-        <Using Include="Komet.Api"/>
     </ItemGroup>
 
     <ItemGroup>

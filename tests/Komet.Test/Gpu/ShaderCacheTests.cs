@@ -69,6 +69,34 @@ public sealed class ShaderCacheTests
     private static string Sources() => ShaderCache.Sources(Vertex, Fragment, Attributes);
 
     [Test]
+    public void APipelineRecipeIsReadBackAtTheNextStartOnce()
+    {
+        var recipe = new ShaderCache.Recipe("v|4", "37/126", 3, [37], 126, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            [0, 0, 3, 0x1406, 0, 0, 12, 0, 0]);
+        ShaderCache.Remember(Sources(), recipe);
+        ShaderCache.Remember(Sources(), recipe with { Colors = [37] }); // the same pipeline again
+        Flush();
+        ShaderCache.Open(_folder); // the next start
+        var read = ShaderCache.Recipes(Sources());
+        Assert.That(read, Has.Length.EqualTo(1));
+        Assert.That(read[0].Inputs, Is.EqualTo("v|4"));
+        Assert.That(read[0].Fixed, Is.EqualTo(recipe.Fixed));
+        Assert.That(read[0].Attributes, Is.EqualTo(recipe.Attributes));
+        Assert.That(ShaderCache.Recipes("another"), Is.Empty);
+    }
+
+    [Test]
+    public void ARecipeKeepsTheStencilAndReadsOneOfAnEarlierBuildWithout()
+    {
+        var state = new GlTap.Fixed(32, 0x4F, 0, 0, new GlTap.BlendState(1, 2, 3, 4, 5, 6, 7, 8), 0x2493);
+        TerrainPools.Attribute[] attributes = [new(0, 0, 3, 0x1406, false, false) { Stride = 12 }];
+        var recipe = PipelineRecipes.Packed(("v|4", "37/130", 0), state, attributes, new TerrainPipeline.Target([37], 130));
+        Assert.That(PipelineRecipes.Unpacked(recipe)?.State, Is.EqualTo(state));
+        var earlier = recipe with { Fixed = recipe.Fixed[..12] }; // twelve words: no stencil
+        Assert.That(PipelineRecipes.Unpacked(earlier)?.State, Is.EqualTo(state with { Stencil = 0 }));
+    }
+
+    [Test]
     public void APortReadBackIsThePortWrittenUnderTheNameAskedFor()
     {
         var ported = Port(Hot);
@@ -132,7 +160,7 @@ public sealed class ShaderCacheTests
     [Test]
     public void TheDeviceLeavesItsPipelineCacheForTheNextOne()
     {
-        using var window = OcclusionGpuTests.Context();
+        using var window = GlContext.Context();
         if (window is null) Assert.Ignore("no OpenGL 4.6 context here");
         using (var rig = GpuRig.Start(GpuRig.Vulkan, out var why))
         {

@@ -1,4 +1,7 @@
 using System.Text;
+using Komet.Core;
+using Komet.Diagnostics;
+using Komet.Hud;
 
 namespace Komet.Test.Hud;
 

@@ -1,3 +1,7 @@
+using Komet.Api;
+using Komet.Core;
+using Komet.Hud;
+using Komet.Options;
 using Newtonsoft.Json.Linq;
 
 namespace Komet.Test.Options;
@@ -110,17 +114,56 @@ public sealed class OptionsTests
         Assert.That(EngineOptions.Readable(name), Is.EqualTo(shown));
     }
 
+    private static readonly string[] Areas = ["komet-render", "komet-chunks", "komet-misc", "komet-vulkan"];
+
+    // The Overview first, the areas, then HUD and tools; every knob page is one of the areas; "advanced" adds rows, no pages
     [Test]
     public void KometHasItsHudPagesAndOnePagePerKnobPage()
     {
-        var pages = new KometPages(new HudSettings(), () => { }, _ => { }, () => { }, () => { }, () => { }).Build();
+        var basic = new KometPages(new HudSettings(), () => { }, _ => { }, () => { }, () => { }, () => { }).Build();
+        var pages = new KometPages(new HudSettings { ShowAdvanced = true }, () => { }, _ => { }, () => { }, () => { }, () => { })
+            .Build();
         var knobPages = Knobs.BuiltIn.ToArray().Select(k => k.Page).OfType<string>().Distinct().Select(p => "komet-" + p);
         var rows = pages.SelectMany(p => Enumerable.Range(0, p.Count).Select(i => p[i].Label)).ToArray();
+        string[] ids = [KometPages.Overview, .. Areas, KometPages.Hud, KometPages.Tools];
         Assert.Multiple(() =>
         {
-            Assert.That(pages.Select(p => p.Id), Is.EqualTo(new[] { KometPages.Hud, KometPages.Tools }.Concat(knobPages)));
-            Assert.That(pages, Has.All.Matches<OptionPage>(p => p.Count is > 0 and <= OptionPage.MaxOptions));
+            Assert.That(basic.Select(p => p.Id), Is.EqualTo(ids));
+            Assert.That(pages.Select(p => p.Id), Is.EqualTo(ids));
+            Assert.That(knobPages, Is.SubsetOf(Areas));
+            Assert.That(pages, Has.All.Matches<OptionPage>(p => p.Count is > 0 and <= OptionPage.MaxRows));
+            Assert.That(pages.Sum(p => p.Count), Is.GreaterThan(basic.Sum(p => p.Count) + 60), "advanced lists every exact switch");
             Assert.That(rows, Does.Not.Contain(""), "every row has a label");
+        });
+    }
+
+    // Every built-in knob with a page is a row somewhere once "advanced" is on: nothing is settable only in komet.json
+    [Test]
+    public void AdvancedShowsEveryKnob()
+    {
+        GameLang.EnsureLoaded();
+        var pages = new KometPages(new HudSettings { ShowAdvanced = true }, () => { }, _ => { }, () => { }, () => { }, () => { })
+            .Build();
+        var labels = pages.SelectMany(p => Enumerable.Range(0, p.Count).Select(i => p[i].Label)).ToHashSet();
+        var missing = Knobs.BuiltIn.ToArray().Where(k => k.Page is not null && !labels.Contains(KometPages.T(k.Label)))
+            .Select(k => k.Key).ToArray();
+        Assert.That(missing, Is.Empty);
+    }
+
+    // What a preset or this computer sets is a trade-off with a row of its own, never one of the Overview's preferences; a preset
+    // value lies in the knob's range
+    [Test]
+    public void ThePresetsAndTheComputerSetOnlyWeighedKnobs()
+    {
+        var knobs = Knobs.BuiltIn.ToArray();
+        var set = knobs.Where(k => k.Presets is not null || k.Suggest is not null).ToArray();
+        Assert.Multiple(() =>
+        {
+            Assert.That(set, Is.Not.Empty);
+            Assert.That(set.Where(k => !k.Weighed || k.Page is null).Select(k => k.Key), Is.Empty);
+            Assert.That(knobs.Where(k => k.General && k.Weighed).Select(k => k.Key), Is.Empty);
+            Assert.That(knobs.Where(k => k.Presets is { } p && !new[] { p.Quality, p.Balanced, p.Speed }.All(v => v >= k.Min && v <= k.Max))
+                .Select(k => k.Key), Is.Empty);
         });
     }
 
@@ -186,26 +229,21 @@ public sealed class OptionsTests
         Assert.That(page.Count, Is.EqualTo(OptionPage.MaxOptions));
     }
 
-    // Each mode reads back as itself; one switch turned off singly drops the mode to the one it still covers
-    [TestCase(0, null, 0)]
-    [TestCase(1, null, 1)]
-    [TestCase(2, null, 2)]
-    [TestCase(3, null, 3)]
-    [TestCase(3, "VulkanPresent", 2)]
-    [TestCase(3, "VulkanSky", 1)]
-    [TestCase(2, "VulkanOpaque", 0)]
-    [TestCase(1, "VulkanShaderCache", 1)]
-    public void TheVulkanModeSetsAndReadsTheSwitches(int mode, string? off, int expected)
+    // Two choices, OpenGL and Vulkan: the mode is VulkanOnly alone, every other knob is left as it is
+    [TestCase(0)]
+    [TestCase(1)]
+    public void TheVulkanModeIsTheVulkanOnlySwitch(int mode)
     {
-        var values = new int[Knobs.Count];
+        var values = Enumerable.Repeat(7, Knobs.Count).ToArray();
         VulkanMode.Set(mode, (knob, value) => values[knob] = value);
-        if (off is not null) values[Knobs.Find(off)] = 0;
+        var only = Knobs.Find("VulkanOnly");
         Assert.Multiple(() =>
         {
-            Assert.That(VulkanMode.Of(knob => values[knob]), Is.EqualTo(expected));
-            Assert.That(values[Knobs.Find("VulkanShaderCache")], Is.EqualTo(off == "VulkanShaderCache" ? 0 : 1),
-                "the shader cache is on in every mode");
-            Assert.That(values[Knobs.Find("VulkanCore")], Is.EqualTo(mode > 0 ? 1 : 0));
+            Assert.That(VulkanMode.Of(knob => values[knob]), Is.EqualTo(mode));
+            Assert.That(values[only], Is.EqualTo(mode));
+            Assert.That(values.Where((_, i) => i != only), Is.All.EqualTo(7), "no other knob written");
+            Assert.That(string.Join(" ", VulkanMode.Choices.Select(c => c.Name)), Is.EqualTo("opengl vulkan"));
+            Assert.That(VulkanMode.Choice(mode), Is.EqualTo(mode));
         });
     }
 }

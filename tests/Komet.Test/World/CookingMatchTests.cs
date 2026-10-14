@@ -1,3 +1,4 @@
+using Komet.World;
 using Newtonsoft.Json.Linq;
 using Vintagestory.GameContent;
 
@@ -63,7 +64,12 @@ public sealed class CookingMatchTests
         CookingMatch.Install(harmony, new QuietLogger());
         _ = Allocated(recipes, inputs); // the thread's lists
         var komet = Allocated(recipes, inputs);
-        Assert.That(komet, Is.LessThan(engine / 4), $"engine {engine} bytes, Komet {komet}");
+        var kept = typeof(CookingMatch).GetField("_stacks", BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
+        Assert.Multiple(() =>
+        {
+            Assert.That(komet, Is.LessThan(engine / 4), $"engine {engine} bytes, Komet {komet}");
+            Assert.That(kept, Is.Empty, "the thread's list keeps the stacks, and with them their world"); // the main thread outlives it
+        });
     }
 
     private static long Allocated(CookingRecipe[] recipes, ItemStack?[][] inputs)

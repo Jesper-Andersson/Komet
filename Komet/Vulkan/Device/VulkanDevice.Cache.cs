@@ -1,7 +1,6 @@
 namespace Komet.Vulkan;
 
-// Kept across starts (ShaderCache). Data from another driver or GPU is not handed over: its header
-// (VkPipelineCacheHeaderVersionOne) must name this vendor, device and pipelineCacheUUID.
+// Kept across starts (ShaderCache). VkPipelineCacheHeaderVersionOne must match vendor, device and pipelineCacheUUID.
 internal sealed unsafe partial class VulkanDevice
 {
     private const int HeaderBytes = 32, HeaderVersionOne = 1;
@@ -15,7 +14,7 @@ internal sealed unsafe partial class VulkanDevice
     {
         if (!Assert(properties != null) || !Assert(Vk.CacheUuidOffset + UuidBytes <= Vk.PropertiesBytes)) return;
         (_vendor, _model) = (*(uint*)(properties + Vk.VendorOffset), *(uint*)(properties + Vk.ModelOffset));
-        // a bool that is no 0 or 1 says the offsets are wrong
+        // a bool that is not 0 or 1 says the offsets are wrong
         var (both, period) = (*(uint*)(properties + Vk.TimestampsOffset), *(float*)(properties + Vk.TimestampPeriodOffset));
         TimestampPeriod = both == 1 && float.IsFinite(period) && period is > 0 and < 1e4f ? period : 0;
         new ReadOnlySpan<byte>(properties + Vk.CacheUuidOffset, UuidBytes).CopyTo(_cacheUuid);
@@ -53,10 +52,9 @@ internal sealed unsafe partial class VulkanDevice
         }
     }
 
-    // Written while the game runs too, off the engine's thread, once the pipelines asked for are made (PipelineSet), so a
-    // crash keeps what was compiled. Reading the cache's data may run beside pipeline creation, as the cache was made
-    // without the externally synchronized flag. While one write is queued or runs (_keeping is 1) further asks fold into
-    // it; CloseCache waits for it as for every build.
+    // Also written during play off the engine thread once requested pipelines exist (PipelineSet), so a crash keeps
+    // them. Reads may run beside pipeline creation (cache not externally synchronized). While a write is queued or
+    // running (_keeping 1) asks fold into it; CloseCache waits for it.
     public void KeepCache()
     {
         if (PipelineCache == 0 || !ShaderCache.Active || !Assert(_device != IntPtr.Zero)) return;

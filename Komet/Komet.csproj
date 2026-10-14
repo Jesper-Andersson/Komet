@@ -11,6 +11,7 @@
         <Using Include="Vintagestory.API.Client.GuiElement" Static="true"/>
         <Using Include="Komet.Contracts" Static="true"/>
         <InternalsVisibleTo Include="Komet.Test"/>
+        <InternalsVisibleTo Include="Komet.Bench"/>   <!-- the developer benchmark, a mod of its own that never ships -->
     </ItemGroup>
 
     <!-- Supplied by the game at runtime, never copied into the mod output -->
@@ -26,7 +27,7 @@
         <Reference Include="OpenTK.Windowing.GraphicsLibraryFramework" HintPath="$(VsInstall)/Lib/OpenTK.Windowing.GraphicsLibraryFramework.dll" Private="false"/>
         <Reference Include="cairo-sharp" HintPath="$(VsInstall)/Lib/cairo-sharp.dll" Private="false"/>
         <Reference Include="Newtonsoft.Json" HintPath="$(VsInstall)/Lib/Newtonsoft.Json.dll" Private="false"/>
-        <!-- the world map's database, written through raw statements (World/MapSaveScratch) -->
+        <!-- the world map's database, written through raw statements (World/Map/MapSaveScratch) -->
         <Reference Include="Microsoft.Data.Sqlite" HintPath="$(VsInstall)/Lib/Microsoft.Data.Sqlite.dll" Private="false"/>
         <Reference Include="SQLitePCLRaw.core" HintPath="$(VsInstall)/Lib/SQLitePCLRaw.core.dll" Private="false"/>
     </ItemGroup>
@@ -75,7 +76,7 @@
     </ItemGroup>
 
     <!-- `dotnet build -c Release -t:Package` (build.sh) builds, lays the mod out in ../Releases/<modid> (scripts/bench.sh loads it from
-         there) and zips it as <modid>_<version>.zip. An explicit target, not one after every Release build: a Release build of the tests
+         there, beside the benchmark mod from Komet.Bench) and zips it as <modid>_<version>.zip. An explicit target, not one after every Release build: a Release build of the tests
          must neither replace the gate's zip nor delete the folder a bench is running from. -->
     <Target Name="Package" DependsOnTargets="ValidateJson;Build">
         <Error Condition="'$(Configuration)' != 'Release'" Text="Package takes a Release build: dotnet build -c Release -t:Package"/>
@@ -91,7 +92,12 @@
             <ReleaseFile Include="$(TargetPath);$(TargetDir)$(TargetName).pdb;@(Content)"/>
             <ReleaseAsset Include="assets/**"/>
         </ItemGroup>
-        <RemoveDir Directories="$(ReleaseRoot)"/>
+        <!-- only this mod's folder and zips: Komet.Bench lays the developer benchmark out beside it (Releases/kometbench) -->
+        <ItemGroup>
+            <ReleaseZip Include="$(ReleaseRoot)/$(ModId)_*.zip"/>
+        </ItemGroup>
+        <RemoveDir Directories="$(ReleaseDir)"/>
+        <Delete Files="@(ReleaseZip)"/>
         <Copy SourceFiles="@(ReleaseFile)" DestinationFolder="$(ReleaseDir)"/>
         <Copy SourceFiles="@(ReleaseAsset)" DestinationFiles="@(ReleaseAsset->'$(ReleaseDir)/assets/%(RecursiveDir)%(Filename)%(Extension)')"/>
         <ZipDirectory SourceDirectory="$(ReleaseDir)" DestinationFile="$(ReleaseRoot)/$(ModId)_$(ModVersion).zip"/>

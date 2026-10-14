@@ -3,8 +3,7 @@ using Vintagestory.API.MathTools;
 
 namespace Komet.Options;
 
-// Blurred at a quarter size: each pass touches a sixteenth of the frame's pixels, so it runs every frame and the world keeps moving
-// behind it. The last pass turns the picture upright (a framebuffer's rows run bottom up, a GUI texture's top down).
+// Blurred at quarter size (1/16 of the pixels per pass), so it runs every frame; the last pass flips rows upright.
 internal sealed class Backdrop(ICoreClientAPI capi) : IDisposable
 {
     private const int Shrink = 4, Rounds = 2, Buffers = 2, MaxSize = 16384;
@@ -20,14 +19,13 @@ internal sealed class Backdrop(ICoreClientAPI capi) : IDisposable
         }
         """;
 
-    // shrink: four bilinear fetches one texel off the middle of a 4x4 block average all 16; otherwise nine Gaussian taps (sigma 2)
-    // folded into five bilinear fetches along step
+    // shrink: four bilinear fetches average a 4x4 block; else nine Gaussian taps (sigma 2) as five bilinear fetches
     private const string Fragment = """
         #version 330 core
         in vec2 uv;
         out vec4 color;
         uniform sampler2D source;
-        uniform vec2 step;
+        uniform vec2 stride;
         uniform int shrink;
         uniform int flip;
         void main()
@@ -36,14 +34,14 @@ internal sealed class Backdrop(ICoreClientAPI capi) : IDisposable
             vec3 sum;
             if (shrink == 1)
             {
-                sum = (texture(source, at + step * vec2(-1.0, -1.0)).rgb + texture(source, at + step * vec2(1.0, -1.0)).rgb
-                    + texture(source, at + step * vec2(-1.0, 1.0)).rgb + texture(source, at + step * vec2(1.0, 1.0)).rgb) * 0.25;
+                sum = (texture(source, at + stride * vec2(-1.0, -1.0)).rgb + texture(source, at + stride * vec2(1.0, -1.0)).rgb
+                    + texture(source, at + stride * vec2(-1.0, 1.0)).rgb + texture(source, at + stride * vec2(1.0, 1.0)).rgb) * 0.25;
             }
             else
             {
                 sum = texture(source, at).rgb * 0.2270270270;
-                sum += (texture(source, at + step * 1.3846153846).rgb + texture(source, at - step * 1.3846153846).rgb) * 0.3162162162;
-                sum += (texture(source, at + step * 3.2307692308).rgb + texture(source, at - step * 3.2307692308).rgb) * 0.0702702703;
+                sum += (texture(source, at + stride * 1.3846153846).rgb + texture(source, at - stride * 1.3846153846).rgb) * 0.3162162162;
+                sum += (texture(source, at + stride * 3.2307692308).rgb + texture(source, at - stride * 3.2307692308).rgb) * 0.0702702703;
             }
             color = vec4(sum, 1.0);
         }
@@ -67,7 +65,7 @@ internal sealed class Backdrop(ICoreClientAPI capi) : IDisposable
         (_program, _vao) = (0, 0);
     }
 
-    // The shaders and the textures for the frame as it is, ahead of the first opening, whose frame would otherwise pay for them
+    // Ahead of the first opening, whose frame would otherwise pay
     public void Prepare()
     {
         var (width, height) = (capi.Render.FrameWidth, capi.Render.FrameHeight);
@@ -76,8 +74,8 @@ internal sealed class Backdrop(ICoreClientAPI capi) : IDisposable
         if (_size != (width, height)) _ = Targets(width, height);
     }
 
-    // The blurred picture over the frame at depth z, amount (0 to 1) of the way in: the blur that far spread, as opaque as that over
-    // the sharp frame, so it grows in rather than switching on; false when there is none (the plain dim then)
+    // amount 0..1: blur spread and opacity grow together; false when none. Under Vulkan-only GlTap routes it to the
+    // scene.
     public bool Draw(float z, double amount)
     {
         if (!Enabled || _failed || !Finite(z) || !Finite(amount) || amount <= 0) return false;
@@ -165,7 +163,7 @@ internal sealed class Backdrop(ICoreClientAPI capi) : IDisposable
         GL.DeleteShader(fragment);
         GL.GetProgram(_program, GetProgramParameterName.LinkStatus, out int linked);
         if (linked == 0) return Fail("the program did not link: " + GL.GetProgramInfoLog(_program));
-        (_source, _step) = (GL.GetUniformLocation(_program, "source"), GL.GetUniformLocation(_program, "step"));
+        (_source, _step) = (GL.GetUniformLocation(_program, "source"), GL.GetUniformLocation(_program, "stride"));
         (_shrink, _flip) = (GL.GetUniformLocation(_program, "shrink"), GL.GetUniformLocation(_program, "flip"));
         _vao = GL.GenVertexArray();
         return Assert(_source >= 0 && _step >= 0) || Fail("the uniforms are missing");

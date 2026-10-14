@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using Komet.Rendering;
 
 namespace Komet.Test.Rendering;
 

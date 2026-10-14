@@ -1,7 +1,6 @@
 namespace Komet.Vulkan;
 
-// Enough for Komet's compute shaders and the engine's shaders after shaderc: storage and uniform buffers, sampled and storage
-// images.
+// Enough for Komet's compute and the engine's shaders: storage/uniform buffers, sampled and storage images.
 internal static partial class Spirv
 {
     public const uint Magic = 0x07230203;
@@ -35,7 +34,7 @@ internal static partial class Spirv
         foreach (var variable in variables.Bounded(MaxResources))
         {
             if (!Index(variable, ids.Length)) continue;
-            // the descriptor type: through the variable's pointer and any arrays to an image, a sampled image or a block
+            // Through the pointer and any arrays to an image, sampled image or block
             var (storage, type) = (ids[variable].Storage, ids[variable].Of);
             for (var hop = 0; hop < 8 && Index(type, ids.Length) && ids[type].Kind == 0; hop++) type = ids[type].Of;
             if (!Index(type, ids.Length)) continue;

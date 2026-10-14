@@ -1,57 +1,45 @@
 using System.Reflection;
 using HarmonyLib;
+using Komet.Api;
+using Komet.Core;
 using OpenTK.Graphics.OpenGL;
 
 namespace Komet.Rendering;
 
-// A map tile (MultiChunkMapComponent, essentials mod) is a 96x96 texture of 3x3 chunk pieces. FinishSetChunks, a game tick listener
-// on the render thread, writes each new piece by uploading it to a shared 32x32 texture and drawing that into the tile through a
-// framebuffer of its own, binding the primary framebuffer back after every piece: while chunks stream in, up to 200 pieces a tick
-// and a quarter of the render thread (tick-gtentity in the frame profile), each draw a separate render pass for the driver and,
-// under Vulkan, a segment of its own. The draw is a texel-exact copy: the quad's UVs run with its corners (v = 0 at the bottom, as
-// the upload's first row), the target is the piece's 32x32 cell at (32 * dx, 32 * dz), nearest sampling at scale 1, and with every
-// pixel opaque the alpha test passes and standard blending writes the source. The prefix uploads such pieces straight into their cell
-// (glTexSubImage2D, the same format and rows), then makes the mipmaps as the engine does; a piece with any pixel not opaque, or not
-// 32x32, leaves the whole tile to the engine.
-//
-// Skipped against the engine's body: the framebuffer, the draws and the state they leave (primary framebuffer bound, depth test and
-// blending on), which every render stage after the game tick sets for itself.
+// A map tile (MultiChunkMapComponent, essentials) is a 96x96 texture of 3x3 chunk pieces. FinishSetChunks
+// (render-thread tick) uploads each piece to a shared 32x32 texture and draws it into the tile via its own framebuffer,
+// rebinding the primary each time: up to 200 pieces a tick while streaming, a quarter of the render thread
+// (tick-gtentity), each draw its own render pass (and under Vulkan its own segment). The draw is a texel-exact copy
+// (UVs follow corners, v = 0 at the bottom like the upload's first row; cell at (32 * dx, 32 * dz); nearest at scale 1,
+// all-opaque pixels pass alpha test and blend to source). The prefix uploads such pieces straight into their cell
+// (glTexSubImage2D, same format), then mipmaps as the engine; any non-opaque or non-32x32 piece leaves the whole tile
+// to the engine. Skipped: the framebuffer, draws and the state they leave (primary bound, depth test and blending on),
+// which every later render stage sets itself.
 internal static class MapTileUpload
 {
-    // EngineShape of Seams() in Vintage Story 1.22.7
+    // EngineShape of Seams() in 1.22.7
     internal const ulong Fingerprint = 0xAEBCE3250C8B0D68UL;
 
     private const string Component = "Vintagestory.GameContent.MultiChunkMapComponent";
     private const int Side = 32, Cells = 3, Tile = Side * Cells, Opaque = unchecked((int)0xFF000000);
 
-    private static MethodBase?[] _seams = [];
-    private static ILogger? _logger;
-    private static bool _shaped, _foreign;
+    private static readonly SeamGuard Guard = new(nameof(MapTileUpload), PatchKinds.Replacing, [typeof(MapTileUpload)]);
 
     public static bool Enabled { get; set; } = true;
 
-    // Body not verified, essentials mod missing or another mod patches it: the engine draws every piece
-    internal static bool Blocked { get; private set; } = true;
+    // Unverified body, essentials missing or another mod's patch: engine draws every piece
+    internal static bool Blocked => Guard.Blocked;
 
-    internal static bool Matched => _shaped;
+    internal static bool Matched => Guard.Matched;
+
+    internal static Action Recheck { get; } = static () => Guard.Recheck();
 
     public static void Install(Harmony harmony, ILogger? logger, ulong fingerprint = Fingerprint)
     {
-        (_shaped, Blocked, _seams, _logger, _foreign) = (false, true, Seams(), logger, false);
-        if (!NotNull(harmony) || !Assert(_seams.Length == 1) || _seams[0] is null) return;
-        _shaped = EngineShape.Matches(_seams, fingerprint, nameof(MapTileUpload), logger);
-        if (!_shaped) return;
-        _ = NotNull(harmony.Patch(_seams[0], new HarmonyMethod(Finish)));
+        var seams = Guard.Reset(Seams(), logger);
+        if (!NotNull(harmony) || !Assert(seams.Length == 1) || seams[0] is null || !Guard.Match(seams, fingerprint)) return;
+        _ = NotNull(harmony.Patch(seams[0], new HarmonyMethod(Finish)));
         Recheck();
-    }
-
-    // KometModSystem asks again on LevelFinalize, when every other mod has patched
-    internal static void Recheck()
-    {
-        var seamed = _shaped && Assert(_seams.Length == 1);
-        _foreign = EngineShape.Report(_logger, nameof(MapTileUpload), _foreign,
-            seamed && EngineShape.Foreign(_seams, EngineShape.Kinds.Replacing, null, typeof(MapTileUpload)));
-        Blocked = !seamed || _foreign;
     }
 
     internal static MethodBase?[] Seams()
@@ -87,7 +75,6 @@ internal static class MapTileUpload
         return false;
     }
 
-    // Every piece 32x32 and every pixel opaque: the engine's draw copies it texel for texel
     internal static bool Uploadable(int[]?[] pieces)
     {
         for (var i = 0; i < Math.Min(pieces.Length, Cells * Cells); i++)

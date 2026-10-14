@@ -3,14 +3,12 @@ using Vintagestory.API.MathTools;
 
 namespace Komet.World;
 
-// The world generator rotates every structure it places while it is packed (BlockSchematic.TransformWhilePacked), and each block
-// entity of a structure is encoded back to text through Ascii85.Encode: a StringBuilder grown from its first guess, and a new char[5]
-// for every four bytes (EncodeValue). In the world-join traces that was the largest allocation of the integrated server (~150 MB in
-// 50 s of chars and strings), and every MB the server allocates in the client's process triggers the client's collections too.
-// Here the length is worked out first and the string written once, in place (string.Create): the same characters, no other garbage.
+// BlockSchematic.TransformWhilePacked re-encodes placed structures' block entities via Ascii85.Encode (StringBuilder,
+// new char[5] per 4 bytes): the server's top allocation on join (~150 MB in 50 s). Here the length comes first and the
+// string is written once (string.Create).
 internal static class Ascii85Text
 {
-    private const int Group = 4, Digits = 5, Base = 85, First = 33, MaxGroups = int.MaxValue / Digits - 1;
+    private const int Group = 4, Digits = 5, Base = 85, First = 33, MaxGroups = int.MaxValue / Digits - 1, MaxChars = int.MaxValue / 4;
 
     public static bool Enabled { get; set; } = true;
     public static bool Patched { get; private set; }
@@ -21,6 +19,90 @@ internal static class Ascii85Text
         var target = AccessTools.DeclaredMethod(typeof(Ascii85), nameof(Ascii85.Encode), [typeof(byte[])]);
         if (!NotNull(harmony) || !NotNull(target) || !Assert(target.ReturnType == typeof(string))) return;
         Patched = NotNull(harmony.Patch(target, new HarmonyMethod(Encode)));
+        var decode = AccessTools.DeclaredMethod(typeof(Ascii85), nameof(Ascii85.Decode), [typeof(string)]);
+        if (NotNull(decode)) _ = NotNull(harmony.Patch(decode, new HarmonyMethod(Decode)));
+    }
+
+    // Ascii85.Decode grows a MemoryStream and copies it out (structures' block entities as chunks generate: 36 MB in 40 s
+    // of flight); the length is counted first and the bytes are written once. The same exceptions for the same input.
+    private static bool Decode(string? encoded, ref byte[] __result)
+    {
+        if (!Enabled || encoded is null || encoded.Length > int.MaxValue / 4) return true;
+        __result = Bytes(encoded);
+        return !Assert(__result.Length <= encoded.Length);
+    }
+
+    // Measured has checked every character: the digits add up unchecked in 64 bits, a group checked once at its end
+    internal static byte[] Bytes(string encoded)
+    {
+        var bytes = new byte[Measured(encoded)];
+        var (at, count, value) = (0, 0, 0ul);
+        for (var i = 0; i < Math.Min(encoded.Length, MaxChars); i++)
+        {
+            var c = encoded[i];
+            if (c == 'z' && count == 0)
+            {
+                at += Unpacked(bytes.AsSpan(at), 0, 0);
+                continue;
+            }
+
+            value += Powers[count++] * (ulong)(c - First);
+            if (count < Digits) continue;
+            at += Unpacked(bytes.AsSpan(at), Narrowed(value), 0);
+            (count, value) = (0, 0ul);
+        }
+
+        if (count > 1)
+        {
+            for (var j = count; j < Digits; j++) value += (Base - 1) * (ulong)Powers[j];
+            at += Unpacked(bytes.AsSpan(at), Narrowed(value), Digits - count);
+        }
+
+        return Assert(at == bytes.Length) ? bytes : bytes[..at];
+    }
+
+    // How many bytes the text decodes to, with the engine's checks on it
+    private static int Measured(string encoded)
+    {
+        var (length, count) = (0, 0);
+        for (var i = 0; i < Math.Min(encoded.Length, MaxChars); i++)
+        {
+            var c = encoded[i];
+            if (c == 'z' && count == 0)
+            {
+                length += Group;
+                continue;
+            }
+
+            if (c is < '!' or > 'u') throw new FormatException("Invalid character '" + c + "' in Ascii85 block.");
+            if (++count < Digits) continue;
+            length += Group;
+            count = 0;
+        }
+
+        if (count == 1) throw new FormatException("The final Ascii85 block must contain more than one character.");
+        var tail = count > 1 ? count - 1 : 0;
+        return Assert(length >= 0) ? length + tail : 0;
+    }
+
+    // A group's value as the engine's checked sum would have it (at most five digits of 84: below 2^33)
+    private static uint Narrowed(ulong value)
+    {
+        if (value > uint.MaxValue)
+            throw new FormatException("The current group of characters decodes to a value greater than UInt32.MaxValue.");
+        _ = Assert(value < 1ul << 33) && Assert(Powers.Length == Digits);
+        return (uint)value;
+    }
+
+    private static readonly uint[] Powers = [52200625u, 614125u, 7225u, 85u, 1u];
+
+    // The value's bytes, big-endian, fewer by paddingChars
+    private static int Unpacked(Span<byte> into, uint value, int paddingChars)
+    {
+        var count = Group - paddingChars;
+        if (!Assert(paddingChars is >= 0 and < Group) || into.Length < count) return 0;
+        for (var i = 0; i < Math.Min(count, Group); i++) into[i] = (byte)(value >> (24 - 8 * i));
+        return count;
     }
 
     // A null array is left to the engine, which throws
@@ -31,8 +113,7 @@ internal static class Ascii85Text
         return !Assert(__result.Length <= (bytes.Length / Group + 1) * Digits);
     }
 
-    // Ascii85.Encode: each full group of four bytes big-endian as five base-85 digits from '!', or 'z' where all four are zero; a
-    // tail of n bytes padded with zeros and cut to n + 1 digits
+    // Ascii85.Encode: 4 bytes big-endian as 5 digits from '!', 'z' if zero; an n-byte tail zero-padded, n + 1 digits
     internal static string Of(byte[] bytes)
     {
         var (full, tail) = (bytes.Length / Group, bytes.Length % Group);

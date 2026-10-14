@@ -4,17 +4,9 @@ using HarmonyLib;
 
 namespace Komet.World;
 
-// WeatherSystemClient.OnAssetsPacket walks weatherSimByMapRegion on the main thread without the lock its writers take
-// (WeatherSystemBase.getOrCreateWeatherSimForRegion, on whichever thread asks a region's climate: the tesselation threads among
-// them). A region made meanwhile crashed the client as it joined ("Collection was modified"); more tesselation threads made it
-// likelier. The walk now holds that same lock.
-//
-// The same lookup was the most contended lock of a world join: the cloud renderer's thread (FluffyClouds, part of the game) asks for
-// the four regions around its tiles over and over, the tesselation threads and the main thread ask too, and each lookup takes that
-// lock for one dictionary read (trace, 2026-10-08). The client's weather system only ever adds regions, so the regions it handed out
-// are kept in a concurrent table of its own and answered without the lock. A region not in it yet is asked from the engine one
-// thread at a time: the engine makes a missing region outside its lock and stores whichever thread's comes last, so two threads could
-// hand out two regions for one; one at a time, the second finds the first's, and the table never holds another than the engine's.
+// OnAssetsPacket walked weatherSimByMapRegion without its writers' lock, crashing joins ("Collection was modified"); it
+// now holds it. The lookup was also a top contended lock (trace, 2026-10-08), so handed-out regions (the client only
+// adds) are read lock-free from a table; misses go to the engine one at a time, as it builds outside its lock.
 internal static class WeatherLock
 {
     private const string Client = "Vintagestory.GameContent.WeatherSystemClient";
@@ -23,6 +15,7 @@ internal static class WeatherLock
     private const int MaxRegions = 1 << 16;
     private static readonly Lock Making = new();
     private static Regions? _regions; // the regions of the client weather system that asked last
+    private static Type? _client;
 
     public static bool Patched { get; private set; }
 
@@ -36,13 +29,21 @@ internal static class WeatherLock
     {
         Patched = false;
         if (!NotNull(harmony) || !Assert(Client.Length > 0) || Target() is not { } target || !NotNull(target.DeclaringType)) return;
+        _client = target.DeclaringType;
         Patched = NotNull(harmony.Patch(target, new HarmonyMethod(Taking), finalizer: new HarmonyMethod(Leaving)));
         _regions = null;
         Cached = Lookup() is { } lookup && NotNull(harmony.Patch(lookup, new HarmonyMethod(Known), new HarmonyMethod(Kept),
             finalizer: new HarmonyMethod(Made)));
     }
 
-    // WeatherSystemBase.getOrCreateWeatherSimForRegion(long, IMapRegion), which the (int, int) overload and every reader go through
+    // The world closes: its weather system, and with it the world, is not kept
+    public static void Forget()
+    {
+        Volatile.Write(ref _regions, null);
+        _ = Assert(_regions is null) && Assert(MaxRegions > 0);
+    }
+
+    // getOrCreateWeatherSimForRegion(long, IMapRegion), which the (int, int) overload and every reader go through
     internal static MethodInfo? Lookup()
     {
         var method = AccessTools.TypeByName(Base) is { } type
@@ -51,11 +52,11 @@ internal static class WeatherLock
         return method is null || Assert(!method.ReturnType.IsValueType) ? method : null;
     }
 
-    // A region the client's weather system handed out already: answered without its lock. Else the engine's lookup, one at a time.
+    // A region already handed out: answered without the lock. Else the engine's lookup, one at a time.
     private static bool Known(object __instance, long index2d, ref object? __result, out bool __state)
     {
         __state = false;
-        if (!NotNull(__instance) || __instance.GetType().FullName != Client) return true; // the server's removes regions
+        if (!NotNull(__instance) || __instance.GetType() != _client) return true; // the server's removes regions
         var regions = Volatile.Read(ref _regions);
         if (regions is not null && ReferenceEquals(regions.Owner, __instance) && regions.Map.TryGetValue(index2d, out var known))
         {

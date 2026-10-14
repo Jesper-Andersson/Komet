@@ -14,6 +14,7 @@
     <!-- The game API is copied next to the tests: the golden tests run the engine's culling against Komet's -->
     <ItemGroup>
         <ProjectReference Include="$(KometRepo)Komet/Komet.csproj"/>
+        <ProjectReference Include="$(KometRepo)Komet.Bench/Komet.Bench.csproj"/> <!-- the developer benchmark, a mod of its own -->
         <ProjectReference Include="$(KometRepo)tools/Komet.Rules/Komet.Rules.csproj"/>
         <ProjectReference Include="../Komet.Testing/Komet.Testing.csproj"/>
         <Reference Include="VintagestoryAPI" HintPath="$(VsInstall)/VintagestoryAPI.dll"/>

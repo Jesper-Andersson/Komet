@@ -9,22 +9,21 @@ internal static class HudText
     private static readonly Dictionary<(string Prefix, string Name), string> Cache = [];
     private static string? _locale;
 
-    // NaN is a value not measured yet, and an infinite one is a division by an empty window. Neither is a number to show; both print
-    // as nothing, never as "NaN" or "Infinity".
+    // NaN (not measured) and infinity (empty window) print as nothing.
     public static string Format(double value, string format, string none = "") =>
         double.IsFinite(value) && Assert(format.Length is 2 or 3)
             ? value.ToString(format, CultureInfo.InvariantCulture)
             : none;
 
-    // In the game's language: 1.240,5 in German, 1,240.5 in English
     public static string Num(double value, int decimals = 0)
     {
         if (!double.IsFinite(value) || !Assert(decimals is >= 0 and <= 4)) return "–";
         var culture = Lang.CurrentLocale is { } locale && locale.StartsWith("de", StringComparison.Ordinal) ? German : CultureInfo.InvariantCulture;
-        return value.ToString("N" + decimals.ToString(CultureInfo.InvariantCulture), culture);
+        return value.ToString(Grouped[decimals], culture);
     }
 
     private static readonly CultureInfo German = CultureInfo.GetCultureInfo("de-DE");
+    private static readonly string[] Grouped = ["N0", "N1", "N2", "N3", "N4"];
 
     // Lang.Get hands the key back when the translation is missing
     public static string Translate(string key, params object[] args)
@@ -47,7 +46,6 @@ internal static class HudText
         };
     }
 
-    // The '~' that starts Komet's own pseudo marks is not part of the key
     public static string Cached(string prefix, string name)
     {
         if (!ReferenceEquals(_locale, Lang.CurrentLocale) || Cache.Count >= MaxCached)
@@ -61,7 +59,6 @@ internal static class HudText
         return Assert(Cache.Count <= MaxCached) ? text : "";
     }
 
-    // UTC, as CI stamps it and GitHub reports it
     public static string LocalTime(string iso)
     {
         if (iso.Length == 0 || !Assert(iso.Length <= 40)) return "";

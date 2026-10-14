@@ -2,8 +2,7 @@ using Komet.Gpu;
 
 namespace Komet.Vulkan;
 
-// At each dispatch every resource is taken from the binding tables by kind, as OpenGL keeps one binding namespace per kind, or is
-// the placeholder.
+// Each dispatch takes every resource from the per-kind binding tables (OpenGL's namespaces), or the placeholder.
 internal sealed unsafe partial class VulkanBackend
 {
     private const int MaxUnits = 64, MaxResources = 16;
@@ -24,8 +23,7 @@ internal sealed unsafe partial class VulkanBackend
         }
 
         var at = Free(_programs);
-        var program = Pipeline(words, Spirv.Resources(words));
-        if (at == 0 || program is null) return 0;
+        if (at == 0 || Pipeline(words, Spirv.Resources(words)) is not { } program) return 0;
         _programs[at] = program;
         return at;
     }
@@ -39,7 +37,7 @@ internal sealed unsafe partial class VulkanBackend
             {
                 Binding = (uint)resources[i].Binding, Type = resources[i].Type, Count = 1, Stages = Vk.StageCompute
             };
-        ulong module, set, layout, pipeline;
+        ulong module, set = 0, layout = 0, pipeline = 0;
         fixed (uint* code = words)
         {
             var info = new Vk.ModuleInfo
@@ -54,12 +52,12 @@ internal sealed unsafe partial class VulkanBackend
             SType = Vk.SetLayoutCreateInfo, Flags = Vk.PushDescriptorLayout, BindingCount = (uint)resources.Length,
             Bindings = bindings
         };
-        _ = VkApi.CreateSetLayout(_handle, &setInfo, null, &set);
         var layoutInfo = new Vk.PipelineLayoutInfo
         {
             SType = Vk.PipelineLayoutCreateInfo, SetLayoutCount = 1, SetLayouts = &set
         };
-        _ = VkApi.CreatePipelineLayout(_handle, &layoutInfo, null, &layout);
+        var made = VkApi.CreateSetLayout(_handle, &setInfo, null, &set) == Vk.Success &&
+                   VkApi.CreatePipelineLayout(_handle, &layoutInfo, null, &layout) == Vk.Success;
         var main = stackalloc byte[] { (byte)'m', (byte)'a', (byte)'i', (byte)'n', 0 };
         var compute = new Vk.ComputeInfo
         {
@@ -69,8 +67,8 @@ internal sealed unsafe partial class VulkanBackend
                 SType = Vk.StageCreateInfo, Stage = Vk.StageCompute, Module = module, Name = main
             }
         };
-        var cache = _device.PipelineCache;
-        var made = VkApi.CreateComputePipelines(_handle, cache, 1, &compute, null, &pipeline) == Vk.Success;
+        made = made &&
+               VkApi.CreateComputePipelines(_handle, _device.PipelineCache, 1, &compute, null, &pipeline) == Vk.Success;
         VkApi.DestroyShaderModule(_handle, module, null);
         var program = new ProgramSlot(pipeline, layout, set, resources);
         if (made) return program;
@@ -105,12 +103,11 @@ internal sealed unsafe partial class VulkanBackend
         table[at] = handle;
     }
 
-    // The descriptors worked out now, from the binding tables as they stand; recorded now, or on a frame posted to its thread
+    // Descriptors from the binding tables as they stand now; recorded now, or on a frame posted to its thread
     public void Dispatch(int program, int x, int y = 1)
     {
         if (!Index(program, MaxHandles) || _programs[program] is not { } p || !Assert(x >= 0 && y >= 0) ||
             x * y == 0) return;
-        // on a frame the placeholder image is made at the first dispatch, inside a segment
         if (_placeholderImage == 0 && _frame is not null) _placeholderImage = Pyramid(1, 1, out _);
         if (!Assert(_placeholderImage != 0) || !Assert(_placeholderBuffer != 0)) return;
         VulkanRenderer.Mark(VulkanRenderer.Drawn.Compute);
@@ -197,7 +194,7 @@ internal sealed unsafe partial class VulkanBackend
         if (Assert(wait != GpuBarrier.None)) Record(Ordered);
     }
 
-    private static void Ordered(IntPtr commands)
+    internal static void Ordered(IntPtr commands)
     {
         if (!Assert(commands != IntPtr.Zero)) return;
         var barrier = new Vk.GlobalBarrier
