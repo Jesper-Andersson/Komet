@@ -1,6 +1,8 @@
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using HarmonyLib;
+using Komet.Api;
 using Komet.Core;
 using OpenTK.Graphics.OpenGL;
 using Vintagestory.API.MathTools;
@@ -31,6 +33,8 @@ internal static class ShaderUseCache
     private static readonly State?[] States = new State[128];
     private static int _frame, _settingsFrame = -1;
     private static float _viewDistance, _viewDistanceLod0;
+    private static MethodBase? _use;
+    private static bool _foreign;
 
     public static bool Enabled
     {
@@ -53,6 +57,7 @@ internal static class ShaderUseCache
         var update = AccessTools.Method(typeof(DefaultShaderUniforms), nameof(DefaultShaderUniforms.Update));
         var use = AccessTools.Method(typeof(ShaderProgramBase), nameof(ShaderProgramBase.Use));
         if (!NotNull(update) || !NotNull(use)) return;
+        _use = use;
         if (!NotNull(harmony.Patch(update, postfix: new HarmonyMethod(NextFrame)))) return;
         _ = NotNull(harmony.Patch(use, new HarmonyMethod(Use)));
     }
@@ -61,6 +66,12 @@ internal static class ShaderUseCache
     {
         _frame++;
         if (Enabled) ReadSettings();
+        // Another mod's transpiler on Use (e.g. snowcapmeltfix uploading its own uniform) would be skipped with the
+        // body: the engine's Use runs then. Checked per frame, as client mods patch after Install.
+        var foreign = _use is not null && EngineShape.Foreign([_use], PatchKinds.Body, null);
+        if (foreign == _foreign) return;
+        _foreign = foreign;
+        Array.Clear(States); // the engine's uploads bypass the cached values
     }
 
     // SettingsBase lower-cases keys per read: 3 reads per Use at 118 Uses a frame were 1.8 MB/s. Applies next frame.
@@ -74,7 +85,7 @@ internal static class ShaderUseCache
 
     private static bool Use(ShaderProgramBase __instance)
     {
-        if (!Enabled || (uint)__instance.PassId >= (uint)States.Length) return true;
+        if (!Enabled || _foreign || (uint)__instance.PassId >= (uint)States.Length) return true;
         if (!Assert(__instance.ProgramId > 0) || !NotNull(__instance.uniformLocations)) return true;
         if (ShaderProgramBase.CurrentShaderProgram is { } active && active != __instance)
             throw new InvalidOperationException("Already a different shader (" + active.PassName + ") in use!");
